@@ -99,7 +99,7 @@ Inits the object.
 
 Note: log2 under Perl is as below...
 
-    log($psi) / log(2) )
+    log($psi) / log(2)
 
 =cut
 
