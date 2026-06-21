@@ -6,6 +6,7 @@ use Carp       qw(croak);
 use List::Util qw(min);
 use POSIX      qw(ceil);
 use JSON::PP   ();
+use File::Slurp qw(read_file write_file);
 
 our $VERSION = '0.0.1';
 
@@ -449,9 +450,7 @@ Saves the model to the specified path.
 
 sub save {
 	my ( $self, $path ) = @_;
-	open my $fh, '>', $path or croak "cannot open '$path' for writing: $!";
-	print {$fh} $self->to_json;
-	close $fh or croak "cannot close '$path': $!";
+	write_file( $path, {'atomic' => 1}, $self->to_json);
 }
 
 =head2 load($path);
@@ -464,11 +463,8 @@ Init the object from the model in the specified file.
 
 sub load {
 	my ( $class, $path ) = @_;
-	open my $fh, '<', $path or croak "cannot open '$path' for reading: $!";
-	local $/;
-	my $text = <$fh>;
-	close $fh;
-	return $class->from_json($text);
+	my $raw_model = read_file($path);
+	return $class->from_json($raw_model);
 }
 
 =head1 REFERENCES

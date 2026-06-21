@@ -41,3 +41,5 @@ inc/
 # cpanfile.snapshot
 
 demo*
+*.csv
+*.json
