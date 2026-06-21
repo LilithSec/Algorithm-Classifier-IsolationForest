@@ -13,3 +13,9 @@ t/manifest.t
 t/pod-coverage.t
 t/pod.t
 README.md
+examples/README.md
+examples/axis-vs-extended.pl
+examples/basic-anomaly-detection.pl
+examples/contamination-threshold.pl
+examples/save-and-load.pl
+examples/server-metrics.pl
