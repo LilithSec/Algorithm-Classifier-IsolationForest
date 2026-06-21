@@ -8,7 +8,7 @@
 # then uses that learned threshold by default, so you never have to guess a
 # number.
 #
-#     perl -Ilib examples/03-contamination-threshold.pl
+#     perl -Ilib examples/contamination-threshold.pl
 
 use strict;
 use warnings;

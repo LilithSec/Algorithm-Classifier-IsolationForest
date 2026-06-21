@@ -7,7 +7,7 @@ use List::Util qw(min);
 use POSIX      qw(ceil);
 use JSON::PP   ();
 
-our $VERSION = '0.0.0';
+our $VERSION = '0.0.1';
 
 use constant EULER  => 0.5772156649015329;
 use constant TWO_PI => 6.283185307179586;
@@ -77,8 +77,8 @@ Inits the object.
    - max_depth :: per-tree height limit... if not defined is set to ceil(log2(psi))
        default :: undef
 
-   - seed :: optional integer to seed srand with for reproducible tress...
-           see perldoc -f srand for more info
+   - seed :: optional integer to seed srand with for reproducible trees...
+           see perldoc -f srand for more info. This number is processed via abs(int()).
        default :: undef
 
    - mode :: if it should be IF or EIF
@@ -110,6 +110,10 @@ sub new {
 	croak "mode must be 'axis' or 'extended'"
 		unless $mode eq 'axis' || $mode eq 'extended';
 
+	if (defined($args{seed})){
+		$args{seed}=abs(int($args{seed}));
+	}
+	
 	my $self = {
 		n_trees         => $args{n_trees}     // 100,
 		sample_size     => $args{sample_size} // 256,

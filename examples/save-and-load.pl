@@ -11,7 +11,7 @@
 # in-memory string API (to_json/from_json), and verifies a reloaded model scores
 # identically to the original.
 #
-#     perl -Ilib examples/04-save-and-load.pl
+#     perl -Ilib examples/save-and-load.pl
 
 use strict;
 use warnings;

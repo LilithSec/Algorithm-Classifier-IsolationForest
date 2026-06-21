@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-# 01-basic-anomaly-detection.pl
+# basic-anomaly-detection.pl
 #
 # The canonical use case: fit a forest on mostly-normal data, then score and
 # label every point. Here we manufacture 500 "normal" points from a Gaussian
@@ -8,9 +8,9 @@
 # know the ground truth and can measure how well the forest recovers it.
 #
 # Run from the distribution root:
-#     perl -Ilib examples/01-basic-anomaly-detection.pl
+#     perl -Ilib examples/basic-anomaly-detection.pl
 # or, if the module is installed:
-#     perl examples/01-basic-anomaly-detection.pl
+#     perl examples/basic-anomaly-detection.pl
 
 use strict;
 use warnings;

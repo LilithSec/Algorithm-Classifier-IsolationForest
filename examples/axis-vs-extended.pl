@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-# 02-axis-vs-extended.pl
+# axis-vs-extended.pl
 #
 # Isolation Forest comes in two flavours here:
 #   mode => 'axis'      classic, axis-parallel splits (the original algorithm)
@@ -17,7 +17,7 @@
 # This script trains one forest of each kind on the same diagonal band and
 # compares how they score a few hand-picked probe points.
 #
-#     perl -Ilib examples/02-axis-vs-extended.pl
+#     perl -Ilib examples/axis-vs-extended.pl
 
 use strict;
 use warnings;

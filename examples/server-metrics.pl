@@ -12,7 +12,7 @@
 # observed range and never computes distances, so -- unlike k-NN or clustering
 # -- you don't have to standardise the columns first.
 #
-#     perl -Ilib examples/05-server-metrics.pl
+#     perl -Ilib examples/server-metrics.pl
 
 use strict;
 use warnings;
