@@ -1,9 +1,15 @@
 Changes
 lib/Algorithm/Classifier/IsolationForest.pm
 Makefile.PL
-MANIFEST			This list of files
-README.md
 t/00-load.t
+t/10-constructor.t
+t/20-fit.t
+t/30-scoring.t
+t/40-anomaly-detection.t
+t/50-contamination.t
+t/60-extended-mode.t
+t/70-persistence.t
 t/manifest.t
 t/pod-coverage.t
 t/pod.t
+README.md
