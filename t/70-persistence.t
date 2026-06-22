@@ -101,7 +101,7 @@ subtest 'from_json rejects bad input' => sub {
 subtest 'load reports a missing file' => sub {
     like(
         exception { $CLASS->load('/no/such/iforest/model.json') },
-        qr/cannot open/,
+        qr/No such file or directory/,
         'load() croaks on an unreadable path'
     );
 };
