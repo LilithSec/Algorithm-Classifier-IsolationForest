@@ -1,4 +1,5 @@
 MANIFEST
+LICENSE
 Changes
 lib/Algorithm/Classifier/IsolationForest/App/Command/fit.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/gblob.pm
