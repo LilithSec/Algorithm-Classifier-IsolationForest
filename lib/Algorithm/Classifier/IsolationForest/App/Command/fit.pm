@@ -126,8 +126,7 @@ sub execute {
 		exit 0;
 	}
 
-	write_file( $opt->{'o'}, {'atomic' => 1}, $model)
-	
+	write_file( $opt->{'o'}, {'atomic' => 1}, $model);
 } ## end sub execute
 
 return 1;

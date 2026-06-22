@@ -24,7 +24,7 @@ Algorithm::Classifier::IsolationForest - unsupervised anomaly detection via Isol
     my @data = ([0.1, -0.2], [0.0, 0.1], [5.0, 6.0], ...);
 
     # Classic, axis-parallel Isolation Forest
-    my $iforest = IsolationForest->new(
+    my $iforest = Algorithm::Classifier::IsolationForest->new(
         n_trees     => 100,
         sample_size => 256,
         seed        => 42,
@@ -36,7 +36,7 @@ Algorithm::Classifier::IsolationForest - unsupervised anomaly detection via Isol
 
     # Save and reload
     $iforest->save('model.json');
-    my $reloaded = IsolationForest->load('model.json');
+    my $reloaded = Algorithm::Classifier::IsolationForest->load('model.json');
 
     # Extended Isolation Forest (oblique hyperplane splits)
     my $eif = IsolationForest->new(mode => 'extended', seed => 42);
