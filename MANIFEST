@@ -1,5 +1,11 @@
 Changes
+lib/Algorithm/Classifier/IsolationForest/App/Command/fit.pm
+lib/Algorithm/Classifier/IsolationForest/App/Command/gblob.pm
+lib/Algorithm/Classifier/IsolationForest/App/Command/predict.pm
+lib/Algorithm/Classifier/IsolationForest/App/Command.pm
+lib/Algorithm/Classifier/IsolationForest/App.pm
 lib/Algorithm/Classifier/IsolationForest.pm
+src_bin/iforest
 Makefile.PL
 t/00-load.t
 t/10-constructor.t
