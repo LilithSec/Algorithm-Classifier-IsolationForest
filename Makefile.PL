@@ -10,6 +10,7 @@ my %WriteMakefileArgs = (
 	ABSTRACT_FROM      => 'lib/Algorithm/Classifier/IsolationForest.pm',
 	LICENSE            => 'lgpl_2_1',
 	MIN_PERL_VERSION   => '5.006',
+	INST_SCRIPT        => 'bin',
 	EXE_FILES          => ['src_bin/iforest'],
 	CONFIGURE_REQUIRES => {
 		'ExtUtils::MakeMaker' => '0',
@@ -19,17 +20,18 @@ my %WriteMakefileArgs = (
 	},
 	PREREQ_PM => {
 		'App::Cmd'    => '0',
+		'File::Slurp' => '0',
 	},
-	dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
-	clean => { FILES    => 'Algorithm-Classifier-IsolationForest-*' },
+	dist       => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
+	clean      => { FILES    => 'Algorithm-Classifier-IsolationForest-*' },
 	META_MERGE => {
 		"meta-spec" => { version => 2 },
-			resources   => {
-				repository => {
-					type => 'git',
-					url  => 'git@github.com:LilithSec/Algorithm-Classifier-IsolationForest.git',
-					web  => 'https://github.com/LilithSec/Algorithm-Classifier-IsolationForest',
-				},
+		resources   => {
+			repository => {
+				type => 'git',
+				url  => 'git@github.com:LilithSec/Algorithm-Classifier-IsolationForest.git',
+				web  => 'https://github.com/LilithSec/Algorithm-Classifier-IsolationForest',
+			},
 		},
 	}
 );

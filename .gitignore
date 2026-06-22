@@ -44,3 +44,5 @@ demo*
 *.csv
 *.json
 Algorithm-Classifier-IsolationForest-*
+
+bin/
