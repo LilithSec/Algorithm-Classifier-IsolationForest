@@ -2,10 +2,10 @@ package Algorithm::Classifier::IsolationForest;
 
 use strict;
 use warnings;
-use Carp       qw(croak);
-use List::Util qw(min);
-use POSIX      qw(ceil);
-use JSON::PP   ();
+use Carp        qw(croak);
+use List::Util  qw(min);
+use POSIX       qw(ceil);
+use JSON::PP    ();
 use File::Slurp qw(read_file write_file);
 
 our $VERSION = '0.0.1';
@@ -111,10 +111,10 @@ sub new {
 	croak "mode must be 'axis' or 'extended'"
 		unless $mode eq 'axis' || $mode eq 'extended';
 
-	if (defined($args{seed})){
-		$args{seed}=abs(int($args{seed}));
+	if ( defined( $args{seed} ) ) {
+		$args{seed} = abs( int( $args{seed} ) );
 	}
-	
+
 	my $self = {
 		n_trees         => $args{n_trees}     // 100,
 		sample_size     => $args{sample_size} // 256,
@@ -362,6 +362,44 @@ sub score_samples {
 	return \@scores;
 } ## end sub score_samples
 
+=head2 score_predict_samples
+
+Returns a array ref of arrays. First value of each sub array is the score with the second being
+0/1 for if it is a anomaly or not.
+
+    my $results = $forest->predict(\@data, $threshold);
+
+    print "x, y, score, result\n";
+
+    my $int=0;
+    while (defined($data[$int])) {
+        print $data[$int][0].', '.$data[$int][1].', '.$results->[$int][0].', '.$results->[$int][1]."\n";
+
+        $int++;
+    }
+
+=cut
+
+sub score_predict_samples {
+	my ( $self, $data, $threshold ) = @_;
+	$threshold
+		= defined $threshold         ? $threshold
+		: defined $self->{threshold} ? $self->{threshold}
+		:                              0.5;
+	my $scores = $self->score_samples($data);
+
+	my @to_return;
+	foreach my $score ( @{$scores} ) {
+		if ( $score >= $threshold ) {
+			push @to_return, [ $score, 1 ];
+		} else {
+			push @to_return, [ $score, 0 ];
+		}
+	}
+
+	return \@to_return;
+} ## end sub score_predict_samples
+
 =head1 MODEL SAVE/LOAD METHODS
 
 =head2 to_json
@@ -450,7 +488,7 @@ Saves the model to the specified path.
 
 sub save {
 	my ( $self, $path ) = @_;
-	write_file( $path, {'atomic' => 1}, $self->to_json);
+	write_file( $path, { 'atomic' => 1 }, $self->to_json );
 }
 
 =head2 load($path);
