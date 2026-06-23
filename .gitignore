@@ -46,3 +46,4 @@ demo*
 Algorithm-Classifier-IsolationForest-*
 
 bin/
+*.png
