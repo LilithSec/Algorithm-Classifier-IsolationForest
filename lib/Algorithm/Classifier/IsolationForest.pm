@@ -380,6 +380,30 @@ Liu, Fei Tony & Ting, Kai & Zhou, Zhi-Hua. (2008). Isolation Forest. 413 - 422. 
 
 L<https://www.researchgate.net/publication/224384174_Isolation_Forest>
 
+=head1 NATIVE ACCELERATION (Inline::C and OpenMP)
+
+The scoring hot path (C<score_samples>, C<predict>, C<path_lengths>, and
+C<score_predict_samples>) is automatically accelerated through
+L<Inline::C> when it is installed and a working C compiler is reachable.
+If the toolchain also accepts C<-fopenmp> and can link against
+C<libgomp>, the per-point tree walk runs in parallel across all
+available CPU cores using OpenMP.
+
+Detection happens once when the module is loaded; the compiled artefact
+is cached under C<_Inline/> and reused on subsequent runs.  Two package
+variables report what the build picked up:
+
+    $Algorithm::Classifier::IsolationForest::HAS_C       # 0/1
+    $Algorithm::Classifier::IsolationForest::HAS_OPENMP  # 0/1
+
+Neither dependency is required.  Without C<Inline::C> the module falls
+back to a pure-Perl implementation that produces identical results, just
+slower; without OpenMP the C backend runs single-threaded.
+
+The bundled C<iforest accel> subcommand performs a tiny fit + score and
+prints which backend is active, which is the recommended way to verify
+the build picked up the optional dependencies on a given machine.
+
 =head1 GENERAL METHODS
 
 =head2 new(%args)
