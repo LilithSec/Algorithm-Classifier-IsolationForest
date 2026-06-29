@@ -188,6 +188,41 @@ void predict_sums_xs(SV* sm_sv, int n_pts, double sum_threshold, SV* out_rv){
     }
 }
 
+/* score_predict_xs(sm_sv, n_pts, inv, sum_threshold, out_rv)
+ *
+ * Combines finalize_scores_xs + predict_sums_xs: fills the pre-allocated
+ * out_rv with [score, label] pairs in one pass over sm_sv.  Replaces the
+ * trailing Perl loop in score_predict_samples that built ~3*n_pts SVs
+ * (n_pts scores + n_pts labels + n_pts inner arrayrefs) via a Perl
+ * foreach -- here the same SVs are allocated directly inside C.
+ *
+ * Refcount note: newRV_noinc takes ownership of the inner AV without
+ * incrementing it, and av_store takes ownership of the RV.  When the
+ * outer AV is destroyed it frees the RVs, which free the inner AVs,
+ * which free the score/label SVs.  No leak. */
+void score_predict_xs(SV* sm_sv, int n_pts, double inv,
+                       double sum_threshold, SV* out_rv){
+    STRLEN tl;
+    const double* sm;
+    AV* out;
+    int i;
+
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("score_predict_xs: out must be an arrayref");
+    }
+    sm  = (const double*)SvPVbyte(sm_sv, tl);
+    out = (AV*)SvRV(out_rv);
+    av_clear(out);
+    if (n_pts > 0) av_extend(out, n_pts - 1);
+    for (i = 0; i < n_pts; i++) {
+        AV* row = newAV();
+        av_extend(row, 1);
+        av_store(row, 0, newSVnv(exp(-sm[i] * inv)));
+        av_store(row, 1, newSViv(sm[i] <= sum_threshold ? 1 : 0));
+        av_store(out, i, newRV_noinc((SV*)row));
+    }
+}
+
 /* score_all_xs(nodes_av, coefs_av, x_sv, sm_sv, n_pts, n_feats, n_trees)
  *
  * Scores all points across all trees in one C call.  See header comment
@@ -750,6 +785,37 @@ sub score_predict_samples {
 		= defined $threshold         ? $threshold
 		: defined $self->{threshold} ? $self->{threshold}
 		:                              0.5;
+	$self->_check_fitted;
+
+	# Fast path: build [score, label] pairs straight from the sum buffer
+	# in one C call.  Avoids the intermediate scores arrayref + Perl
+	# foreach that allocates ~3*n_pts SVs.  Gated identically to predict()
+	# so the threshold conversion is valid.
+	if (   $HAS_C
+		&& $self->{_c_nodes}
+		&& $self->{c_psi} > 0
+		&& $threshold > 0
+		&& $threshold < 1 )
+	{
+		my $trees = $self->{trees};
+		my $t     = scalar @$trees;
+		my $c     = $self->{c_psi};
+		my $n_pts = scalar @$data;
+		my $nf    = $self->{n_features};
+		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		pack_input_xs( $data, $x_packed, $n_pts, $nf );
+		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+			$x_packed, $sums_packed, $n_pts, $nf, $t );
+		my $inv           = log(2) / ( $c * $t );
+		my $sum_threshold = -log($threshold) * $c * $t / log(2);
+		my $result        = [];
+		score_predict_xs( $sums_packed, $n_pts, $inv, $sum_threshold,
+			$result );
+		return $result;
+	}
+
+	# Fallback: edge thresholds, c==0, or no C backend.
 	my $scores = $self->score_samples($data);
 
 	my @to_return;
