@@ -217,9 +217,50 @@ void score_predict_xs(SV* sm_sv, int n_pts, double inv,
     for (i = 0; i < n_pts; i++) {
         AV* row = newAV();
         av_extend(row, 1);
-        av_store(row, 0, newSVnv(exp(-sm[i] * inv)));
-        av_store(row, 1, newSViv(sm[i] <= sum_threshold ? 1 : 0));
+        /* av_extend filled both slots with &PL_sv_undef.  Since that
+         * sentinel is immortal (its refcount is never freed) we can
+         * overwrite the slots directly and bump AvFILLp, skipping the
+         * per-element bounds/magic checks av_store would do. */
+        AvARRAY(row)[0] = newSVnv(exp(-sm[i] * inv));
+        AvARRAY(row)[1] = newSViv(sm[i] <= sum_threshold ? 1 : 0);
+        AvFILLp(row)    = 1;
         av_store(out, i, newRV_noinc((SV*)row));
+    }
+}
+
+/* score_predict_split_xs(sm_sv, n_pts, inv, sum_threshold,
+ *                          scores_rv, labels_rv)
+ *
+ * Parallel-arrays variant of score_predict_xs: fills two pre-allocated
+ * arrayrefs (scores: NV, labels: IV) instead of an AV-of-[score, label]
+ * pairs.  Allocates ~2*n_pts SVs instead of ~4*n_pts -- no inner AV and
+ * no RV per point -- so it's about twice as cheap for callers that
+ * don't need the paired shape. */
+void score_predict_split_xs(SV* sm_sv, int n_pts, double inv,
+                             double sum_threshold,
+                             SV* scores_rv, SV* labels_rv){
+    STRLEN tl;
+    const double* sm;
+    AV* scores;
+    AV* labels;
+    int i;
+
+    if (!SvROK(scores_rv) || SvTYPE(SvRV(scores_rv)) != SVt_PVAV ||
+        !SvROK(labels_rv) || SvTYPE(SvRV(labels_rv)) != SVt_PVAV) {
+        croak("score_predict_split_xs: scores/labels must be arrayrefs");
+    }
+    sm     = (const double*)SvPVbyte(sm_sv, tl);
+    scores = (AV*)SvRV(scores_rv);
+    labels = (AV*)SvRV(labels_rv);
+    av_clear(scores);
+    av_clear(labels);
+    if (n_pts > 0) {
+        av_extend(scores, n_pts - 1);
+        av_extend(labels, n_pts - 1);
+    }
+    for (i = 0; i < n_pts; i++) {
+        av_store(scores, i, newSVnv(exp(-sm[i] * inv)));
+        av_store(labels, i, newSViv(sm[i] <= sum_threshold ? 1 : 0));
     }
 }
 
@@ -853,6 +894,69 @@ sub score_predict_samples {
 
 	return \@to_return;
 } ## end sub score_predict_samples
+
+=head2 score_predict_split(\@data, $threshold)
+
+Same data as L</score_predict_samples> but returned as two flat arrayrefs
+instead of an arrayref-of-pairs.  Allocates roughly half as many Perl
+SVs per point (no inner AV, no RV per row), so it is meaningfully faster
+when both scores and labels are wanted but the paired shape is not.
+
+In list context returns C<($scores_aref, $labels_aref)>.
+
+    my ($scores, $labels) = $forest->score_predict_split(\@data);
+
+    for my $i (0 .. $#$scores) {
+        printf "%s -> score %.4f, label %d\n",
+            join(',', @{ $data[$i] }), $scores->[$i], $labels->[$i];
+    }
+
+C<$threshold> defaults to the contamination-learned cutoff (if C<fit>
+was called with C<contamination>) or 0.5.
+
+=cut
+
+sub score_predict_split {
+	my ( $self, $data, $threshold ) = @_;
+	$threshold
+		= defined $threshold         ? $threshold
+		: defined $self->{threshold} ? $self->{threshold}
+		:                              0.5;
+	$self->_check_fitted;
+
+	# Fast path: fill two flat arrayrefs (scores + labels) directly from
+	# the sum buffer in one C call.  Skips the inner AV + RV per point
+	# that score_predict_samples has to allocate.
+	if (   $HAS_C
+		&& $self->{_c_nodes}
+		&& $self->{c_psi} > 0
+		&& $threshold > 0
+		&& $threshold < 1 )
+	{
+		my $trees = $self->{trees};
+		my $t     = scalar @$trees;
+		my $c     = $self->{c_psi};
+		my $n_pts = scalar @$data;
+		my $nf    = $self->{n_features};
+		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		pack_input_xs( $data, $x_packed, $n_pts, $nf );
+		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+			$x_packed, $sums_packed, $n_pts, $nf, $t );
+		my $inv           = log(2) / ( $c * $t );
+		my $sum_threshold = -log($threshold) * $c * $t / log(2);
+		my $scores        = [];
+		my $labels        = [];
+		score_predict_split_xs( $sums_packed, $n_pts, $inv, $sum_threshold,
+			$scores, $labels );
+		return ( $scores, $labels );
+	}
+
+	# Fallback: derive from score_samples.
+	my $scores = $self->score_samples($data);
+	my @labels = map { $_ >= $threshold ? 1 : 0 } @$scores;
+	return ( $scores, \@labels );
+}
 
 =head1 MODEL SAVE/LOAD METHODS
 

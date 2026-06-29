@@ -1,8 +1,9 @@
 #!/usr/bin/perl
 # benchmarking/bench-score.pl
 #
-# Benchmarks the four public scoring/prediction methods:
-#   score_samples, predict, score_predict_samples, path_lengths
+# Benchmarks the five public scoring/prediction methods:
+#   score_samples, predict, score_predict_samples, score_predict_split,
+#   path_lengths
 #
 # Sections:
 #   1. Scoring method comparison  -- which method has the lowest overhead
@@ -76,6 +77,7 @@ cmpthese(
         'score_samples'         => sub { $m->score_samples($q1k)         },
         'predict'               => sub { $m->predict($q1k)               },
         'score_predict_samples' => sub { $m->score_predict_samples($q1k) },
+        'score_predict_split'   => sub { $m->score_predict_split($q1k)   },
         'path_lengths'          => sub { $m->path_lengths($q1k)          },
     }
 );

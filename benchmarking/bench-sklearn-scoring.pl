@@ -14,6 +14,7 @@
 #   Perl score_samples         <-->  clf.score_samples(X)      (same formula, opposite sign)
 #   Perl predict               <-->  clf.predict(X)            (same semantics, 0/1 vs -1/+1)
 #   Perl score_predict_samples <-->  (no sklearn equivalent)
+#   Perl score_predict_split   <-->  (no sklearn equivalent)
 #   Perl path_lengths          <-->  (no sklearn equivalent)
 #   (no Perl equivalent)       <-->  clf.decision_function(X)  (threshold-shifted score)
 #
@@ -254,6 +255,7 @@ for my $exp (@experiments) {
         score_samples         => bench( sub { $model->score_samples($q)         }, $BENCH_SECS ),
         predict               => bench( sub { $model->predict($q)               }, $BENCH_SECS ),
         score_predict_samples => bench( sub { $model->score_predict_samples($q) }, $BENCH_SECS ),
+        score_predict_split   => bench( sub { $model->score_predict_split($q)   }, $BENCH_SECS ),
         path_lengths          => bench( sub { $model->path_lengths($q)          }, $BENCH_SECS ),
     };
 }
@@ -266,6 +268,7 @@ my @rows = (
     [ 'score_samples',         'score_samples',         'score_samples'     ],
     [ 'predict',               'predict',               'predict'           ],
     [ 'score_predict_samples', 'score_predict_samples', undef               ],
+    [ 'score_predict_split',   'score_predict_split',   undef               ],
     [ 'path_lengths',          'path_lengths',          undef               ],
     [ 'decision_function',     undef,                   'decision_function' ],
 );

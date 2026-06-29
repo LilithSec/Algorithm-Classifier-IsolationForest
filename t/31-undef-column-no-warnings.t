@@ -61,6 +61,28 @@ subtest 'score_predict_samples emits no warnings with undef column(s)' => sub {
     is( scalar @warns, 0, 'no warnings from score_predict_samples on undef column(s)' );
 };
 
+subtest 'score_predict_split emits no warnings with undef column(s)' => sub {
+    my @warns = _capture_warnings( sub { $f->score_predict_split( \@undef_pts ) } );
+    is( scalar @warns, 0, 'no warnings from score_predict_split on undef column(s)' );
+
+    # Also verify the new method returns scores/labels consistent with
+    # score_predict_samples on the same data (numeric equality on scores,
+    # exact equality on labels).
+    my $pairs            = $f->score_predict_samples( \@undef_pts );
+    my ($scores, $labels) = $f->score_predict_split( \@undef_pts );
+    is( scalar @$scores, scalar @$pairs, 'split returns matching scores length' );
+    is( scalar @$labels, scalar @$pairs, 'split returns matching labels length' );
+
+    my $mismatches = 0;
+    for my $i ( 0 .. $#$pairs ) {
+        $mismatches++ if $scores->[$i] != $pairs->[$i][0];
+        $mismatches++ if $labels->[$i] != $pairs->[$i][1];
+    }
+    is( $mismatches, 0,
+        'score_predict_split scores/labels match score_predict_samples element-for-element'
+    );
+};
+
 subtest 'extended mode: score_samples emits no warnings with undef column(s)' => sub {
     my $ef = $CLASS->new(
         n_trees     => 100,
