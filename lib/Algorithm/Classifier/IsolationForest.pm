@@ -46,6 +46,51 @@ static double _ifc(double n){
     double h=log(n-1.0)+0.5772156649015329;
     return 2.0*h-2.0*(n-1.0)/n;
 }
+/* pack_input_xs(data_sv, out_sv, n_pts, n_feats)
+ *
+ * Walks a Perl arrayref-of-arrayrefs (n_pts rows of n_feats doubles each)
+ * directly in C and writes the packed double buffer into out_sv (which the
+ * caller pre-allocates with "\0" x (n_pts*n_feats*8)).  Replaces
+ *
+ *   pack('d*', map { my $r=$_; map { $r->[$_] // 0 } 0..$nf-1 } @$data)
+ *
+ * which was the dominant per-call overhead for high feature counts.
+ * Undef cells (and missing rows) are coerced to 0.0 with no warning.
+ * Matches the "fill an SV in place" convention used by score_tree_xs. */
+void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
+    STRLEN tl;
+    double* out;
+    AV* outer;
+    int i, k;
+
+    if (!SvROK(data_sv) || SvTYPE(SvRV(data_sv)) != SVt_PVAV) {
+        croak("pack_input_xs: data must be an arrayref");
+    }
+    outer = (AV*)SvRV(data_sv);
+    out   = (double*)SvPVbyte_force(out_sv, tl);
+
+    for (i = 0; i < n_pts; i++) {
+        SV** row_pp = av_fetch(outer, i, 0);
+        double* dst = out + (size_t)i * (size_t)n_feats;
+        if (!row_pp || !*row_pp || !SvROK(*row_pp) ||
+            SvTYPE(SvRV(*row_pp)) != SVt_PVAV) {
+            for (k = 0; k < n_feats; k++) dst[k] = 0.0;
+            continue;
+        }
+        {
+            AV* row = (AV*)SvRV(*row_pp);
+            for (k = 0; k < n_feats; k++) {
+                SV** v = av_fetch(row, k, 0);
+                if (v && *v && SvOK(*v)) {
+                    dst[k] = SvNV(*v);
+                } else {
+                    dst[k] = 0.0;
+                }
+            }
+        }
+    }
+}
+
 void score_tree_xs(SV*nd_sv,SV*co_sv,SV*x_sv,SV*sm_sv,int n_pts,int n_feats){
     STRLEN tl;
     const double*nd=(const double*)SvPVbyte(nd_sv,tl);
@@ -374,8 +419,8 @@ sub path_lengths {
 	if ( $HAS_C && $self->{_c_nodes} ) {
 		my $n_pts   = scalar @$data;
 		my $nf      = $self->{n_features};
-		my $x_packed = pack( 'd*',
-			map { my $r = $_; map { $r->[$_] // 0 } 0 .. $nf - 1 } @$data );
+		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		my $sums_packed = pack( 'd*', (0.0) x $n_pts );
 		my $c_nodes = $self->{_c_nodes};
 		my $c_coefs = $self->{_c_coefs};
@@ -459,8 +504,8 @@ sub score_samples {
 	if ( $HAS_C && $self->{_c_nodes} ) {
 		my $n_pts   = scalar @$data;
 		my $nf      = $self->{n_features};
-		my $x_packed = pack( 'd*',
-			map { my $r = $_; map { $r->[$_] // 0 } 0 .. $nf - 1 } @$data );
+		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		my $sums_packed = pack( 'd*', (0.0) x $n_pts );
 		my $c_nodes = $self->{_c_nodes};
 		my $c_coefs = $self->{_c_coefs};
