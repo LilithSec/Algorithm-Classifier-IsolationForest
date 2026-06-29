@@ -113,4 +113,22 @@ subtest 'feature-count mismatch is detected' => sub {
     );
 };
 
+# ----- pack_data error paths -----
+subtest 'pack_data croaks before fit()' => sub {
+    my $unfit = $CLASS->new( n_trees => 10, sample_size => 16 );
+    eval { $unfit->pack_data( \@query ) };
+    like( $@, qr/not fitted/,
+        'pack_data on an unfitted model croaks via _check_fitted' );
+};
+
+subtest 'pack_data croaks on non-arrayref input' => sub {
+    eval { $f->pack_data('not an arrayref') };
+    like( $@, qr/expects an arrayref/,
+        'pack_data on a scalar croaks with a clear message' );
+
+    eval { $f->pack_data( { wrong => 'shape' } ) };
+    like( $@, qr/expects an arrayref/,
+        'pack_data on a hashref croaks with a clear message' );
+};
+
 done_testing;

@@ -109,4 +109,69 @@ subtest 'parallel_fit=1 is equivalent to serial' => sub {
     cmp_ok( $s->[1], '>', $s->[0], 'model separates outlier from inlier' );
 };
 
+subtest 'parallel_fit works for extended (EIF) mode' => sub {
+    plan skip_all => 'no fork() on this platform' unless $can_fork;
+
+    my $f = $CLASS->new(
+        n_trees      => 40,
+        sample_size  => 256,
+        mode         => 'extended',
+        seed         => 11,
+        parallel_fit => 4,
+    );
+    $f->fit( \@train );
+
+    is( scalar @{ $f->{trees} }, 40, 'tree count matches n_trees' );
+    is( $f->{mode}, 'extended', 'mode preserved across parallel fit' );
+
+    # Sanity: extended-mode parallel-built model should still separate
+    # the obvious outlier from the inlier.
+    my $s = $f->score_samples( \@query );
+    cmp_ok( $s->[1], '>',  $s->[0], 'outlier scores higher than inlier' );
+    cmp_ok( $s->[0], '>=', 0,       'inlier score in [0,1]' );
+    cmp_ok( $s->[1], '<=', 1,       'outlier score in [0,1]' );
+};
+
+subtest 'parallel_fit + to_json/from_json round-trips' => sub {
+    plan skip_all => 'no fork() on this platform' unless $can_fork;
+
+    my $f1 = $CLASS->new(
+        n_trees      => 25,
+        sample_size  => 256,
+        seed         => 17,
+        parallel_fit => 3,
+    )->fit( \@train );
+
+    my $json = $f1->to_json;
+    ok( length $json > 100, 'JSON has plausible body length' );
+
+    my $f2 = $CLASS->from_json($json);
+    is( scalar @{ $f2->{trees} }, 25, 'restored tree count matches' );
+
+    my $s1 = $f1->score_samples( \@query );
+    my $s2 = $f2->score_samples( \@query );
+    my $diffs = grep { abs( $s1->[$_] - $s2->[$_] ) > 1e-9 } 0 .. $#$s1;
+    is( $diffs, 0,
+        'restored model produces the same scores as the parallel-fit original'
+    );
+};
+
+subtest 'parallel_fit with n_trees < workers caps workers at n_trees' => sub {
+    plan skip_all => 'no fork() on this platform' unless $can_fork;
+
+    # 3 trees, 8 workers requested -- only 3 workers should actually fork.
+    my $f = $CLASS->new(
+        n_trees      => 3,
+        sample_size  => 64,
+        seed         => 23,
+        parallel_fit => 8,
+    );
+    $f->fit( \@train );
+    is( scalar @{ $f->{trees} }, 3,
+        'tree count matches n_trees even when workers > n_trees' );
+
+    my $s = $f->score_samples( \@query );
+    is( scalar @$s, 2, 'two scores returned' );
+};
+
 done_testing;
