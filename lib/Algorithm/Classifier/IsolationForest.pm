@@ -13,6 +13,80 @@ our $VERSION = '0.1.0';
 use constant EULER  => 0.5772156649015329;
 use constant TWO_PI => 6.283185307179586;
 
+# Node-type tags stored in index 0 of every tree node arrayref.
+# 0 is falsy, so  while ($node->[0])  acts as  while (!leaf).
+use constant _NODE_LEAF    => 0;
+use constant _NODE_AXIS    => 1;
+use constant _NODE_OBLIQUE => 2;
+
+# ---------------------------------------------------------------------------
+# Optional Inline::C accelerator for the scoring hot path.
+#
+# score_tree_xs(nodes_sv, coefs_sv, x_sv, sums_sv, n_pts, n_feats)
+# accumulates path lengths for all n_pts query points through one pre-packed
+# tree directly in C, avoiding Perl call-overhead on the innermost loop.
+#
+# Node layout (6 doubles per node, "IF_NZ = 6"):
+#   leaf:    [0, size, 0,   0,  0, 0]
+#   axis:    [1, attr, split, li, ri, 0]
+#   oblique: [2, coff, nf,  li, ri, b]
+#
+# coefs: flat array of (feat_idx, coef_val) pairs, indexed by coff*2.
+# x:     row-major doubles, n_pts rows of n_feats each.
+# sums:  in/out double array of length n_pts; C adds to existing values.
+# ---------------------------------------------------------------------------
+our $HAS_C = 0;
+{
+    my $C_CODE = <<'__INLINE_C__';
+#include <math.h>
+#define IF_NZ 6
+static double _ifc(double n){
+    if(n<=1.0)return 0.0;
+    if(n<2.5) return 1.0;
+    double h=log(n-1.0)+0.5772156649015329;
+    return 2.0*h-2.0*(n-1.0)/n;
+}
+void score_tree_xs(SV*nd_sv,SV*co_sv,SV*x_sv,SV*sm_sv,int n_pts,int n_feats){
+    STRLEN tl;
+    const double*nd=(const double*)SvPVbyte(nd_sv,tl);
+    const double*co=(const double*)SvPVbyte(co_sv,tl);
+    const double*xd=(const double*)SvPVbyte(x_sv,tl);
+    double*sm=(double*)SvPVbyte_force(sm_sv,tl);
+    int i,k;
+    for(i=0;i<n_pts;i++){
+        const double*xi=xd+(size_t)i*(size_t)n_feats;
+        int ni=0,depth=0;
+        for(;;){
+            const double*node=nd+(size_t)ni*IF_NZ;
+            int type=(int)node[0];
+            if(type==0){sm[i]+=depth+_ifc(node[1]);break;}
+            if(type==1){
+                int attr=(int)node[1];
+                double fv=(attr<n_feats)?xi[attr]:0.0;
+                ni=(fv<node[2])?(int)node[3]:(int)node[4];
+            }else{
+                int coff=(int)node[1],nf=(int)node[2];
+                double b=node[5],dot=0.0;
+                const double*cp=co+(size_t)coff*2;
+                for(k=0;k<nf;k++){
+                    int fi=(int)cp[k*2];
+                    dot+=cp[k*2+1]*(fi<n_feats?xi[fi]:0.0);
+                }
+                ni=(dot<=b)?(int)node[3]:(int)node[4];
+            }
+            depth++;
+        }
+    }
+}
+__INLINE_C__
+    local $@;
+    eval {
+        require Inline;
+        Inline->import( C => $C_CODE, LIBS => '-lm' );
+        $HAS_C = 1;
+    };
+}
+
 =head1 NAME
 
 Algorithm::Classifier::IsolationForest - unsupervised anomaly detection via Isolation Forest or Extended Isolation Forest
@@ -270,6 +344,7 @@ sub fit {
 			: $desc[ $n_pts - 1 ] - 1e-9;              # k == n: flag everything
 	} ## end if ( defined $self->{contamination} )
 
+	$self->_rebuild_c_trees() if $HAS_C;
 	return $self;
 } ## end sub fit
 
@@ -293,14 +368,33 @@ Returns the mean isolation depth per sample, for inspection.
 sub path_lengths {
 	my ( $self, $data ) = @_;
 	$self->_check_fitted;
-	my $t = scalar @{ $self->{trees} };
-	my @out;
-	for my $x (@$data) {
-		my $sum = 0;
-		$sum += $self->_path_length( $x, $_, 0 ) for @{ $self->{trees} };
-		push @out, $sum / $t;
+	my $trees = $self->{trees};
+	my $t     = scalar @$trees;
+
+	if ( $HAS_C && $self->{_c_nodes} ) {
+		my $n_pts   = scalar @$data;
+		my $nf      = $self->{n_features};
+		my $x_packed = pack( 'd*',
+			map { my $r = $_; map { $r->[$_] // 0 } 0 .. $nf - 1 } @$data );
+		my $sums_packed = pack( 'd*', (0.0) x $n_pts );
+		my $c_nodes = $self->{_c_nodes};
+		my $c_coefs = $self->{_c_coefs};
+		for my $ti ( 0 .. $t - 1 ) {
+			score_tree_xs( $c_nodes->[$ti], $c_coefs->[$ti],
+				$x_packed, $sums_packed, $n_pts, $nf );
+		}
+		my @sums = unpack( 'd*', $sums_packed );
+		return [ map { $_ / $t } @sums ];
 	}
-	return \@out;
+
+	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
+	my @sums = (0) x @$data;
+	for my $tree (@$trees) {
+		for my $i ( 0 .. $#$data ) {
+			$sums[$i] += _path_length( $data->[$i], $tree, 0 );
+		}
+	}
+	return [ map { $_ / $t } @sums ];
 } ## end sub path_lengths
 
 =head predict(\@data, $threshold)
@@ -358,17 +452,46 @@ Scores ~0.5 means the points are hard to tell apart.
 sub score_samples {
 	my ( $self, $data ) = @_;
 	$self->_check_fitted;
-	my $c = $self->{c_psi};
-	my $t = scalar @{ $self->{trees} };
+	my $c     = $self->{c_psi};
+	my $trees = $self->{trees};
+	my $t     = scalar @$trees;
 
-	my @scores;
-	for my $x (@$data) {
-		my $sum = 0;
-		$sum += $self->_path_length( $x, $_, 0 ) for @{ $self->{trees} };
-		my $avg = $sum / $t;
-		push @scores, $c > 0 ? 2**( -$avg / $c ) : 0.5;
+	if ( $HAS_C && $self->{_c_nodes} ) {
+		my $n_pts   = scalar @$data;
+		my $nf      = $self->{n_features};
+		my $x_packed = pack( 'd*',
+			map { my $r = $_; map { $r->[$_] // 0 } 0 .. $nf - 1 } @$data );
+		my $sums_packed = pack( 'd*', (0.0) x $n_pts );
+		my $c_nodes = $self->{_c_nodes};
+		my $c_coefs = $self->{_c_coefs};
+		for my $ti ( 0 .. $t - 1 ) {
+			score_tree_xs( $c_nodes->[$ti], $c_coefs->[$ti],
+				$x_packed, $sums_packed, $n_pts, $nf );
+		}
+		my @sums = unpack( 'd*', $sums_packed );
+		if ( $c > 0 ) {
+			my $inv = log(2) / ( $c * $t );
+			return [ map { exp( -$_ * $inv ) } @sums ];
+		}
+		return [ (0.5) x @sums ];
 	}
-	return \@scores;
+
+	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
+	my @sums = (0) x @$data;
+	for my $tree (@$trees) {
+		for my $i ( 0 .. $#$data ) {
+			$sums[$i] += _path_length( $data->[$i], $tree, 0 );
+		}
+	}
+
+	# Precompute the single normalising factor; exp() is a direct FPU
+	# instruction and faster than Perl's general-purpose 2**x (pow).
+	# Derivation: 2**(-avg/c) = 2**(-(sum/t)/c) = exp(-sum * log(2)/(c*t))
+	if ( $c > 0 ) {
+		my $inv = log(2) / ( $c * $t );
+		return [ map { exp( -$_ * $inv ) } @sums ];
+	}
+	return [ (0.5) x @sums ];
 } ## end sub score_samples
 
 =head2 score_predict_samples
@@ -426,7 +549,7 @@ sub to_json {
 	$self->_check_fitted;
 	my $payload = {
 		format  => 'Algorithm::Classifier::IsolationForest',
-		version => 0,
+		version => 1,
 		params  => {
 			n_trees         => $self->{n_trees},
 			sample_size     => $self->{sample_size},
@@ -460,7 +583,15 @@ sub from_json {
 		&& defined $payload->{format}
 		&& $payload->{format} eq 'Algorithm::Classifier::IsolationForest';
 
-	my $p    = $payload->{params} || {};
+	my $p = $payload->{params} || {};
+
+	# version 0 used hash-based nodes; version 1+ uses array-based nodes.
+	# Convert old models on load so the rest of the code only sees arrays.
+	my $trees = $payload->{trees} || [];
+	if ( ( $payload->{version} // 0 ) < 1 ) {
+		$trees = [ map { _hash_node_to_array($_) } @$trees ];
+	}
+
 	my $self = {
 		n_trees              => $p->{n_trees},
 		sample_size          => $p->{sample_size},
@@ -475,7 +606,7 @@ sub from_json {
 		psi_used             => $p->{psi_used},
 		c_psi                => $p->{c_psi},
 		max_depth_used       => $p->{max_depth_used},
-		trees                => $payload->{trees} || [],
+		trees                => $trees,
 	};
 	croak "model contains no trees" unless @{ $self->{trees} };
 
@@ -484,7 +615,9 @@ sub from_json {
 	# are bit-for-bit identical to the original's.
 	$self->{c_psi} = _c( $self->{psi_used} ) if defined $self->{psi_used};
 
-	return bless $self, $class;
+	my $model = bless $self, $class;
+	$model->_rebuild_c_trees() if $HAS_C;
+	return $model;
 } ## end sub from_json
 
 =head2 save($path)
@@ -588,7 +721,7 @@ sub _build_tree {
 	my ( $self, $X, $depth, $limit ) = @_;
 
 	my $size = scalar @$X;
-	return { leaf => 1, size => $size }
+	return [ _NODE_LEAF, $size ]
 		if $depth >= $limit || $size <= 1;
 
 	my $nf = $self->{n_features};
@@ -607,21 +740,27 @@ sub _build_tree {
 	my @varying = grep { $lo[$_] < $hi[$_] } 0 .. $nf - 1;
 
 	# No spread on any feature => all points identical => cannot isolate.
-	return { leaf => 1, size => $size } unless @varying;
+	return [ _NODE_LEAF, $size ] unless @varying;
 
 	my $node
 		= $self->{mode} eq 'extended'
 		? $self->_oblique_split( $X, \@varying, \@lo, \@hi )
 		: _axis_split( $X, \@varying, \@lo, \@hi );
 
-	$node->{left}  = $self->_build_tree( $node->{_left},  $depth + 1, $limit );
-	$node->{right} = $self->_build_tree( $node->{_right}, $depth + 1, $limit );
-	delete @{$node}{qw(_left _right)};
+	# Split functions leave the raw point arrays at the child slots so that
+	# _build_tree can recurse into them; the subtree refs replace them in-place.
+	# Axis nodes:   left at [3], right at [4]
+	# Oblique nodes: left at [4], right at [5]
+	my ( $li, $ri ) = $node->[0] == _NODE_AXIS ? ( 3, 4 ) : ( 4, 5 );
+	$node->[$li] = $self->_build_tree( $node->[$li], $depth + 1, $limit );
+	$node->[$ri] = $self->_build_tree( $node->[$ri], $depth + 1, $limit );
 
 	return $node;
 } ## end sub _build_tree
 
 # Axis-parallel cut: random varying feature, random threshold in its range.
+# Returns [_NODE_AXIS, attr, split, \@left_pts, \@right_pts].
+# _build_tree overwrites slots 3 and 4 with the recursed subtrees.
 sub _axis_split {
 	my ( $X, $varying, $lo, $hi ) = @_;
 
@@ -633,13 +772,15 @@ sub _axis_split {
 		if   ( $row->[$attr] < $split ) { push @left,  $row }
 		else                            { push @right, $row }
 	}
-	return { attr => $attr, split => $split, _left => \@left, _right => \@right };
+	return [ _NODE_AXIS, $attr, $split, \@left, \@right ];
 } ## end sub _axis_split
 
 # Oblique cut (Extended Isolation Forest): a random hyperplane. We activate
 # (extension_level + 1) of the varying features, give each a Gaussian
 # coefficient, and place the plane through a random point in the bounding box.
 # A point goes left when coef . x <= b, where b = coef . p.
+# Returns [_NODE_OBLIQUE, \@idx, \@coef, $b, \@left_pts, \@right_pts].
+# _build_tree overwrites slots 4 and 5 with the recursed subtrees.
 sub _oblique_split {
 	my ( $self, $X, $varying, $lo, $hi ) = @_;
 
@@ -670,37 +811,140 @@ sub _oblique_split {
 		if   ( $dot <= $b ) { push @left,  $row }
 		else                { push @right, $row }
 	}
-	return {
-		idx    => \@idx,
-		coef   => \@coef,
-		b      => $b,
-		_left  => \@left,
-		_right => \@right
-	};
+	return [ _NODE_OBLIQUE, \@idx, \@coef, $b, \@left, \@right ];
 } ## end sub _oblique_split
 
 #-------------------------------------------------------------------------------
 # Path length of a single point in a single tree: edges traversed until a leaf,
-# plus c(leaf size) when the leaf still holds several points. Handles both axis
-# and oblique internal nodes, so a model of either mode scores correctly.
+# plus c(leaf size) when the leaf still holds several points.
+#
+# Node layout (arrayref, slot 0 = type):
+#   _NODE_LEAF    [0, size]
+#   _NODE_AXIS    [1, attr, split, left, right]
+#   _NODE_OBLIQUE [2, \@idx, \@coef, b, left, right]
+#
+# The type tag is also used as a loop sentinel: 0 (_NODE_LEAF) is falsy.
+# No $self argument -- the node type encodes everything needed.
 #-------------------------------------------------------------------------------
 sub _path_length {
-	my ( $self, $x, $node, $depth ) = @_;
-	while ( !$node->{leaf} ) {
-		my $left;
-		if ( exists $node->{attr} ) {    # axis-parallel split
-			$left = ( $x->[ $node->{attr} ] // 0 ) < $node->{split};
-		} else {                         # oblique (hyperplane) split
-			my ( $idx, $coef ) = ( $node->{idx}, $node->{coef} );
+	my ( $x, $node, $depth ) = @_;
+	while ( $node->[0] ) {                       # false only for leaf (type 0)
+		if ( $node->[0] == _NODE_AXIS ) {        # [1, attr, split, left, right]
+			$node = ( $x->[ $node->[1] ] // 0 ) < $node->[2]
+				? $node->[3] : $node->[4];
+		} else {                                 # [2, \@idx, \@coef, b, left, right]
+			my ( $idx, $coef, $b ) = ( $node->[1], $node->[2], $node->[3] );
 			my $dot = 0.0;
 			$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 ) for 0 .. $#$idx;
-			$left = $dot <= $node->{b};
+			$node = $dot <= $b ? $node->[4] : $node->[5];
 		}
-		$node = $left ? $node->{left} : $node->{right};
 		$depth++;
-	} ## end while ( !$node->{leaf} )
-	return $depth + _c( $node->{size} );
+	}
+	return $depth + _c( $node->[1] );            # leaf size at slot 1
 } ## end sub _path_length
+
+# Recursively convert a version-0 hash-based tree node to the version-1
+# array format.  Called by from_json when loading an old saved model.
+sub _hash_node_to_array {
+	my ($node) = @_;
+	if ( $node->{leaf} ) {
+		return [ _NODE_LEAF, $node->{size} ];
+	} elsif ( exists $node->{attr} ) {
+		return [
+			_NODE_AXIS,
+			$node->{attr},
+			$node->{split},
+			_hash_node_to_array( $node->{left} ),
+			_hash_node_to_array( $node->{right} ),
+		];
+	} else {
+		return [
+			_NODE_OBLIQUE,
+			$node->{idx},
+			$node->{coef},
+			$node->{b},
+			_hash_node_to_array( $node->{left} ),
+			_hash_node_to_array( $node->{right} ),
+		];
+	}
+} ## end sub _hash_node_to_array
+
+# ---------------------------------------------------------------------------
+# _pack_tree($root) -- flatten one tree into two packed double strings.
+#
+# Returns ($nodes_packed, $coefs_packed) where:
+#   nodes_packed: 6 doubles per node (see score_tree_xs comment above)
+#   coefs_packed: pairs (feat_idx, coef_val) for oblique nodes
+#
+# Nodes are numbered in DFS pre-order: the root is always index 0 and
+# children always get indices larger than their parent's.
+# ---------------------------------------------------------------------------
+sub _pack_tree {
+	my ($root) = @_;
+	my ( @node_data, @coefs );
+
+	my $assign;
+	$assign = sub {
+		my ($node) = @_;
+		my $my_idx = scalar @node_data;
+		push @node_data, undef;    # reserve slot; filled in after children
+
+		if ( $node->[0] == _NODE_LEAF ) {
+			$node_data[$my_idx] = [ 0.0, $node->[1] + 0.0, 0.0, 0.0, 0.0, 0.0 ];
+		}
+		elsif ( $node->[0] == _NODE_AXIS ) {
+			my $li = $assign->( $node->[3] );
+			my $ri = $assign->( $node->[4] );
+			$node_data[$my_idx] = [
+				1.0,
+				$node->[1] + 0.0,    # attr
+				$node->[2] + 0.0,    # split
+				$li + 0.0,
+				$ri + 0.0,
+				0.0,
+			];
+		}
+		else {                       # _NODE_OBLIQUE
+			my ( $idx_arr, $coef_arr, $b ) = ( $node->[1], $node->[2], $node->[3] );
+			my $coef_off = scalar(@coefs) / 2;
+			my $num      = scalar @$idx_arr;
+			for my $i ( 0 .. $num - 1 ) {
+				push @coefs, $idx_arr->[$i] + 0.0, $coef_arr->[$i] + 0.0;
+			}
+			my $li = $assign->( $node->[4] );
+			my $ri = $assign->( $node->[5] );
+			$node_data[$my_idx] = [
+				2.0,
+				$coef_off + 0.0,
+				$num + 0.0,
+				$li + 0.0,
+				$ri + 0.0,
+				$b + 0.0,
+			];
+		}
+		return $my_idx;
+	};
+	$assign->($root);
+
+	my $nodes_packed = pack( 'd*', map { @$_ } @node_data );
+	my $coefs_packed = @coefs ? pack( 'd*', @coefs ) : pack( 'd*' );
+	return ( $nodes_packed, $coefs_packed );
+} ## end sub _pack_tree
+
+# Build packed C-ready representations for all trees and store them in
+# $self->{_c_nodes} and $self->{_c_coefs}.  Called after fit() and from_json()
+# when $HAS_C is true.
+sub _rebuild_c_trees {
+	my ($self) = @_;
+	my ( @c_nodes, @c_coefs );
+	for my $tree ( @{ $self->{trees} } ) {
+		my ( $np, $cp ) = _pack_tree($tree);
+		push @c_nodes, $np;
+		push @c_coefs, $cp;
+	}
+	$self->{_c_nodes} = \@c_nodes;
+	$self->{_c_coefs} = \@c_coefs;
+} ## end sub _rebuild_c_trees
 
 sub _check_fitted {
 	my ($self) = @_;

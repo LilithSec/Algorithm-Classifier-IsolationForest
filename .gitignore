@@ -47,3 +47,4 @@ Algorithm-Classifier-IsolationForest-*
 
 bin/
 *.png
+_Inline/
