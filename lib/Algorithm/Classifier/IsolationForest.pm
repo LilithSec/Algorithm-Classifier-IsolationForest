@@ -480,6 +480,16 @@ Inits the object.
           => no learned threshold (predict() falls back to 0.5).
         default :: undef
 
+    - parallel_fit :: positive integer N => build the trees across N forked
+          worker processes during fit(). Each worker gets a derived seed
+          (parent seed + worker_id * 1009) so the parallel fit is
+          reproducible across runs at fixed worker count -- but the trees
+          produced are NOT bit-identical to a serial fit with the same
+          seed, because the RNG draws happen in a different order.
+          Inference is unaffected. Falls back silently to serial on
+          platforms without a real fork() (e.g. Windows without Cygwin).
+        default :: undef (serial)
+
 Note: log2 under Perl is as below...
 
     log($psi) / log(2)
@@ -505,6 +515,7 @@ sub new {
 		mode            => $mode,
 		extension_level => $args{extension_level},    # undef => max, resolved in fit()
 		contamination   => $args{contamination},      # undef => no learned threshold
+		parallel_fit    => $args{parallel_fit},       # undef/0/1 => serial; N>1 => fork
 		threshold       => undef,                     # learned in fit() if contamination set
 		trees           => [],
 		c_psi           => undef,                     # c(psi), set during fit()
@@ -518,6 +529,9 @@ sub new {
 	croak "contamination must be a number in (0, 0.5]"
 		if defined $self->{contamination}
 		&& !( $self->{contamination} > 0 && $self->{contamination} <= 0.5 );
+	croak "parallel_fit must be a positive integer"
+		if defined $self->{parallel_fit}
+		&& ( $self->{parallel_fit} !~ /^\d+$/ || $self->{parallel_fit} < 1 );
 
 	return bless $self, $class;
 } ## end sub new
@@ -628,12 +642,23 @@ sub fit {
 
 	srand( $self->{seed} ) if defined $self->{seed};
 
-	my @trees;
-	for ( 1 .. $self->{n_trees} ) {
-		my $sample = _subsample( $data, $psi );
-		push @trees, $self->_build_tree( $sample, 0, $limit );
+	my $workers = $self->{parallel_fit};
+	if (   defined $workers
+		&& $workers > 1
+		&& $self->{n_trees} > 1
+		&& _fork_supported() )
+	{
+		$self->{trees}
+			= $self->_fit_trees_parallel( $data, $psi, $limit, $workers );
 	}
-	$self->{trees} = \@trees;
+	else {
+		my @trees;
+		for ( 1 .. $self->{n_trees} ) {
+			my $sample = _subsample( $data, $psi );
+			push @trees, $self->_build_tree( $sample, 0, $limit );
+		}
+		$self->{trees} = \@trees;
+	}
 
 	# If a contamination rate was requested, learn the score cutoff that flags
 	# that fraction of the training set. We place the threshold midway between
@@ -655,6 +680,30 @@ sub fit {
 	$self->_rebuild_c_trees() if $HAS_C;
 	return $self;
 } ## end sub fit
+
+=head2 pack_data(\@data)
+
+Returns an opaque, blessed wrapper around the input dataset that the
+scoring methods can use directly, skipping the per-call work of walking
+the arrayref-of-arrayrefs and converting each cell into a double.  At
+high feature counts this is a meaningful win when the same dataset is
+scored repeatedly (e.g. interactive threshold tuning, dashboards,
+plotting that updates as parameters change).
+
+Requires the Inline::C backend; croaks if C<$HAS_C> is false.
+
+    my $packed = $forest->pack_data(\@data);
+
+    # Now any of these accept either an arrayref or the packed wrapper:
+    my $scores = $forest->score_samples($packed);
+    my $flags  = $forest->predict($packed, 0.6);
+    my ($s, $l) = $forest->score_predict_split($packed);
+
+The wrapper has C<n_pts> and C<n_feats> accessors for introspection.
+The feature count is matched against the model on every call; passing a
+packed dataset built for a different feature count is a fatal error.
+
+=cut
 
 =head2 path_lengths(\@data)
 
@@ -680,17 +729,16 @@ sub path_lengths {
 	my $t     = scalar @$trees;
 
 	if ( $HAS_C && $self->{_c_nodes} ) {
-		my $n_pts = scalar @$data;
-		my $nf    = $self->{n_features};
-		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		my $result = [];
 		finalize_path_lengths_xs( $sums_packed, $n_pts, $t + 0.0, $result );
 		return $result;
 	}
+
+	$data = $self->_to_arrayref($data);
 
 	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
 	my @sums = (0) x @$data;
@@ -743,11 +791,8 @@ sub predict {
 		my $trees = $self->{trees};
 		my $t     = scalar @$trees;
 		my $c     = $self->{c_psi};
-		my $n_pts = scalar @$data;
-		my $nf    = $self->{n_features};
-		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
@@ -757,7 +802,7 @@ sub predict {
 	}
 
 	# Fallback: edge thresholds, c==0, or no C backend.
-	my $scores = $self->score_samples($data);
+	my $scores = $self->score_samples( $self->_to_arrayref($data) );
 	return [ map { $_ >= $threshold ? 1 : 0 } @$scores ];
 }
 
@@ -792,11 +837,8 @@ sub score_samples {
 	my $t     = scalar @$trees;
 
 	if ( $HAS_C && $self->{_c_nodes} ) {
-		my $n_pts = scalar @$data;
-		my $nf    = $self->{n_features};
-		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		if ( $c > 0 ) {
@@ -807,6 +849,8 @@ sub score_samples {
 		}
 		return [ (0.5) x $n_pts ];
 	}
+
+	$data = $self->_to_arrayref($data);
 
 	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
 	my @sums = (0) x @$data;
@@ -865,11 +909,8 @@ sub score_predict_samples {
 		my $trees = $self->{trees};
 		my $t     = scalar @$trees;
 		my $c     = $self->{c_psi};
-		my $n_pts = scalar @$data;
-		my $nf    = $self->{n_features};
-		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		my $inv           = log(2) / ( $c * $t );
@@ -881,7 +922,7 @@ sub score_predict_samples {
 	}
 
 	# Fallback: edge thresholds, c==0, or no C backend.
-	my $scores = $self->score_samples($data);
+	my $scores = $self->score_samples( $self->_to_arrayref($data) );
 
 	my @to_return;
 	foreach my $score ( @{$scores} ) {
@@ -936,11 +977,8 @@ sub score_predict_split {
 		my $trees = $self->{trees};
 		my $t     = scalar @$trees;
 		my $c     = $self->{c_psi};
-		my $n_pts = scalar @$data;
-		my $nf    = $self->{n_features};
-		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		my $inv           = log(2) / ( $c * $t );
@@ -953,7 +991,7 @@ sub score_predict_split {
 	}
 
 	# Fallback: derive from score_samples.
-	my $scores = $self->score_samples($data);
+	my $scores = $self->score_samples( $self->_to_arrayref($data) );
 	my @labels = map { $_ >= $threshold ? 1 : 0 } @$scores;
 	return ( $scores, \@labels );
 }
@@ -1376,6 +1414,176 @@ sub _check_fitted {
 	my ($self) = @_;
 	croak "model is not fitted yet; call fit() first"
 		unless ref $self->{trees} eq 'ARRAY' && @{ $self->{trees} };
+}
+
+# Memoised "does this perl have a real fork()?".  False on Windows
+# without Cygwin; true on every Unix-like platform.
+{
+	my $cached;
+	sub _fork_supported {
+		return $cached if defined $cached;
+		require Config;
+		$cached
+			= ( ( $Config::Config{d_fork} || '' ) eq 'define' ) ? 1 : 0;
+		return $cached;
+	}
+}
+
+#-------------------------------------------------------------------------------
+# Fork-based parallel tree builder.  Used by fit() when parallel_fit > 1
+# and the platform has a real fork().  Divides n_trees evenly among
+# workers; each child seeds its own RNG ($seed + worker_id * 1009 so
+# fixed-worker-count runs are reproducible), builds its share, and
+# returns the trees to the parent via Storable on a one-shot pipe.
+#
+# The trees that come back differ from a serial fit with the same seed
+# because the RNG draws happen in a different order -- this is documented
+# as part of the parallel_fit contract.
+#-------------------------------------------------------------------------------
+sub _fit_trees_parallel {
+	my ( $self, $data, $psi, $limit, $workers ) = @_;
+	require Storable;
+	require POSIX;
+
+	my $n_trees = $self->{n_trees};
+	$workers = $n_trees if $workers > $n_trees;
+
+	# Divide n_trees as evenly as possible across workers.
+	my @shares;
+	{
+		my $base   = int( $n_trees / $workers );
+		my $extras = $n_trees - $base * $workers;
+		for my $w ( 0 .. $workers - 1 ) {
+			push @shares, $base + ( $w < $extras ? 1 : 0 );
+		}
+	}
+
+	my @procs;    # { pid, rh, share }
+	for my $w ( 0 .. $workers - 1 ) {
+		my $share = $shares[$w];
+		next unless $share > 0;
+
+		pipe( my $rh, my $wh ) or croak "pipe failed: $!";
+		my $pid = fork();
+		croak "fork failed: $!" unless defined $pid;
+
+		if ( $pid == 0 ) {
+			# child
+			close $rh;
+			binmode $wh;
+			if ( defined $self->{seed} ) {
+				srand( $self->{seed} + $w * 1009 );
+			}
+			my @trees;
+			for ( 1 .. $share ) {
+				my $sample = _subsample( $data, $psi );
+				push @trees, $self->_build_tree( $sample, 0, $limit );
+			}
+			print $wh Storable::freeze( \@trees );
+			close $wh;
+			# _exit so we don't run parent END/DESTROY in the child.
+			POSIX::_exit(0);
+		}
+
+		close $wh;
+		binmode $rh;
+		push @procs, { pid => $pid, rh => $rh, share => $share };
+	}
+
+	# Collect from each pipe in worker order so the canonical tree
+	# ordering is deterministic (worker 0's trees first, then 1's, ...).
+	my @all_trees;
+	for my $p (@procs) {
+		my $buf;
+		{
+			local $/;
+			$buf = readline( $p->{rh} );
+		}
+		close $p->{rh};
+		waitpid( $p->{pid}, 0 );
+		my $exit = $? >> 8;
+		croak "parallel_fit worker $p->{pid} exited with status $exit"
+			if $exit != 0;
+		my $trees = eval { Storable::thaw($buf) };
+		croak "parallel_fit worker $p->{pid} returned unparseable trees: $@"
+			if $@ || ref $trees ne 'ARRAY';
+		push @all_trees, @$trees;
+	}
+
+	return \@all_trees;
+}
+
+#-------------------------------------------------------------------------------
+# Packed input wrapper.  pack_data() returns one of these so callers can
+# score the same dataset many times without re-walking the AV/AV refs on
+# every call -- a meaningful win at high feature counts where
+# pack_input_xs is a non-trivial slice of total scoring time.
+#
+# It's a minimal blessed hashref: { packed, n_pts, n_feats }.  The C
+# scoring functions only need the packed bytes + dimensions.
+#-------------------------------------------------------------------------------
+sub pack_data {
+	my ( $self, $data ) = @_;
+	$self->_check_fitted;
+	croak "pack_data requires the Inline::C backend; install Inline::C"
+		unless $HAS_C;
+	croak "pack_data() expects an arrayref of samples"
+		unless ref $data eq 'ARRAY';
+	my $n_pts    = scalar @$data;
+	my $nf       = $self->{n_features};
+	my $x_packed = "\0" x ( $n_pts * $nf * 8 );
+	pack_input_xs( $data, $x_packed, $n_pts, $nf );
+	return bless {
+		packed  => $x_packed,
+		n_pts   => $n_pts,
+		n_feats => $nf,
+	}, 'Algorithm::Classifier::IsolationForest::PackedData';
+}
+
+# Internal helper: given $data that may be a raw arrayref OR a PackedData
+# instance, return the (n_pts, n_feats, x_packed) triple ready for
+# score_all_xs.  Called from every scoring fast path.
+sub _resolve_input {
+	my ( $self, $data ) = @_;
+	if ( ref $data eq 'Algorithm::Classifier::IsolationForest::PackedData' ) {
+		croak "PackedData has $data->{n_feats} features but model expects "
+			. $self->{n_features}
+			unless $data->{n_feats} == $self->{n_features};
+		return ( $data->{n_pts}, $data->{n_feats}, $data->{packed} );
+	}
+	my $n_pts    = scalar @$data;
+	my $nf       = $self->{n_features};
+	my $x_packed = "\0" x ( $n_pts * $nf * 8 );
+	pack_input_xs( $data, $x_packed, $n_pts, $nf );
+	return ( $n_pts, $nf, $x_packed );
+}
+
+# Helper used by the pure-Perl fallback paths: convert either form back
+# to an arrayref-of-arrayrefs.  Slow on PackedData -- the whole point of
+# packing is to keep things in C -- but lets the fallback path be
+# uniformly arrayref-driven.
+sub _to_arrayref {
+	my ( $self, $data ) = @_;
+	return $data if ref $data eq 'ARRAY';
+	if ( ref $data eq 'Algorithm::Classifier::IsolationForest::PackedData' ) {
+		my $n_pts = $data->{n_pts};
+		my $nf    = $data->{n_feats};
+		my @doubles = unpack( 'd*', $data->{packed} );
+		my @rows;
+		for my $i ( 0 .. $n_pts - 1 ) {
+			push @rows, [ @doubles[ $i * $nf .. ( $i + 1 ) * $nf - 1 ] ];
+		}
+		return \@rows;
+	}
+	croak "expected arrayref or PackedData, got " . ( ref($data) || 'scalar' );
+}
+
+# Minimal PackedData package: opaque token returned by pack_data().
+# Exposes n_pts and n_feats accessors for users who want to introspect.
+{
+	package Algorithm::Classifier::IsolationForest::PackedData;
+	sub n_pts   { $_[0]->{n_pts} }
+	sub n_feats { $_[0]->{n_feats} }
 }
 
 1;

@@ -251,12 +251,27 @@ my %pl;
 for my $exp (@experiments) {
     my $model = $exp->{perl_model};
     my $q     = $exp->{query_data};
+
+    # Pre-pack the query data once so the *_packed rows measure scoring
+    # in isolation, without the per-call pack_input_xs cost.  Only the
+    # C backend supports packed input; if it's missing, just reuse $q
+    # so the bench still runs (and the "packed" rows match the unpacked
+    # ones).
+    my $packed
+        = $Algorithm::Classifier::IsolationForest::HAS_C
+        ? $model->pack_data($q)
+        : $q;
+
     $pl{ exp_key($exp) } = {
-        score_samples         => bench( sub { $model->score_samples($q)         }, $BENCH_SECS ),
-        predict               => bench( sub { $model->predict($q)               }, $BENCH_SECS ),
-        score_predict_samples => bench( sub { $model->score_predict_samples($q) }, $BENCH_SECS ),
-        score_predict_split   => bench( sub { $model->score_predict_split($q)   }, $BENCH_SECS ),
-        path_lengths          => bench( sub { $model->path_lengths($q)          }, $BENCH_SECS ),
+        score_samples         => bench( sub { $model->score_samples($q)              }, $BENCH_SECS ),
+        score_samples_packed  => bench( sub { $model->score_samples($packed)         }, $BENCH_SECS ),
+        predict               => bench( sub { $model->predict($q)                    }, $BENCH_SECS ),
+        predict_packed        => bench( sub { $model->predict($packed)               }, $BENCH_SECS ),
+        score_predict_samples => bench( sub { $model->score_predict_samples($q)      }, $BENCH_SECS ),
+        score_predict_split   => bench( sub { $model->score_predict_split($q)        }, $BENCH_SECS ),
+        score_predict_split_packed
+                              => bench( sub { $model->score_predict_split($packed)   }, $BENCH_SECS ),
+        path_lengths          => bench( sub { $model->path_lengths($q)               }, $BENCH_SECS ),
     };
 }
 
@@ -265,12 +280,15 @@ for my $exp (@experiments) {
 # -----------------------------------------------------------------------
 # Row definitions: [ label, perl_key, sklearn_key ]
 my @rows = (
-    [ 'score_samples',         'score_samples',         'score_samples'     ],
-    [ 'predict',               'predict',               'predict'           ],
-    [ 'score_predict_samples', 'score_predict_samples', undef               ],
-    [ 'score_predict_split',   'score_predict_split',   undef               ],
-    [ 'path_lengths',          'path_lengths',          undef               ],
-    [ 'decision_function',     undef,                   'decision_function' ],
+    [ 'score_samples',              'score_samples',              'score_samples'     ],
+    [ 'score_samples (packed)',     'score_samples_packed',       undef               ],
+    [ 'predict',                    'predict',                    'predict'           ],
+    [ 'predict (packed)',           'predict_packed',             undef               ],
+    [ 'score_predict_samples',      'score_predict_samples',      undef               ],
+    [ 'score_predict_split',        'score_predict_split',        undef               ],
+    [ 'score_predict_split (packed)','score_predict_split_packed',undef               ],
+    [ 'path_lengths',               'path_lengths',               undef               ],
+    [ 'decision_function',          undef,                        'decision_function' ],
 );
 
 sub print_point {

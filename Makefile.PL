@@ -24,6 +24,7 @@ my %WriteMakefileArgs = (
 	PREREQ_PM => {
 		'App::Cmd'     => '0',
 		'Carp'         => '0',
+		'Config'       => '0',
 		'File::Slurp'  => '0',
 		'File::Spec'   => '0',
 		'File::Temp'   => '0',
@@ -31,6 +32,7 @@ my %WriteMakefileArgs = (
 		'List::Util'   => '0',
 		'POSIX'        => '0',
 		'Scalar::Util' => '0',
+		'Storable'     => '0',
 	},
 	dist       => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
 	clean      => { FILES    => 'Algorithm-Classifier-IsolationForest-*' },
