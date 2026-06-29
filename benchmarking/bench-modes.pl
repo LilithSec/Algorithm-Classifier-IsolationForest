@@ -43,7 +43,7 @@ print "(1000 training samples, n_trees=100, sample_size=256)\n";
 print "(1000 query points for score_samples)\n";
 print "(rates shown as calls/second; higher is faster)\n";
 
-my @feature_counts = ( 2, 5, 10, 20 );
+my @feature_counts = ( 2..10 );
 
 # Pre-generate all datasets (training and query) before any timing.
 srand(42);

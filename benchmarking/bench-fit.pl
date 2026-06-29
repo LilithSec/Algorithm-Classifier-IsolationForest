@@ -1,11 +1,12 @@
 #!/usr/bin/perl
 # benchmarking/bench-fit.pl
 #
-# Benchmarks the fit() method across four dimensions:
+# Benchmarks the fit() method across five dimensions:
 #   1. n_trees          -- number of isolation trees
 #   2. sample_size/psi  -- sub-sample size used to build each tree
 #   3. dataset size     -- number of training samples
-#   4. feature count    -- dimensionality
+#   4. feature count    -- dimensionality (wide range: 2, 5, 10, 20, 50)
+#   5. feature count    -- fine-grained 2–10 columns
 #
 # Each section uses Benchmark::cmpthese so results include both the raw
 # rate (fits/sec) and relative %-difference between variants.
@@ -98,7 +99,7 @@ cmpthese(
 );
 
 # -----------------------------------------------------------------------
-# 4. Feature count / dimensionality
+# 4. Feature count / dimensionality  (wide range)
 # -----------------------------------------------------------------------
 print "\n--- feature count  (1000 samples, n_trees=100, sample_size=256) ---\n";
 srand(42);
@@ -112,5 +113,27 @@ cmpthese(
         '10 features' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfd{10} ) },
         '20 features' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfd{20} ) },
         '50 features' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfd{50} ) },
+    }
+);
+
+# -----------------------------------------------------------------------
+# 5. Feature count / dimensionality  (fine-grained 2–10)
+# -----------------------------------------------------------------------
+print "\n--- feature count 2-10  (1000 samples, n_trees=100, sample_size=256) ---\n";
+srand(42);
+my %dfc;
+$dfc{$_} = make_data( 1000, $_ ) for ( 2..10 );
+cmpthese(
+    -2,
+    {
+        ' 2 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{2}  ) },
+        ' 3 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{3}  ) },
+        ' 4 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{4}  ) },
+        ' 5 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{5}  ) },
+        ' 6 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{6}  ) },
+        ' 7 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{7}  ) },
+        ' 8 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{8}  ) },
+        ' 9 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{9}  ) },
+        '10 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{10} ) },
     }
 );

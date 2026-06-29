@@ -8,6 +8,7 @@
 #   1. Scoring method comparison  -- which method has the lowest overhead
 #   2. Query set size scaling     -- throughput vs number of points scored
 #   3. n_trees scaling on scoring -- effect of model size on score time
+#   4. Feature count 2–10         -- fine-grained column-count sweep on scoring
 #
 # Models are pre-trained before any timing begins.
 #
@@ -106,5 +107,35 @@ cmpthese(
         'n_trees=100' => sub { $model{100}->score_samples($q1k) },
         'n_trees=200' => sub { $model{200}->score_samples($q1k) },
         'n_trees=500' => sub { $model{500}->score_samples($q1k) },
+    }
+);
+
+# -----------------------------------------------------------------------
+# 4. Feature count 2–10  (n_trees=100, sample_size=256, 1000 query points)
+# -----------------------------------------------------------------------
+print "\n--- feature count 2-10  (n_trees=100, sample_size=256, 1000 query points) ---\n";
+srand(42);
+my ( %fc_model, %fc_query );
+for my $nf ( 2..10 ) {
+    my $tr = make_data( 1000, $nf );
+    $fc_model{$nf} = Algorithm::Classifier::IsolationForest->new(
+        n_trees     => 100,
+        sample_size => 256,
+        seed        => 1,
+    )->fit($tr);
+    $fc_query{$nf} = make_data( 1000, $nf );
+}
+cmpthese(
+    -2,
+    {
+        ' 2 cols' => sub { $fc_model{2} ->score_samples( $fc_query{2}  ) },
+        ' 3 cols' => sub { $fc_model{3} ->score_samples( $fc_query{3}  ) },
+        ' 4 cols' => sub { $fc_model{4} ->score_samples( $fc_query{4}  ) },
+        ' 5 cols' => sub { $fc_model{5} ->score_samples( $fc_query{5}  ) },
+        ' 6 cols' => sub { $fc_model{6} ->score_samples( $fc_query{6}  ) },
+        ' 7 cols' => sub { $fc_model{7} ->score_samples( $fc_query{7}  ) },
+        ' 8 cols' => sub { $fc_model{8} ->score_samples( $fc_query{8}  ) },
+        ' 9 cols' => sub { $fc_model{9} ->score_samples( $fc_query{9}  ) },
+        '10 cols' => sub { $fc_model{10}->score_samples( $fc_query{10} ) },
     }
 );
