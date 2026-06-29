@@ -15,10 +15,12 @@ reports which acceleration (if any) is wired up:
 
   * Inline::C  -- C scoring backend compiled at module load
   * OpenMP     -- parallel tree-walk across CPU cores (requires libgomp)
+  * SIMD       -- vectorised oblique dot product in extended mode
+                  (gated on OpenMP 4.0+; relies on `#pragma omp simd`)
 
-The Inline::C / OpenMP detection happens automatically the first time the
-module is loaded (the build is cached under _Inline/).  If neither
-backend is active the module falls back to a pure-Perl implementation.
+The detection happens automatically the first time the module is loaded
+(the build is cached under _Inline/).  If no backend is active the
+module falls back to a pure-Perl implementation.
 ' }
 
 sub validate { 1 }
@@ -44,17 +46,25 @@ sub execute {
 		= $Algorithm::Classifier::IsolationForest::HAS_C ? 1 : 0;
 	my $has_openmp
 		= $Algorithm::Classifier::IsolationForest::HAS_OPENMP ? 1 : 0;
+	my $has_simd
+		= $Algorithm::Classifier::IsolationForest::HAS_SIMD ? 1 : 0;
 
 	print "Algorithm::Classifier::IsolationForest acceleration status\n";
 	print "  Inline::C : ", ( $has_c      ? "available\n" : "not available\n" );
 	print "  OpenMP    : ", ( $has_openmp ? "available\n" : "not available\n" );
+	print "  SIMD      : ", ( $has_simd   ? "available\n" : "not available\n" );
 	print "\n";
 
-	if ( $has_c && $has_openmp ) {
-		print "Active backend: Inline::C with OpenMP (multi-core parallel scoring)\n";
+	# Build a one-line backend summary that lists every active feature.
+	my @features;
+	push @features, 'OpenMP' if $has_openmp;
+	push @features, 'SIMD'   if $has_simd;
+
+	if ( $has_c && @features ) {
+		printf "Active backend: Inline::C with %s\n", join( ' + ', @features );
 	}
 	elsif ($has_c) {
-		print "Active backend: Inline::C (single-threaded)\n";
+		print "Active backend: Inline::C (serial, scalar)\n";
 	}
 	else {
 		print "Active backend: pure Perl (no native acceleration)\n";

@@ -8,6 +8,11 @@
 # all four combinations: {axis, extended} x {fit, score}.  This makes it
 # easy to see both the mode overhead and how it grows with dimensionality.
 #
+# Extended mode at high feature counts is where the SIMD pragma on the
+# oblique dot product matters most, so the sweep extends up to 100
+# features.  The closer the extended:score row gets to axis:score, the
+# less the per-node dot product is costing.
+#
 # Run with:
 #   perl -Ilib benchmarking/bench-modes.pl
 
@@ -43,7 +48,7 @@ print "(1000 training samples, n_trees=100, sample_size=256)\n";
 print "(1000 query points for score_samples)\n";
 print "(rates shown as calls/second; higher is faster)\n";
 
-my @feature_counts = ( 2..10 );
+my @feature_counts = ( 2..10, 20, 50, 100 );
 
 # Pre-generate all datasets (training and query) before any timing.
 srand(42);

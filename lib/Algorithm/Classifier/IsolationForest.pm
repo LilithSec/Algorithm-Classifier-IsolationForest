@@ -49,6 +49,7 @@ use constant _NODE_OBLIQUE => 2;
 # ---------------------------------------------------------------------------
 our $HAS_C      = 0;
 our $HAS_OPENMP = 0;
+our $HAS_SIMD   = 0;
 {
     my $C_CODE = <<'__INLINE_C__';
 #include <math.h>
@@ -65,6 +66,19 @@ static double _ifc(double n){
 
 int has_openmp_xs(){
 #ifdef _OPENMP
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* SIMD on the extended-mode oblique dot product is enabled via
+ * `#pragma omp simd`, which OpenMP 4.0 (_OPENMP == 201307) introduced.
+ * Anything older silently ignores the pragma -- the loop still runs,
+ * just not auto-vectorised.  So "simd available" really means the
+ * compiler is going to honour the pragma we put on that loop. */
+int has_simd_xs(){
+#if defined(_OPENMP) && _OPENMP >= 201307
     return 1;
 #else
     return 0;
@@ -309,6 +323,13 @@ void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
+    /* Invariant: every feature index stored in a tree node is in
+     * [0, n_feats).  fit() builds trees against n_features columns and
+     * pack_input_xs writes exactly that many doubles per row, and
+     * _resolve_input rejects PackedData with a mismatched feature
+     * count.  So the inner loop can omit per-iteration bounds checks
+     * on attr / fi -- this is what lets the oblique dot product
+     * vectorize cleanly under the omp-simd reduction below. */
     for (int i = 0; i < n_pts; i++) {
         double sum = 0.0;
         const double *xi = xd + (size_t)i * (size_t)n_feats;
@@ -324,16 +345,25 @@ void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
                     break;
                 }
                 if (type == 1) {
-                    int attr = (int)node[1];
-                    double fv = (attr < n_feats) ? xi[attr] : 0.0;
+                    double fv = xi[(int)node[1]];
                     ni = (fv < node[2]) ? (int)node[3] : (int)node[4];
                 } else {
                     int coff = (int)node[1], nf = (int)node[2];
                     double b = node[5], dot = 0.0;
                     const double *cpp = co + (size_t)coff * 2;
+                    /* Extended-mode oblique dot product.  omp-simd
+                     * reduction lets the compiler vectorize the
+                     * scalar-times-gathered-feature multiply-accumulate
+                     * (on AVX2+ via vgatherdpd + vfmadd231pd, or a
+                     * straightforward unrolled FMA chain otherwise).
+                     * Without _OPENMP defined the pragma is ignored
+                     * and the loop runs serially -- still benefits
+                     * from the bounds-check removal above. */
+                    #ifdef _OPENMP
+                    #pragma omp simd reduction(+:dot)
+                    #endif
                     for (int k = 0; k < nf; k++) {
-                        int fi = (int)cpp[k * 2];
-                        dot += cpp[k * 2 + 1] * (fi < n_feats ? xi[fi] : 0.0);
+                        dot += cpp[k * 2 + 1] * xi[(int)cpp[k * 2]];
                     }
                     ni = (dot <= b) ? (int)node[3] : (int)node[4];
                 }
@@ -368,6 +398,8 @@ __INLINE_C__
         };
     }
     $HAS_OPENMP = ( $HAS_C && defined &has_openmp_xs && has_openmp_xs() )
+        ? 1 : 0;
+    $HAS_SIMD = ( $HAS_C && defined &has_simd_xs && has_simd_xs() )
         ? 1 : 0;
 }
 
@@ -428,14 +460,18 @@ C<score_predict_samples>) is automatically accelerated through
 L<Inline::C> when it is installed and a working C compiler is reachable.
 If the toolchain also accepts C<-fopenmp> and can link against
 C<libgomp>, the per-point tree walk runs in parallel across all
-available CPU cores using OpenMP.
+available CPU cores using OpenMP, and the extended-mode oblique dot
+product is vectorised via C<#pragma omp simd> -- which on modern x86
+compilers translates to an unrolled FMA / AVX gather chain that's
+substantially faster for high-feature-count extended models.
 
 Detection happens once when the module is loaded; the compiled artefact
-is cached under C<_Inline/> and reused on subsequent runs.  Two package
-variables report what the build picked up:
+is cached under C<_Inline/> and reused on subsequent runs.  Three
+package variables report what the build picked up:
 
     $Algorithm::Classifier::IsolationForest::HAS_C       # 0/1
     $Algorithm::Classifier::IsolationForest::HAS_OPENMP  # 0/1
+    $Algorithm::Classifier::IsolationForest::HAS_SIMD    # 0/1 (OpenMP 4.0+)
 
 Neither dependency is required.  Without C<Inline::C> the module falls
 back to a pure-Perl implementation that produces identical results, just
