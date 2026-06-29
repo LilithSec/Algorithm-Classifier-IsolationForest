@@ -115,6 +115,79 @@ void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
     }
 }
 
+/* finalize_scores_xs(sm_sv, n_pts, inv, out_rv)
+ *
+ * Fills the pre-allocated arrayref out_rv with exp(-sm[i] * inv) for
+ * i in 0..n_pts-1.  Replaces the trailing
+ *
+ *   my @sums = unpack('d*', $sums_packed);
+ *   return [ map { exp(-$_ * $inv) } @sums ];
+ *
+ * which allocated ~2*n_pts intermediate Perl SVs per scoring call. */
+void finalize_scores_xs(SV* sm_sv, int n_pts, double inv, SV* out_rv){
+    STRLEN tl;
+    const double* sm;
+    AV* out;
+    int i;
+
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("finalize_scores_xs: out must be an arrayref");
+    }
+    sm  = (const double*)SvPVbyte(sm_sv, tl);
+    out = (AV*)SvRV(out_rv);
+    av_clear(out);
+    if (n_pts > 0) av_extend(out, n_pts - 1);
+    for (i = 0; i < n_pts; i++) {
+        av_store(out, i, newSVnv(exp(-sm[i] * inv)));
+    }
+}
+
+/* finalize_path_lengths_xs(sm_sv, n_pts, t, out_rv)
+ *
+ * Same idea as finalize_scores_xs but writes sm[i] / t (the average path
+ * length across n_trees=t trees) instead of the exp normalisation. */
+void finalize_path_lengths_xs(SV* sm_sv, int n_pts, double t, SV* out_rv){
+    STRLEN tl;
+    const double* sm;
+    AV* out;
+    int i;
+
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("finalize_path_lengths_xs: out must be an arrayref");
+    }
+    sm  = (const double*)SvPVbyte(sm_sv, tl);
+    out = (AV*)SvRV(out_rv);
+    av_clear(out);
+    if (n_pts > 0) av_extend(out, n_pts - 1);
+    for (i = 0; i < n_pts; i++) {
+        av_store(out, i, newSVnv(sm[i] / t));
+    }
+}
+
+/* predict_sums_xs(sm_sv, n_pts, sum_threshold, out_rv)
+ *
+ * Fills out_rv with 0/1 IVs based on sm[i] <= sum_threshold.  The caller
+ * pre-computes sum_threshold = -log(score_threshold) * c * n_trees / log(2),
+ * so this skips both the per-point exp() and the intermediate scores
+ * arrayref that the old "score_samples + map threshold" path created. */
+void predict_sums_xs(SV* sm_sv, int n_pts, double sum_threshold, SV* out_rv){
+    STRLEN tl;
+    const double* sm;
+    AV* out;
+    int i;
+
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("predict_sums_xs: out must be an arrayref");
+    }
+    sm  = (const double*)SvPVbyte(sm_sv, tl);
+    out = (AV*)SvRV(out_rv);
+    av_clear(out);
+    if (n_pts > 0) av_extend(out, n_pts - 1);
+    for (i = 0; i < n_pts; i++) {
+        av_store(out, i, newSViv(sm[i] <= sum_threshold ? 1 : 0));
+    }
+}
+
 /* score_all_xs(nodes_av, coefs_av, x_sv, sm_sv, n_pts, n_feats, n_trees)
  *
  * Scores all points across all trees in one C call.  See header comment
@@ -514,8 +587,9 @@ sub path_lengths {
 		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
-		my @sums = unpack( 'd*', $sums_packed );
-		return [ map { $_ / $t } @sums ];
+		my $result = [];
+		finalize_path_lengths_xs( $sums_packed, $n_pts, $t + 0.0, $result );
+		return $result;
 	}
 
 	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
@@ -553,6 +627,36 @@ sub predict {
 		= defined $threshold         ? $threshold
 		: defined $self->{threshold} ? $self->{threshold}
 		:                              0.5;
+	$self->_check_fitted;
+
+	# Fast path: threshold the raw path-length sums directly, skipping the
+	# per-point exp() and the intermediate scores arrayref.
+	# Derivation: score = exp(-sum * log(2) / (c*t))
+	#   so   score >= T   iff   sum <= -log(T) * c * t / log(2)
+	# Only valid for a normal threshold in (0, 1) and a positive c.
+	if (   $HAS_C
+		&& $self->{_c_nodes}
+		&& $self->{c_psi} > 0
+		&& $threshold > 0
+		&& $threshold < 1 )
+	{
+		my $trees = $self->{trees};
+		my $t     = scalar @$trees;
+		my $c     = $self->{c_psi};
+		my $n_pts = scalar @$data;
+		my $nf    = $self->{n_features};
+		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		pack_input_xs( $data, $x_packed, $n_pts, $nf );
+		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+			$x_packed, $sums_packed, $n_pts, $nf, $t );
+		my $sum_threshold = -log($threshold) * $c * $t / log(2);
+		my $result        = [];
+		predict_sums_xs( $sums_packed, $n_pts, $sum_threshold, $result );
+		return $result;
+	}
+
+	# Fallback: edge thresholds, c==0, or no C backend.
 	my $scores = $self->score_samples($data);
 	return [ map { $_ >= $threshold ? 1 : 0 } @$scores ];
 }
@@ -595,12 +699,13 @@ sub score_samples {
 		pack_input_xs( $data, $x_packed, $n_pts, $nf );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
 			$x_packed, $sums_packed, $n_pts, $nf, $t );
-		my @sums = unpack( 'd*', $sums_packed );
 		if ( $c > 0 ) {
-			my $inv = log(2) / ( $c * $t );
-			return [ map { exp( -$_ * $inv ) } @sums ];
+			my $inv    = log(2) / ( $c * $t );
+			my $result = [];
+			finalize_scores_xs( $sums_packed, $n_pts, $inv, $result );
+			return $result;
 		}
-		return [ (0.5) x @sums ];
+		return [ (0.5) x $n_pts ];
 	}
 
 	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
