@@ -18,6 +18,7 @@ t/50-contamination.t
 t/60-extended-mode.t
 t/70-persistence.t
 t/80-sklearn-comparison.t
+t/80-sklearn-comparison-undef.t
 t/manifest.t
 t/pod-coverage.t
 t/pod.t
