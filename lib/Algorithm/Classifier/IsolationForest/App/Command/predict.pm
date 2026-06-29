@@ -22,13 +22,16 @@ sub abstract { 'Processes the data using the score_predict_samples using the spe
 
 sub description { 'Processes the data using the score_predict_samples using the specified model.
 
+The input CSV may have any number of feature columns; every row must have the
+same column count and every value must be numeric.
+
 Output format is as below per line.
 
 $score,$predict
 
-If -d is specified it is as below.
+If -d is specified all input feature columns are prepended.
 
-$x,$y,$score,$predict
+$feat1,...,$featN,$score,$predict
 ' }
 
 sub validate {
@@ -65,25 +68,44 @@ sub execute {
 	my ( $self, $opt, $args ) = @_;
 
 	my @data;
-	
+	my $expected_cols;
+
 	my $line_int = 1;
 	foreach my $line (read_file($opt->{'i'})) {
 		chomp($line);
+		next if $line =~ /^\s*$/;
 
-	    my ($x, $y) = split(/\,/, $line);
+		my @fields = split(/,/, $line, -1);
 
-		if (!defined($x)){
-			die('Line '.$line_int.' of "'.$opt->{'i'}.'" lacks a value for x');
-		}elsif(!looks_like_number($x)){
-			die('Line '.$line_int.' of "'.$opt->{'i'}.'" value for x,"'.$x.'", does not appear to be a number');			
-		}elsif(!defined($y)){
-			die('Line '.$line_int.' of "'.$opt->{'i'}.'" lacks a value for y');
-		}elsif(!looks_like_number($y)){
-			die('Line '.$line_int.' of "'.$opt->{'i'}.'" value for y,"'.$y.'", does not appear to be a number');			
+		if ( !defined($expected_cols) ) {
+			$expected_cols = scalar @fields;
+			die( 'Line ' . $line_int . ' of "' . $opt->{'i'} . '" has no columns' )
+				if $expected_cols < 1;
+		} elsif ( scalar @fields != $expected_cols ) {
+			die(    'Line '
+				  . $line_int . ' of "'
+				  . $opt->{'i'}
+				  . '" has '
+				  . scalar(@fields)
+				  . ' columns but expected '
+				  . $expected_cols );
 		}
 
-		push @data, [ $x, $y ];
-		
+		my $col_int = 1;
+		for my $field (@fields) {
+			die(    'Line '
+				  . $line_int . ' of "'
+				  . $opt->{'i'}
+				  . '" value for column '
+				  . $col_int . ',"'
+				  . $field
+				  . '", does not appear to be a number' )
+				unless looks_like_number($field);
+			$col_int++;
+		}
+
+		push @data, \@fields;
+
 		$line_int++;
 	}
 
@@ -94,11 +116,18 @@ sub execute {
 	my $results_string='';
 	
 	my $data_int = 0;
-	while(defined($data[$data_int])){
-		if ($opt->{'d'}){
-			$results_string = $results_string .$data[$data_int][0].','.$data[$data_int][1].','. $results->[$data_int][0].','.$results->[$data_int][1]."\n";
-		}else{
-			$results_string = $results_string . $results->[$data_int][0].','.$results->[$data_int][1]."\n";
+	while ( defined( $data[$data_int] ) ) {
+		if ( $opt->{'d'} ) {
+			$results_string
+				= $results_string
+				. join( ',', @{ $data[$data_int] } ) . ','
+				. $results->[$data_int][0] . ','
+				. $results->[$data_int][1] . "\n";
+		} else {
+			$results_string
+				= $results_string
+				. $results->[$data_int][0] . ','
+				. $results->[$data_int][1] . "\n";
 		}
 
 		$data_int++;

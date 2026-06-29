@@ -30,12 +30,15 @@ sub description {
 
 Plot types are as below.
 
-auto: If there are two columns, 2heat. If there are 4 columns, 3range.
+auto: If there are two columns, 2heat. If there are 4 or more columns, 3range.
 2heat: Use column 1 and 2 to generate a splatter plot over a heat map.
-3range: Use column 1 and 2 for a splatter plot with 3 being used for gradient.
-3binary: Use column 1 and 2 for a splatter plot with 4 being if it is abnormal or not.
+3range: Use columns 1 and 2 for x/y, and the second-to-last column for the
+        score gradient. Suitable for predict -d output (any number of features).
+3binary: Use columns 1 and 2 for x/y, and the last column for normal/abnormal.
+         Suitable for predict -d output or gblob output.
 
-3range and 3binary require data outputed from predict with the -d flag.
+3range and 3binary require data outputted from predict with the -d flag.
+For N-dimensional data, columns 1 and 2 are always used for the x/y axes.
 ';
 } ## end sub description
 
@@ -73,21 +76,26 @@ sub execute {
 	my ( $self, $opt, $args ) = @_;
 
 	my @raw_csv = read_file( $opt->{'i'} );
-	my ( $x, $y, $score, $truth ) = split( /,/, $raw_csv[0] );
+	my @first_fields = split( /,/, $raw_csv[0] );
+	my $ncols = scalar @first_fields;
 
-	if ( $opt->{'p'} eq 'auto' && defined($truth) ) {
+	if ( $opt->{'p'} eq 'auto' && $ncols >= 4 ) {
 		$opt->{'p'} = '3range';
-	} elsif ( $opt->{'p'} eq 'auto' && defined($y) ) {
+	} elsif ( $opt->{'p'} eq 'auto' && $ncols >= 2 ) {
 		$opt->{'p'} = '2heat';
 	} elsif ( $opt->{'p'} eq 'auto' ) {
-		die('-p is set to auto and the specified CSV does not have enought columns');
-	} elsif ( $opt->{'p'} eq '2heat' && !defined($y) ) {
+		die('-p is set to auto and the specified CSV does not have enough columns');
+	} elsif ( $opt->{'p'} eq '2heat' && $ncols < 2 ) {
 		die('2heat specified but there is no column for y');
-	} elsif ( $opt->{'p'} eq '3range' && !defined($score) ) {
+	} elsif ( $opt->{'p'} eq '3range' && $ncols < 3 ) {
 		die('3range specified but there is no column for score');
-	} elsif ( $opt->{'p'} eq '3binary' && !defined($truth) ) {
+	} elsif ( $opt->{'p'} eq '3binary' && $ncols < 3 ) {
 		die('3binary specified but there is no column for truth');
 	}
+
+	# For predict -d output: score is the second-to-last column, prediction is last.
+	my $score_col = $ncols - 1;
+	my $pred_col  = $ncols;
 
 	$opt->{'i'} = File::Spec->rel2abs( $opt->{'i'} );
 	$opt->{'o'} = File::Spec->rel2abs( $opt->{'o'} );
@@ -106,15 +114,17 @@ set key autotitle columnhead
 		$gnu_plot_stuff = $gnu_plot_stuff . '
 set palette defined (0 "green", 1 "red")
 set cblabel "outlier score"
-plot "' . $opt->{'i'} . '" using 1:2:3 with points pt 7 ps 1.5 palette title ""
+plot "' . $opt->{'i'} . '" using 1:2:' . $score_col . ' with points pt 7 ps 1.5 palette title ""
 ';
 	} elsif ( $opt->{'p'} eq '3binary' ) {
 		$gnu_plot_stuff
 			= $gnu_plot_stuff
 			. 'plot "'
 			. $opt->{'i'}
-			. '" using 1:($4==0 ? $2 : 1/0) with points pt 7 ps 1.2 lc rgb "green" title "normal", \
-     "' . $opt->{'i'} . '" using 1:($4==1 ? $2 : 1/0) with points pt 9 ps 2.0 lc rgb "red"    title "abnormal"
+			. '" using 1:($'
+			. $pred_col
+			. '==0 ? $2 : 1/0) with points pt 7 ps 1.2 lc rgb "green" title "normal", \
+     "' . $opt->{'i'} . '" using 1:($' . $pred_col . '==1 ? $2 : 1/0) with points pt 9 ps 2.0 lc rgb "red"    title "abnormal"
 ';
 	} elsif ( $opt->{'p'} eq '2heat' ) {
 		$gnu_plot_stuff = $gnu_plot_stuff . '

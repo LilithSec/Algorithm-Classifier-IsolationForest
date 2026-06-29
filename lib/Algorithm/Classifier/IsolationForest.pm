@@ -153,12 +153,21 @@ sub decision_threshold { return $_[0]->{threshold} }
 
 Trains the model on the specified data.
 
-The data taken is a array of arrays, with each sub array containing two numbers.
+The data taken is an array of arrays. Each sub-array is one sample and must
+contain one or more numeric features. All samples must have the same number
+of features. There is no upper limit on dimensionality.
 
     @training_data = (
         [ 3, 5 ],
         [ 2.3, 1 ],
         [ 5, 9 ],
+        ...
+    );
+
+    # Three-feature example
+    @training_data = (
+        [ 1.0, 2.0, 3.0 ],
+        [ 1.1, 1.9, 3.1 ],
         ...
     );
 
