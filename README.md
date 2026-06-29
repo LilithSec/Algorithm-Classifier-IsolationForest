@@ -35,18 +35,73 @@ my $eif = IsolationForest->new(mode => 'extended', seed => 42);
 $eif->fit(\@data);
 ```
 
-# Native acceleration (Inline::C and OpenMP)
+# Performance options
+
+A handful of constructor / method-level knobs unlock measurable speedups
+for specific workloads.  All of them are no-ops when the optional
+Inline::C backend is absent.
+
+## `parallel_fit => N` — fork-based parallel training
+
+Builds the `n_trees` across `N` forked workers (Unix-like platforms; no-op
+elsewhere).  Each worker gets a derived RNG seed, so parallel fits are
+reproducible across runs at fixed worker count — though the trees
+*differ* from a serial fit with the same seed, because the RNG draws
+happen in a different order.  Inference results are unaffected.
+
+```perl
+my $f = Algorithm::Classifier::IsolationForest->new(
+    n_trees      => 200,
+    sample_size  => 256,
+    seed         => 42,
+    parallel_fit => 4,       # 4 forked workers
+)->fit(\@training_data);
+```
+
+## `pack_data` — score the same dataset many times faster
+
+`pack_data` returns an opaque wrapper that the scoring methods accept
+directly, skipping the per-call walk over the arrayref-of-arrayrefs.
+Use it when the same dataset is scored repeatedly (interactive threshold
+tuning, dashboards, plotting that updates as parameters change).
+
+```perl
+my $packed = $f->pack_data(\@data);
+my $scores = $f->score_samples($packed);
+my $flags  = $f->predict($packed, 0.6);
+my ($s, $l) = $f->score_predict_split($packed);  # two flat arrayrefs
+```
+
+## `score_predict_split` — get scores + labels without the AV-of-AVs
+
+When you want both anomaly scores and 0/1 labels but don't need them
+paired together row-by-row, `score_predict_split` returns the two as
+flat arrayrefs and skips the ~`2 * n_pts` SV allocations that the
+classic `score_predict_samples` shape requires.
+
+```perl
+my ($scores, $labels) = $f->score_predict_split(\@data, 0.6);
+```
+
+# Native acceleration (Inline::C, OpenMP, SIMD)
 
 The scoring hot path (`score_samples`, `predict`, `path_lengths`,
-`score_predict_samples`) is automatically accelerated through
-[`Inline::C`](https://metacpan.org/pod/Inline::C) when it is installed and
-a working C compiler is present.  If the toolchain also accepts
-`-fopenmp` and can link against `libgomp`, the per-point tree walk is
-parallelised across all available CPU cores using OpenMP.
+`score_predict_samples`, `score_predict_split`) is automatically
+accelerated through [`Inline::C`](https://metacpan.org/pod/Inline::C)
+when it is installed and a working C compiler is present.  On top of
+that:
+
+* if the toolchain accepts `-fopenmp` and can link against `libgomp`,
+  the per-point tree walk runs in parallel across all available CPU
+  cores using OpenMP;
+* on OpenMP 4.0+ compilers the extended-mode oblique dot product is
+  vectorised via `#pragma omp simd` — substantially faster for
+  high-feature-count extended models.
 
 Detection happens once at module load and is cached under `_Inline/`.
-Neither dependency is required: without them the module falls back to a
-pure-Perl implementation that produces identical results, just slower.
+None of these dependencies are required: without them the module falls
+back to a pure-Perl implementation that produces identical results,
+just slower.
 
 Check which backend is active on your machine:
 
@@ -60,8 +115,18 @@ Sample output on a host with everything wired up:
 Algorithm::Classifier::IsolationForest acceleration status
   Inline::C : available
   OpenMP    : available
+  SIMD      : available
 
-Active backend: Inline::C with OpenMP (multi-core parallel scoring)
+Active backend: Inline::C with OpenMP + SIMD
+```
+
+User code that wants to introspect the active backend can read three
+package variables:
+
+```perl
+$Algorithm::Classifier::IsolationForest::HAS_C       # 0/1
+$Algorithm::Classifier::IsolationForest::HAS_OPENMP  # 0/1
+$Algorithm::Classifier::IsolationForest::HAS_SIMD    # 0/1
 ```
 
 # Install

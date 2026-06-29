@@ -432,6 +432,26 @@ Algorithm::Classifier::IsolationForest - unsupervised anomaly detection via Isol
     my $eif = IsolationForest->new(mode => 'extended', seed => 42);
     $eif->fit(\@data);
 
+    # Parallel training (fork-based, Unix-like platforms): build the
+    # n_trees across several worker processes.
+    my $iforest = Algorithm::Classifier::IsolationForest->new(
+        n_trees      => 200,
+        sample_size  => 256,
+        seed         => 42,
+        parallel_fit => 4,        # 4 forked workers
+    );
+    $iforest->fit(\@data);
+
+    # Pre-pack a dataset to skip the per-call input-walk cost when the
+    # same data gets scored many times (interactive tuning, dashboards).
+    my $packed = $iforest->pack_data(\@data);
+    my $scores = $iforest->score_samples($packed);
+    my $flags  = $iforest->predict($packed, 0.6);
+
+    # Get scores and labels as two flat arrayrefs in one call -- cheaper
+    # than score_predict_samples when you don't need the paired shape.
+    my ($s, $l) = $iforest->score_predict_split(\@data, 0.6);
+
 =head1 DESCRIPTION
 
 Isolation Forest (Liu, Fei Tony & Ting, Kai & Zhou, Zhi-Hua, 2008) detects anomalies by random
@@ -455,8 +475,9 @@ L<https://www.researchgate.net/publication/224384174_Isolation_Forest>
 
 =head1 NATIVE ACCELERATION (Inline::C and OpenMP)
 
-The scoring hot path (C<score_samples>, C<predict>, C<path_lengths>, and
-C<score_predict_samples>) is automatically accelerated through
+The scoring hot path (C<score_samples>, C<predict>, C<path_lengths>,
+C<score_predict_samples>, and C<score_predict_split>) is automatically
+accelerated through
 L<Inline::C> when it is installed and a working C compiler is reachable.
 If the toolchain also accepts C<-fopenmp> and can link against
 C<libgomp>, the per-point tree walk runs in parallel across all
