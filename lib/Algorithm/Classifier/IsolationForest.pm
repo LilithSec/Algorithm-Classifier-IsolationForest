@@ -22,9 +22,17 @@ use constant _NODE_OBLIQUE => 2;
 # ---------------------------------------------------------------------------
 # Optional Inline::C accelerator for the scoring hot path.
 #
-# score_tree_xs(nodes_sv, coefs_sv, x_sv, sums_sv, n_pts, n_feats)
-# accumulates path lengths for all n_pts query points through one pre-packed
-# tree directly in C, avoiding Perl call-overhead on the innermost loop.
+# pack_input_xs(data_sv, out_sv, n_pts, n_feats)
+#     Walks the Perl arrayref-of-arrayrefs and writes a packed double buffer
+#     into out_sv.  Replaces the dominant per-call Perl map-pack loop.
+#
+# score_all_xs(nodes_av, coefs_av, x_sv, sm_sv, n_pts, n_feats, n_trees)
+#     Sums path lengths for all n_pts query points across all n_trees trees
+#     in one call.  Outer loop over points is OpenMP-parallel when the
+#     module was built with OpenMP (each iteration writes to a unique sm[i],
+#     so no synchronisation is needed).  Tree pointers are extracted from
+#     the AVs before the parallel region; the parallel region touches only
+#     raw double buffers.
 #
 # Node layout (6 doubles per node, "IF_NZ = 6"):
 #   leaf:    [0, size, 0,   0,  0, 0]
@@ -33,12 +41,20 @@ use constant _NODE_OBLIQUE => 2;
 #
 # coefs: flat array of (feat_idx, coef_val) pairs, indexed by coff*2.
 # x:     row-major doubles, n_pts rows of n_feats each.
-# sums:  in/out double array of length n_pts; C adds to existing values.
+# sums:  out double array of length n_pts; score_all_xs writes once per i.
+#
+# OpenMP is enabled at module load when the toolchain accepts -fopenmp and
+# libgomp is linkable; otherwise the same C code compiles to a serial loop
+# (the #pragma is silently ignored without _OPENMP defined).
 # ---------------------------------------------------------------------------
-our $HAS_C = 0;
+our $HAS_C      = 0;
+our $HAS_OPENMP = 0;
 {
     my $C_CODE = <<'__INLINE_C__';
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #define IF_NZ 6
 static double _ifc(double n){
     if(n<=1.0)return 0.0;
@@ -46,6 +62,15 @@ static double _ifc(double n){
     double h=log(n-1.0)+0.5772156649015329;
     return 2.0*h-2.0*(n-1.0)/n;
 }
+
+int has_openmp_xs(){
+#ifdef _OPENMP
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 /* pack_input_xs(data_sv, out_sv, n_pts, n_feats)
  *
  * Walks a Perl arrayref-of-arrayrefs (n_pts rows of n_feats doubles each)
@@ -55,8 +80,7 @@ static double _ifc(double n){
  *   pack('d*', map { my $r=$_; map { $r->[$_] // 0 } 0..$nf-1 } @$data)
  *
  * which was the dominant per-call overhead for high feature counts.
- * Undef cells (and missing rows) are coerced to 0.0 with no warning.
- * Matches the "fill an SV in place" convention used by score_tree_xs. */
+ * Undef cells (and missing rows) are coerced to 0.0 with no warning. */
 void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
     STRLEN tl;
     double* out;
@@ -91,45 +115,111 @@ void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
     }
 }
 
-void score_tree_xs(SV*nd_sv,SV*co_sv,SV*x_sv,SV*sm_sv,int n_pts,int n_feats){
+/* score_all_xs(nodes_av, coefs_av, x_sv, sm_sv, n_pts, n_feats, n_trees)
+ *
+ * Scores all points across all trees in one C call.  See header comment
+ * above for the bigger picture.  Writes sm[i] = sum_over_trees(path_len),
+ * not accumulating, so the caller need not zero-init sm.
+ *
+ * Thread-safety: the parallel region only reads node_ptrs/coef_ptrs/xd
+ * (extracted before the region) and writes sm[i] for a unique i per
+ * iteration.  No Perl API is called from inside the parallel region. */
+void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
+                  SV* x_sv, SV* sm_sv,
+                  int n_pts, int n_feats, int n_trees){
     STRLEN tl;
-    const double*nd=(const double*)SvPVbyte(nd_sv,tl);
-    const double*co=(const double*)SvPVbyte(co_sv,tl);
-    const double*xd=(const double*)SvPVbyte(x_sv,tl);
-    double*sm=(double*)SvPVbyte_force(sm_sv,tl);
-    int i,k;
-    for(i=0;i<n_pts;i++){
-        const double*xi=xd+(size_t)i*(size_t)n_feats;
-        int ni=0,depth=0;
-        for(;;){
-            const double*node=nd+(size_t)ni*IF_NZ;
-            int type=(int)node[0];
-            if(type==0){sm[i]+=depth+_ifc(node[1]);break;}
-            if(type==1){
-                int attr=(int)node[1];
-                double fv=(attr<n_feats)?xi[attr]:0.0;
-                ni=(fv<node[2])?(int)node[3]:(int)node[4];
-            }else{
-                int coff=(int)node[1],nf=(int)node[2];
-                double b=node[5],dot=0.0;
-                const double*cp=co+(size_t)coff*2;
-                for(k=0;k<nf;k++){
-                    int fi=(int)cp[k*2];
-                    dot+=cp[k*2+1]*(fi<n_feats?xi[fi]:0.0);
-                }
-                ni=(dot<=b)?(int)node[3]:(int)node[4];
-            }
-            depth++;
+    AV *nodes_av, *coefs_av;
+    const double *xd;
+    double *sm;
+    int ti;
+
+    if (!SvROK(nodes_av_sv) || SvTYPE(SvRV(nodes_av_sv)) != SVt_PVAV ||
+        !SvROK(coefs_av_sv) || SvTYPE(SvRV(coefs_av_sv)) != SVt_PVAV) {
+        croak("score_all_xs: nodes/coefs must be arrayrefs");
+    }
+    nodes_av = (AV*)SvRV(nodes_av_sv);
+    coefs_av = (AV*)SvRV(coefs_av_sv);
+
+    /* C99 VLAs -- n_trees is small (typ. 100) and fits on the stack. */
+    const double *node_ptrs[n_trees];
+    const double *coef_ptrs[n_trees];
+
+    for (ti = 0; ti < n_trees; ti++) {
+        SV** np = av_fetch(nodes_av, ti, 0);
+        SV** cp = av_fetch(coefs_av, ti, 0);
+        if (!np || !*np || !cp || !*cp) {
+            croak("score_all_xs: missing tree %d", ti);
         }
+        node_ptrs[ti] = (const double*)SvPVbyte(*np, tl);
+        coef_ptrs[ti] = (const double*)SvPVbyte(*cp, tl);
+    }
+
+    xd = (const double*)SvPVbyte(x_sv, tl);
+    sm = (double*)SvPVbyte_force(sm_sv, tl);
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < n_pts; i++) {
+        double sum = 0.0;
+        const double *xi = xd + (size_t)i * (size_t)n_feats;
+        for (int t = 0; t < n_trees; t++) {
+            const double *nd = node_ptrs[t];
+            const double *co = coef_ptrs[t];
+            int ni = 0, depth = 0;
+            for (;;) {
+                const double *node = nd + (size_t)ni * IF_NZ;
+                int type = (int)node[0];
+                if (type == 0) {
+                    sum += depth + _ifc(node[1]);
+                    break;
+                }
+                if (type == 1) {
+                    int attr = (int)node[1];
+                    double fv = (attr < n_feats) ? xi[attr] : 0.0;
+                    ni = (fv < node[2]) ? (int)node[3] : (int)node[4];
+                } else {
+                    int coff = (int)node[1], nf = (int)node[2];
+                    double b = node[5], dot = 0.0;
+                    const double *cpp = co + (size_t)coff * 2;
+                    for (int k = 0; k < nf; k++) {
+                        int fi = (int)cpp[k * 2];
+                        dot += cpp[k * 2 + 1] * (fi < n_feats ? xi[fi] : 0.0);
+                    }
+                    ni = (dot <= b) ? (int)node[3] : (int)node[4];
+                }
+                depth++;
+            }
+        }
+        sm[i] = sum;
     }
 }
 __INLINE_C__
-    local $@;
-    eval {
-        require Inline;
-        Inline->import( C => $C_CODE, LIBS => '-lm' );
-        $HAS_C = 1;
-    };
+
+    # Try compiling with OpenMP first; on any failure (compiler doesn't
+    # accept -fopenmp, libgomp missing, etc.) fall back to a serial build.
+    {
+        local $@;
+        eval {
+            require Inline;
+            Inline->import(
+                C       => $C_CODE,
+                CCFLAGS => '-fopenmp -O2',
+                LIBS    => '-lm -lgomp',
+            );
+            $HAS_C = 1;
+        };
+    }
+    unless ($HAS_C) {
+        local $@;
+        eval {
+            require Inline;
+            Inline->import( C => $C_CODE, LIBS => '-lm' );
+            $HAS_C = 1;
+        };
+    }
+    $HAS_OPENMP = ( $HAS_C && defined &has_openmp_xs && has_openmp_xs() )
+        ? 1 : 0;
 }
 
 =head1 NAME
@@ -417,17 +507,13 @@ sub path_lengths {
 	my $t     = scalar @$trees;
 
 	if ( $HAS_C && $self->{_c_nodes} ) {
-		my $n_pts   = scalar @$data;
-		my $nf      = $self->{n_features};
+		my $n_pts = scalar @$data;
+		my $nf    = $self->{n_features};
 		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my $sums_packed = "\0" x ( $n_pts * 8 );
 		pack_input_xs( $data, $x_packed, $n_pts, $nf );
-		my $sums_packed = pack( 'd*', (0.0) x $n_pts );
-		my $c_nodes = $self->{_c_nodes};
-		my $c_coefs = $self->{_c_coefs};
-		for my $ti ( 0 .. $t - 1 ) {
-			score_tree_xs( $c_nodes->[$ti], $c_coefs->[$ti],
-				$x_packed, $sums_packed, $n_pts, $nf );
-		}
+		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		my @sums = unpack( 'd*', $sums_packed );
 		return [ map { $_ / $t } @sums ];
 	}
@@ -502,17 +588,13 @@ sub score_samples {
 	my $t     = scalar @$trees;
 
 	if ( $HAS_C && $self->{_c_nodes} ) {
-		my $n_pts   = scalar @$data;
-		my $nf      = $self->{n_features};
+		my $n_pts = scalar @$data;
+		my $nf    = $self->{n_features};
 		my $x_packed    = "\0" x ( $n_pts * $nf * 8 );
+		my $sums_packed = "\0" x ( $n_pts * 8 );
 		pack_input_xs( $data, $x_packed, $n_pts, $nf );
-		my $sums_packed = pack( 'd*', (0.0) x $n_pts );
-		my $c_nodes = $self->{_c_nodes};
-		my $c_coefs = $self->{_c_coefs};
-		for my $ti ( 0 .. $t - 1 ) {
-			score_tree_xs( $c_nodes->[$ti], $c_coefs->[$ti],
-				$x_packed, $sums_packed, $n_pts, $nf );
-		}
+		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+			$x_packed, $sums_packed, $n_pts, $nf, $t );
 		my @sums = unpack( 'd*', $sums_packed );
 		if ( $c > 0 ) {
 			my $inv = log(2) / ( $c * $t );
