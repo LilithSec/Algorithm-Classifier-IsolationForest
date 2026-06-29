@@ -689,11 +689,11 @@ sub _path_length {
 	while ( !$node->{leaf} ) {
 		my $left;
 		if ( exists $node->{attr} ) {    # axis-parallel split
-			$left = $x->[ $node->{attr} ] < $node->{split};
+			$left = ( $x->[ $node->{attr} ] // 0 ) < $node->{split};
 		} else {                         # oblique (hyperplane) split
 			my ( $idx, $coef ) = ( $node->{idx}, $node->{coef} );
 			my $dot = 0.0;
-			$dot += $coef->[$_] * $x->[ $idx->[$_] ] for 0 .. $#$idx;
+			$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 ) for 0 .. $#$idx;
 			$left = $dot <= $node->{b};
 		}
 		$node = $left ? $node->{left} : $node->{right};

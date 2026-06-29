@@ -13,6 +13,7 @@ t/00-load.t
 t/10-constructor.t
 t/20-fit.t
 t/30-scoring.t
+t/31-undef-column-no-warnings.t
 t/40-anomaly-detection.t
 t/50-contamination.t
 t/60-extended-mode.t
