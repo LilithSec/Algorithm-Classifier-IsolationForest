@@ -1,5 +1,21 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
+0.3.0   2026-06-30
+        - fit() can now handle training data with missing (undef) feature
+          cells, selectable via the new `missing =>` constructor option:
+            die    :: croak on undef in the training data (default)
+            zero   :: treat a missing cell as the value 0
+            impute :: fill with the per-feature mean/median (see `impute_with`)
+            nan    :: range over present values and route missing rows to the
+                      right child, consistently at fit and score time
+        - new `impute_with => 'mean'|'median'` option for impute mode
+        - missing strategy + impute fill vector are persisted in saved models;
+          models from older releases load as `zero` (the prior undef -> 0
+          scoring behaviour)
+        - Tests: t/34-missing-values.t covering all four strategies, the
+          C/pure-Perl agreement under nan mode, and persistence round-trips
+        - Tests: update various ones to test against both C and pure perl
+
 0.2.1   2026-06-30/14:30
         - derp... actually update MANIFEST so a bunch of files from last release
           are actually included
