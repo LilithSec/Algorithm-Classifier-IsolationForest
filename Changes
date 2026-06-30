@@ -1,5 +1,9 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
+0.2.1   2026-06-30/14:30
+        - derp... actually update MANIFEST so a bunch of files from last release
+          are actually included
+
 0.2.0   2026-06-30/14:15
         - C acceleration via Inline::C for core fit and predict ops
         - OpenMP support for parallel multi-threaded fitting and predict ops
