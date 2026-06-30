@@ -1,6 +1,6 @@
 package BenchAccel;
 
-# Shared helper for the bench-*-accel.pl scripts.
+# Shared wall-clock timing helpers for the benchmarking/ scripts.
 #
 # Benchmark::cmpthese is unsafe for comparing OpenMP-parallel code
 # against serial code: its rate column is computed from CPU time
@@ -10,17 +10,34 @@ package BenchAccel;
 # *slower* than c_serial in cmpthese output -- the opposite of what
 # a user actually experiences.
 #
-# wall_cmpthese measures Time::HiRes wall-clock time instead, so the
-# rate column reflects what the user waits for.  Output layout matches
-# Benchmark::cmpthese: rows sorted slowest -> fastest, with a pairwise
-# speedup matrix showing percent difference from each column variant.
+# This module replaces it with three Time::HiRes-based helpers, used
+# across every bench script in this directory so they share a single
+# timing path:
+#
+#   wall_cmpthese($target_secs, \%vars)
+#       cmpthese-style comparison table, sorted slowest -> fastest with
+#       a pairwise percent-difference matrix.  Prints only; returns
+#       nothing.  Used when comparing several alternatives at once.
+#
+#   wall_rate($code, $secs)
+#       Warm up briefly, then time $code for $secs wall-clock seconds.
+#       Returns ops/second as a scalar.  Used when the script formats
+#       its own table (e.g. bench-sklearn-scoring's side-by-side
+#       Perl-vs-sklearn rows).
+#
+#   wall_time_median($code, $reps)
+#       Run $code once as a warm-up, then time exactly $reps invocations
+#       and return the median elapsed time in seconds.  Used when each
+#       invocation is too expensive to run on a time budget (fit() at
+#       large sizes); the small fixed sample with median statistic
+#       resists outliers without burning a 2-second budget per row.
 
 use strict;
 use warnings;
 use Time::HiRes qw(time);
 use Exporter qw(import);
 
-our @EXPORT_OK = qw(wall_cmpthese);
+our @EXPORT_OK = qw(wall_cmpthese wall_rate wall_time_median);
 
 sub wall_cmpthese {
     my ( $target_secs, $vars ) = @_;
@@ -81,6 +98,49 @@ sub _fmt_rate {
     return sprintf '%.2g/s', $r if $r < 1;
     return sprintf '%.2f/s', $r if $r < 100;
     return sprintf '%.0f/s',  $r;
+}
+
+# wall_rate($code, $secs) -- scalar ops/second over $secs wall-clock
+# seconds after a brief warm-up.  Returns the rate as a plain number
+# so callers can format their own tables.
+sub wall_rate {
+    my ( $code, $secs ) = @_;
+    $secs ||= 1;
+
+    # Warm-up: 5% of measurement budget, capped at 0.3 s to handle
+    # callers (e.g. sklearn-via-subprocess) whose first call is much
+    # more expensive than steady state.
+    my $warmup = $secs * 0.05;
+    $warmup = 0.3 if $warmup > 0.3;
+    my $wt0 = time;
+    $code->() while time - $wt0 < $warmup;
+
+    my $t0 = time;
+    my $n  = 0;
+    while ( time - $t0 < $secs ) { $code->(); $n++ }
+    my $elapsed = ( time - $t0 ) || 1e-9;
+    return $n / $elapsed;
+}
+
+# wall_time_median($code, $reps) -- single warm-up + $reps timed
+# invocations; returns the median elapsed time in seconds.  Use this
+# when each call is expensive enough that running it on a $secs budget
+# would either be wasteful (3 calls in 2 s tells you little more than
+# 3 calls in 30 s) or pull in confounders like GC pauses.
+sub wall_time_median {
+    my ( $code, $reps ) = @_;
+    $reps = 5 unless $reps && $reps >= 1;
+
+    $code->();    # warm-up: covers Inline::C compile, first-touch cache
+
+    my @times;
+    for ( 1 .. $reps ) {
+        my $t0 = time;
+        $code->();
+        push @times, time - $t0;
+    }
+    my @s = sort { $a <=> $b } @times;
+    return $s[ int( @s / 2 ) ];
 }
 
 1;

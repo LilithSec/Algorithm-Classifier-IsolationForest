@@ -19,7 +19,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Benchmark qw(cmpthese);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel qw(wall_cmpthese);
 use Algorithm::Classifier::IsolationForest;
 
 use constant PI => 3.14159265358979;
@@ -44,7 +46,7 @@ sub make_data {
 print "=" x 62, "\n";
 print " scoring benchmarks -- Algorithm::Classifier::IsolationForest\n";
 print "=" x 62, "\n";
-print "(rates shown as calls/second; higher is faster)\n";
+print "(rates shown as calls/second wall-clock; higher is faster)\n";
 
 # -----------------------------------------------------------------------
 # Pre-train models with different n_trees on the same 1000-sample dataset
@@ -71,7 +73,7 @@ my $q1k = $q{1_000};
 # -----------------------------------------------------------------------
 print "\n--- scoring methods  (n_trees=100, 1000 query points) ---\n";
 my $m = $model{100};
-cmpthese(
+wall_cmpthese(
     -2,
     {
         'score_samples'         => sub { $m->score_samples($q1k)         },
@@ -86,7 +88,7 @@ cmpthese(
 # 2. Query set size  (n_trees=100, score_samples)
 # -----------------------------------------------------------------------
 print "\n--- query set size  (n_trees=100, score_samples) ---\n";
-cmpthese(
+wall_cmpthese(
     -2,
     {
         '100 pts'   => sub { $m->score_samples( $q{100}    ) },
@@ -101,7 +103,7 @@ cmpthese(
 # 3. n_trees effect on scoring  (1000 query points, score_samples)
 # -----------------------------------------------------------------------
 print "\n--- n_trees effect on score_samples  (1000 query points) ---\n";
-cmpthese(
+wall_cmpthese(
     -2,
     {
         'n_trees=10'  => sub { $model{10} ->score_samples($q1k) },
@@ -127,7 +129,7 @@ for my $nf ( 2..10 ) {
     )->fit($tr);
     $fc_query{$nf} = make_data( 1000, $nf );
 }
-cmpthese(
+wall_cmpthese(
     -2,
     {
         ' 2 cols' => sub { $fc_model{2} ->score_samples( $fc_query{2}  ) },

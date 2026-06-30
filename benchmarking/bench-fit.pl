@@ -8,7 +8,7 @@
 #   4. feature count    -- dimensionality (wide range: 2, 5, 10, 20, 50)
 #   5. feature count    -- fine-grained 2–10 columns
 #
-# Each section uses Benchmark::cmpthese so results include both the raw
+# Each section uses BenchAccel::wall_cmpthese so results include both the raw
 # rate (fits/sec) and relative %-difference between variants.
 # Data generation is done before timing starts.
 #
@@ -18,7 +18,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Benchmark qw(cmpthese);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel qw(wall_cmpthese);
 use Algorithm::Classifier::IsolationForest;
 
 use constant PI => 3.14159265358979;
@@ -46,7 +48,7 @@ sub make_data {
 print "=" x 62, "\n";
 print " fit() benchmarks -- Algorithm::Classifier::IsolationForest\n";
 print "=" x 62, "\n";
-print "(rates shown as fits/second; higher is faster)\n";
+print "(rates shown as fits/second wall-clock; higher is faster)\n";
 
 # -----------------------------------------------------------------------
 # 1. n_trees
@@ -54,7 +56,7 @@ print "(rates shown as fits/second; higher is faster)\n";
 print "\n--- n_trees  (1000 samples, 2 features, sample_size=256) ---\n";
 srand(42);
 my $d1k = make_data( 1000, 2 );
-cmpthese(
+wall_cmpthese(
     -2,
     {
         'n_trees=10'  => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 10,  sample_size => 256 )->fit($d1k) },
@@ -69,7 +71,7 @@ cmpthese(
 # 2. sample_size (psi)
 # -----------------------------------------------------------------------
 print "\n--- sample_size/psi  (1000 samples, 2 features, n_trees=100) ---\n";
-cmpthese(
+wall_cmpthese(
     -2,
     {
         'psi=32'  => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 32  )->fit($d1k) },
@@ -87,7 +89,7 @@ print "\n--- dataset size  (n_trees=100, sample_size=256, 2 features) ---\n";
 srand(42);
 my %ds;
 $ds{$_} = make_data( $_, 2 ) for ( 500, 1_000, 2_500, 5_000, 10_000 );
-cmpthese(
+wall_cmpthese(
     -2,
     {
         '500 samples'  => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $ds{500}    ) },
@@ -105,7 +107,7 @@ print "\n--- feature count  (1000 samples, n_trees=100, sample_size=256) ---\n";
 srand(42);
 my %dfd;
 $dfd{$_} = make_data( 1000, $_ ) for ( 2, 5, 10, 20, 50 );
-cmpthese(
+wall_cmpthese(
     -2,
     {
         '2 features'  => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfd{2}  ) },
@@ -123,7 +125,7 @@ print "\n--- feature count 2-10  (1000 samples, n_trees=100, sample_size=256) --
 srand(42);
 my %dfc;
 $dfc{$_} = make_data( 1000, $_ ) for ( 2..10 );
-cmpthese(
+wall_cmpthese(
     -2,
     {
         ' 2 cols' => sub { Algorithm::Classifier::IsolationForest->new( n_trees => 100, sample_size => 256 )->fit( $dfc{2}  ) },

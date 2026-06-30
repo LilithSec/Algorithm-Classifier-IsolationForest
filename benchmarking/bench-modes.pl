@@ -19,7 +19,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Benchmark qw(cmpthese);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel qw(wall_cmpthese);
 use Algorithm::Classifier::IsolationForest;
 
 use constant PI => 3.14159265358979;
@@ -46,7 +48,7 @@ print " axis vs extended mode -- Algorithm::Classifier::IsolationForest\n";
 print "=" x 62, "\n";
 print "(1000 training samples, n_trees=100, sample_size=256)\n";
 print "(1000 query points for score_samples)\n";
-print "(rates shown as calls/second; higher is faster)\n";
+print "(rates shown as calls/second wall-clock; higher is faster)\n";
 
 my @feature_counts = ( 2..10, 20, 50, 100 );
 
@@ -80,7 +82,7 @@ for my $nf (@feature_counts) {
 # One table per feature count
 for my $nf (@feature_counts) {
     printf "\n--- %d feature%s ---\n", $nf, $nf == 1 ? '' : 's';
-    cmpthese(
+    wall_cmpthese(
         -2,
         {
             'axis:fit'      => sub {

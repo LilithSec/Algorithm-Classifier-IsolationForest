@@ -19,7 +19,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Time::HiRes qw(time);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel qw(wall_time_median);
 use Config;
 use Algorithm::Classifier::IsolationForest;
 
@@ -30,27 +32,6 @@ sub gaussian {
     return $mu + $sigma
         * sqrt( -2 * log( rand() || 1e-12 ) )
         * cos( 2 * PI * rand() );
-}
-
-# -----------------------------------------------------------------------
-# Bench helper: warm up briefly, then time exactly $reps fits and report
-# the median.  fit() is much slower than scoring so we run it a handful
-# of times rather than fitting a 2-second budget.
-# -----------------------------------------------------------------------
-sub time_fit_median {
-    my ( $build_iforest, $train, $reps ) = @_;
-    # One warm-up fit (covers any first-time Inline::C compile path etc.)
-    $build_iforest->()->fit($train);
-
-    my @times;
-    for ( 1 .. $reps ) {
-        my $f  = $build_iforest->();
-        my $t0 = time();
-        $f->fit($train);
-        push @times, time() - $t0;
-    }
-    my @s = sort { $a <=> $b } @times;
-    return $s[ int( @s / 2 ) ];
 }
 
 # -----------------------------------------------------------------------
@@ -103,16 +84,15 @@ printf "  %-12s  %14s  %14s\n", '-' x 12, '-' x 14, '-' x 14;
 my $serial_time;
 for my $w (@workers) {
     my $label = $w == 1 ? 'serial' : "fork=$w";
-    my $fit_time = time_fit_median(
+    my $fit_time = wall_time_median(
         sub {
             Algorithm::Classifier::IsolationForest->new(
                 n_trees      => $N_TREES,
                 sample_size  => $SAMPLE_SIZE,
                 seed         => 1,
                 parallel_fit => $w == 1 ? undef : $w,
-            );
+            )->fit( \@train );
         },
-        \@train,
         $REPS,
     );
     $serial_time = $fit_time if $w == 1;

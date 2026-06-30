@@ -29,7 +29,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Time::HiRes qw(time);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel  qw(wall_rate);
 use File::Temp  qw(tempfile);
 use JSON::PP    ();
 use Algorithm::Classifier::IsolationForest;
@@ -54,20 +56,6 @@ sub make_data {
         push @rows, [ map { $r * ( rand() > 0.5 ? 1 : -1 ) } 1 .. $nf ];
     }
     return \@rows;
-}
-
-# -----------------------------------------------------------------------
-# Timing helper: warm up for 0.3 s then measure for $secs wall-clock seconds.
-# Returns ops/second.
-# -----------------------------------------------------------------------
-sub bench {
-    my ( $code, $secs ) = @_;
-    my $t0 = time();
-    $code->() while time() - $t0 < 0.3;
-    $t0 = time();
-    my $n = 0;
-    $code->(), $n++ while time() - $t0 < $secs;
-    return $n / ( time() - $t0 );
 }
 
 # -----------------------------------------------------------------------
@@ -263,15 +251,15 @@ for my $exp (@experiments) {
         : $q;
 
     $pl{ exp_key($exp) } = {
-        score_samples         => bench( sub { $model->score_samples($q)              }, $BENCH_SECS ),
-        score_samples_packed  => bench( sub { $model->score_samples($packed)         }, $BENCH_SECS ),
-        predict               => bench( sub { $model->predict($q)                    }, $BENCH_SECS ),
-        predict_packed        => bench( sub { $model->predict($packed)               }, $BENCH_SECS ),
-        score_predict_samples => bench( sub { $model->score_predict_samples($q)      }, $BENCH_SECS ),
-        score_predict_split   => bench( sub { $model->score_predict_split($q)        }, $BENCH_SECS ),
+        score_samples         => wall_rate( sub { $model->score_samples($q)              }, $BENCH_SECS ),
+        score_samples_packed  => wall_rate( sub { $model->score_samples($packed)         }, $BENCH_SECS ),
+        predict               => wall_rate( sub { $model->predict($q)                    }, $BENCH_SECS ),
+        predict_packed        => wall_rate( sub { $model->predict($packed)               }, $BENCH_SECS ),
+        score_predict_samples => wall_rate( sub { $model->score_predict_samples($q)      }, $BENCH_SECS ),
+        score_predict_split   => wall_rate( sub { $model->score_predict_split($q)        }, $BENCH_SECS ),
         score_predict_split_packed
-                              => bench( sub { $model->score_predict_split($packed)   }, $BENCH_SECS ),
-        path_lengths          => bench( sub { $model->path_lengths($q)               }, $BENCH_SECS ),
+                              => wall_rate( sub { $model->score_predict_split($packed)   }, $BENCH_SECS ),
+        path_lengths          => wall_rate( sub { $model->path_lengths($q)               }, $BENCH_SECS ),
     };
 }
 
