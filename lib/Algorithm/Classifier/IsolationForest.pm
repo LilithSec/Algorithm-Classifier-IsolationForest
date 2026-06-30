@@ -48,6 +48,14 @@ use constant _NODE_OBLIQUE => 2;
 # (int)<double> cast inside the SIMD loop, and lets the value loads be
 # contiguous so the compiler emits a clean FMA chain over val[k] with
 # the feature gather on xi[idx[k]] kept separate.
+#
+# Dense-pack fast path: when an oblique node uses every feature (the
+# common case in extended mode with extension_level == n_features - 1),
+# _pack_tree writes its coefficients in feature order so val[k] is the
+# coefficient for feature k.  score_all_xs detects this via `nf ==
+# n_feats` and uses a no-gather dot product (dot += val[k] * xi[k])
+# that vectorizes cleanly with FMA -- substantially faster than the
+# sparse gather path on high-feature-count models.
 # x:     row-major doubles, n_pts rows of n_feats each.
 # sums:  out double array of length n_pts; score_all_xs writes once per i.
 #
@@ -371,22 +379,35 @@ void score_all_xs(SV* nodes_av_sv, SV* idx_av_sv, SV* val_av_sv,
                 } else {
                     int coff = (int)node[1], nf = (int)node[2];
                     double b = node[5], dot = 0.0;
-                    const int    *idx_p = ico + (size_t)coff;
                     const double *val_p = vco + (size_t)coff;
-                    /* Extended-mode oblique dot product.  With idx as
-                     * contiguous int32 and val as contiguous doubles,
-                     * the compiler can emit a clean vfmadd231pd over
-                     * the val[] stream while gathering xi[idx[k]] -- a
-                     * markedly cheaper pattern than the old stride-2
-                     * (idx-as-double, val) interleave.  omp simd
-                     * permits reordering of the reduction; without
-                     * _OPENMP defined the pragma is ignored and the
-                     * loop runs serially. */
-                    #ifdef _OPENMP
-                    #pragma omp simd reduction(+:dot)
-                    #endif
-                    for (int k = 0; k < nf; k++) {
-                        dot += val_p[k] * xi[idx_p[k]];
+                    if (nf == n_feats) {
+                        /* Dense oblique split: this node uses every
+                         * feature, so _pack_tree laid the coefficients
+                         * out in feature order.  No gather -- the
+                         * inner loop is a textbook FMA-vectorizable
+                         * dot product over two contiguous double
+                         * streams.  Common case in extended mode at
+                         * the default extension_level (== n_feats-1). */
+                        #ifdef _OPENMP
+                        #pragma omp simd reduction(+:dot)
+                        #endif
+                        for (int k = 0; k < n_feats; k++) {
+                            dot += val_p[k] * xi[k];
+                        }
+                    } else {
+                        /* Sparse oblique split: only nf < n_feats
+                         * features participate, so we still need the
+                         * gather on xi[idx_p[k]].  Storing idx as
+                         * contiguous int32 (rather than interleaved
+                         * doubles) keeps the gather pattern clean and
+                         * the val[] load contiguous. */
+                        const int *idx_p = ico + (size_t)coff;
+                        #ifdef _OPENMP
+                        #pragma omp simd reduction(+:dot)
+                        #endif
+                        for (int k = 0; k < nf; k++) {
+                            dot += val_p[k] * xi[idx_p[k]];
+                        }
                     }
                     ni = (dot <= b) ? (int)node[3] : (int)node[4];
                 }
@@ -1511,7 +1532,7 @@ sub _hash_node_to_array {
 # children always get indices larger than their parent's.
 # ---------------------------------------------------------------------------
 sub _pack_tree {
-	my ($root) = @_;
+	my ( $root, $n_features ) = @_;
 	my ( @node_data, @coef_idx, @coef_val );
 
 	my $assign;
@@ -1539,10 +1560,29 @@ sub _pack_tree {
 			my ( $idx_arr, $coef_arr, $b ) = ( $node->[1], $node->[2], $node->[3] );
 			my $coef_off = scalar @coef_idx;
 			my $num      = scalar @$idx_arr;
-			for my $i ( 0 .. $num - 1 ) {
-				push @coef_idx, int( $idx_arr->[$i] );
-				push @coef_val, $coef_arr->[$i] + 0.0;
+
+			# Dense-pack opportunity: when this oblique split uses
+			# every feature (extension_level == n_features - 1 and
+			# all features vary), pack the coefficients in feature
+			# order so val[k] is the coefficient for feature k.  The
+			# C scoring path then detects `nf == n_feats` and switches
+			# to a no-gather inner loop (dot += val[k] * xi[k]) that
+			# auto-vectorizes cleanly with FMA.
+			if ( defined $n_features && $num == $n_features ) {
+				my %coef_for;
+				@coef_for{ @$idx_arr } = @$coef_arr;
+				for my $k ( 0 .. $n_features - 1 ) {
+					push @coef_idx, $k;
+					push @coef_val, $coef_for{$k} + 0.0;
+				}
 			}
+			else {
+				for my $i ( 0 .. $num - 1 ) {
+					push @coef_idx, int( $idx_arr->[$i] );
+					push @coef_val, $coef_arr->[$i] + 0.0;
+				}
+			}
+
 			my $li = $assign->( $node->[4] );
 			my $ri = $assign->( $node->[5] );
 			$node_data[$my_idx] = [
@@ -1566,12 +1606,13 @@ sub _pack_tree {
 
 # Build packed C-ready representations for all trees and store them in
 # $self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val}.
-# Called after fit() and from_json() when _use_c is true.
+# Called after fit() and from_json() when _use_c is true.  n_features is
+# threaded through so _pack_tree can spot the dense-pack opportunity.
 sub _rebuild_c_trees {
 	my ($self) = @_;
 	my ( @c_nodes, @c_coef_idx, @c_coef_val );
 	for my $tree ( @{ $self->{trees} } ) {
-		my ( $np, $ip, $vp ) = _pack_tree($tree);
+		my ( $np, $ip, $vp ) = _pack_tree( $tree, $self->{n_features} );
 		push @c_nodes,    $np;
 		push @c_coef_idx, $ip;
 		push @c_coef_val, $vp;
