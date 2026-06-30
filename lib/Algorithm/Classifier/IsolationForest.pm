@@ -289,7 +289,8 @@ void score_predict_split_xs(SV* sm_sv, int n_pts, double inv,
  * iteration.  No Perl API is called from inside the parallel region. */
 void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
                   SV* x_sv, SV* sm_sv,
-                  int n_pts, int n_feats, int n_trees){
+                  int n_pts, int n_feats, int n_trees,
+                  int use_openmp){
     STRLEN tl;
     AV *nodes_av, *coefs_av;
     const double *xd;
@@ -321,7 +322,7 @@ void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
     sm = (double*)SvPVbyte_force(sm_sv, tl);
 
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(use_openmp)
 #endif
     /* Invariant: every feature index stored in a tree node is in
      * [0, n_feats).  fit() builds trees against n_features columns and
@@ -547,6 +548,18 @@ Inits the object.
           platforms without a real fork() (e.g. Windows without Cygwin).
         default :: undef (serial)
 
+    - use_c :: boolean, override whether the Inline::C scoring backend is
+          used.  When false the instance falls back to pure Perl even if
+          the C backend compiled successfully.  When true (or unset) the
+          C backend is used if available ($HAS_C).
+        default :: $HAS_C
+
+    - use_openmp :: boolean, override whether OpenMP parallel scoring is
+          used inside score_all_xs().  When false the C tree walk runs
+          single-threaded even if OpenMP was linked in.  Ignored when
+          use_c is false (pure Perl has no OpenMP path).
+        default :: $HAS_OPENMP
+
 Note: log2 under Perl is as below...
 
     log($psi) / log(2)
@@ -573,6 +586,8 @@ sub new {
 		extension_level => $args{extension_level},    # undef => max, resolved in fit()
 		contamination   => $args{contamination},      # undef => no learned threshold
 		parallel_fit    => $args{parallel_fit},       # undef/0/1 => serial; N>1 => fork
+		_use_c          => ( defined $args{use_c} ? ( $args{use_c} ? 1 : 0 ) : $HAS_C ),
+		_use_openmp     => ( defined $args{use_openmp} ? ( $args{use_openmp} ? 1 : 0 ) : $HAS_OPENMP ),
 		threshold       => undef,                     # learned in fit() if contamination set
 		trees           => [],
 		c_psi           => undef,                     # c(psi), set during fit()
@@ -734,7 +749,7 @@ sub fit {
 			: $desc[ $n_pts - 1 ] - 1e-9;              # k == n: flag everything
 	} ## end if ( defined $self->{contamination} )
 
-	$self->_rebuild_c_trees() if $HAS_C;
+	$self->_rebuild_c_trees() if $self->{_use_c};
 	return $self;
 } ## end sub fit
 
@@ -747,7 +762,7 @@ high feature counts this is a meaningful win when the same dataset is
 scored repeatedly (e.g. interactive threshold tuning, dashboards,
 plotting that updates as parameters change).
 
-Requires the Inline::C backend; croaks if C<$HAS_C> is false.
+Requires the Inline::C backend; croaks if C<use_c> is false.
 
     my $packed = $forest->pack_data(\@data);
 
@@ -785,11 +800,12 @@ sub path_lengths {
 	my $trees = $self->{trees};
 	my $t     = scalar @$trees;
 
-	if ( $HAS_C && $self->{_c_nodes} ) {
+	if ( $self->{_use_c} && $self->{_c_nodes} ) {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
-			$x_packed, $sums_packed, $n_pts, $nf, $t );
+			$x_packed, $sums_packed, $n_pts, $nf, $t,
+			$self->{_use_openmp} );
 		my $result = [];
 		finalize_path_lengths_xs( $sums_packed, $n_pts, $t + 0.0, $result );
 		return $result;
@@ -839,7 +855,7 @@ sub predict {
 	# Derivation: score = exp(-sum * log(2) / (c*t))
 	#   so   score >= T   iff   sum <= -log(T) * c * t / log(2)
 	# Only valid for a normal threshold in (0, 1) and a positive c.
-	if (   $HAS_C
+	if (   $self->{_use_c}
 		&& $self->{_c_nodes}
 		&& $self->{c_psi} > 0
 		&& $threshold > 0
@@ -851,7 +867,8 @@ sub predict {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
-			$x_packed, $sums_packed, $n_pts, $nf, $t );
+			$x_packed, $sums_packed, $n_pts, $nf, $t,
+			$self->{_use_openmp} );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
 		my $result        = [];
 		predict_sums_xs( $sums_packed, $n_pts, $sum_threshold, $result );
@@ -893,11 +910,12 @@ sub score_samples {
 	my $trees = $self->{trees};
 	my $t     = scalar @$trees;
 
-	if ( $HAS_C && $self->{_c_nodes} ) {
+	if ( $self->{_use_c} && $self->{_c_nodes} ) {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
-			$x_packed, $sums_packed, $n_pts, $nf, $t );
+			$x_packed, $sums_packed, $n_pts, $nf, $t,
+			$self->{_use_openmp} );
 		if ( $c > 0 ) {
 			my $inv    = log(2) / ( $c * $t );
 			my $result = [];
@@ -957,7 +975,7 @@ sub score_predict_samples {
 	# in one C call.  Avoids the intermediate scores arrayref + Perl
 	# foreach that allocates ~3*n_pts SVs.  Gated identically to predict()
 	# so the threshold conversion is valid.
-	if (   $HAS_C
+	if (   $self->{_use_c}
 		&& $self->{_c_nodes}
 		&& $self->{c_psi} > 0
 		&& $threshold > 0
@@ -969,7 +987,8 @@ sub score_predict_samples {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
-			$x_packed, $sums_packed, $n_pts, $nf, $t );
+			$x_packed, $sums_packed, $n_pts, $nf, $t,
+			$self->{_use_openmp} );
 		my $inv           = log(2) / ( $c * $t );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
 		my $result        = [];
@@ -1025,7 +1044,7 @@ sub score_predict_split {
 	# Fast path: fill two flat arrayrefs (scores + labels) directly from
 	# the sum buffer in one C call.  Skips the inner AV + RV per point
 	# that score_predict_samples has to allocate.
-	if (   $HAS_C
+	if (   $self->{_use_c}
 		&& $self->{_c_nodes}
 		&& $self->{c_psi} > 0
 		&& $threshold > 0
@@ -1037,7 +1056,8 @@ sub score_predict_split {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
 		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
-			$x_packed, $sums_packed, $n_pts, $nf, $t );
+			$x_packed, $sums_packed, $n_pts, $nf, $t,
+			$self->{_use_openmp} );
 		my $inv           = log(2) / ( $c * $t );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
 		my $scores        = [];
@@ -1128,6 +1148,8 @@ sub from_json {
 		c_psi                => $p->{c_psi},
 		max_depth_used       => $p->{max_depth_used},
 		trees                => $trees,
+		_use_c               => $HAS_C,
+		_use_openmp          => $HAS_OPENMP,
 	};
 	croak "model contains no trees" unless @{ $self->{trees} };
 
@@ -1137,7 +1159,7 @@ sub from_json {
 	$self->{c_psi} = _c( $self->{psi_used} ) if defined $self->{psi_used};
 
 	my $model = bless $self, $class;
-	$model->_rebuild_c_trees() if $HAS_C;
+	$model->_rebuild_c_trees() if $self->{_use_c};
 	return $model;
 } ## end sub from_json
 
@@ -1454,7 +1476,7 @@ sub _pack_tree {
 
 # Build packed C-ready representations for all trees and store them in
 # $self->{_c_nodes} and $self->{_c_coefs}.  Called after fit() and from_json()
-# when $HAS_C is true.
+# when _use_c is true.
 sub _rebuild_c_trees {
 	my ($self) = @_;
 	my ( @c_nodes, @c_coefs );
@@ -1583,7 +1605,7 @@ sub pack_data {
 	my ( $self, $data ) = @_;
 	$self->_check_fitted;
 	croak "pack_data requires the Inline::C backend; install Inline::C"
-		unless $HAS_C;
+		unless $self->{_use_c};
 	croak "pack_data() expects an arrayref of samples"
 		unless ref $data eq 'ARRAY';
 	my $n_pts    = scalar @$data;
