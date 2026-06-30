@@ -26,20 +26,28 @@ use constant _NODE_OBLIQUE => 2;
 #     Walks the Perl arrayref-of-arrayrefs and writes a packed double buffer
 #     into out_sv.  Replaces the dominant per-call Perl map-pack loop.
 #
-# score_all_xs(nodes_av, coefs_av, x_sv, sm_sv, n_pts, n_feats, n_trees)
+# score_all_xs(nodes_av, idx_av, val_av, x_sv, sm_sv,
+#              n_pts, n_feats, n_trees, use_openmp)
 #     Sums path lengths for all n_pts query points across all n_trees trees
 #     in one call.  Outer loop over points is OpenMP-parallel when the
 #     module was built with OpenMP (each iteration writes to a unique sm[i],
 #     so no synchronisation is needed).  Tree pointers are extracted from
 #     the AVs before the parallel region; the parallel region touches only
-#     raw double buffers.
+#     raw int / double buffers.
 #
 # Node layout (6 doubles per node, "IF_NZ = 6"):
 #   leaf:    [0, size, 0,   0,  0, 0]
 #   axis:    [1, attr, split, li, ri, 0]
 #   oblique: [2, coff, nf,  li, ri, b]
 #
-# coefs: flat array of (feat_idx, coef_val) pairs, indexed by coff*2.
+# Coefficient storage uses a Structure-of-Arrays layout: one int32 array
+# per tree (feature indices, packed with 'l*') and one double array per
+# tree (coefficients, packed with 'd*').  Both are indexed by `coff` --
+# the same offset addresses paired entries in the two arrays.  Splitting
+# them this way halves index bandwidth, removes the per-element
+# (int)<double> cast inside the SIMD loop, and lets the value loads be
+# contiguous so the compiler emits a clean FMA chain over val[k] with
+# the feature gather on xi[idx[k]] kept separate.
 # x:     row-major doubles, n_pts rows of n_feats each.
 # sums:  out double array of length n_pts; score_all_xs writes once per i.
 #
@@ -278,44 +286,55 @@ void score_predict_split_xs(SV* sm_sv, int n_pts, double inv,
     }
 }
 
-/* score_all_xs(nodes_av, coefs_av, x_sv, sm_sv, n_pts, n_feats, n_trees)
+/* score_all_xs(nodes_av, idx_av, val_av, x_sv, sm_sv,
+ *              n_pts, n_feats, n_trees, use_openmp)
  *
  * Scores all points across all trees in one C call.  See header comment
  * above for the bigger picture.  Writes sm[i] = sum_over_trees(path_len),
  * not accumulating, so the caller need not zero-init sm.
  *
- * Thread-safety: the parallel region only reads node_ptrs/coef_ptrs/xd
+ * idx_av holds per-tree packed int32 buffers of feature indices and
+ * val_av holds per-tree packed double buffers of coefficients (the SoA
+ * counterpart of the old interleaved layout).  See the file-top
+ * comment for the rationale.
+ *
+ * Thread-safety: the parallel region only reads node/idx/val/x pointers
  * (extracted before the region) and writes sm[i] for a unique i per
  * iteration.  No Perl API is called from inside the parallel region. */
-void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
+void score_all_xs(SV* nodes_av_sv, SV* idx_av_sv, SV* val_av_sv,
                   SV* x_sv, SV* sm_sv,
                   int n_pts, int n_feats, int n_trees,
                   int use_openmp){
     STRLEN tl;
-    AV *nodes_av, *coefs_av;
+    AV *nodes_av, *idx_av, *val_av;
     const double *xd;
     double *sm;
     int ti;
 
     if (!SvROK(nodes_av_sv) || SvTYPE(SvRV(nodes_av_sv)) != SVt_PVAV ||
-        !SvROK(coefs_av_sv) || SvTYPE(SvRV(coefs_av_sv)) != SVt_PVAV) {
-        croak("score_all_xs: nodes/coefs must be arrayrefs");
+        !SvROK(idx_av_sv)   || SvTYPE(SvRV(idx_av_sv))   != SVt_PVAV ||
+        !SvROK(val_av_sv)   || SvTYPE(SvRV(val_av_sv))   != SVt_PVAV) {
+        croak("score_all_xs: nodes/idx/val must be arrayrefs");
     }
     nodes_av = (AV*)SvRV(nodes_av_sv);
-    coefs_av = (AV*)SvRV(coefs_av_sv);
+    idx_av   = (AV*)SvRV(idx_av_sv);
+    val_av   = (AV*)SvRV(val_av_sv);
 
     /* C99 VLAs -- n_trees is small (typ. 100) and fits on the stack. */
     const double *node_ptrs[n_trees];
-    const double *coef_ptrs[n_trees];
+    const int    *idx_ptrs[n_trees];
+    const double *val_ptrs[n_trees];
 
     for (ti = 0; ti < n_trees; ti++) {
         SV** np = av_fetch(nodes_av, ti, 0);
-        SV** cp = av_fetch(coefs_av, ti, 0);
-        if (!np || !*np || !cp || !*cp) {
+        SV** ip = av_fetch(idx_av,   ti, 0);
+        SV** vp = av_fetch(val_av,   ti, 0);
+        if (!np || !*np || !ip || !*ip || !vp || !*vp) {
             croak("score_all_xs: missing tree %d", ti);
         }
         node_ptrs[ti] = (const double*)SvPVbyte(*np, tl);
-        coef_ptrs[ti] = (const double*)SvPVbyte(*cp, tl);
+        idx_ptrs[ti]  = (const int*)   SvPVbyte(*ip, tl);
+        val_ptrs[ti]  = (const double*)SvPVbyte(*vp, tl);
     }
 
     xd = (const double*)SvPVbyte(x_sv, tl);
@@ -335,8 +354,9 @@ void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
         double sum = 0.0;
         const double *xi = xd + (size_t)i * (size_t)n_feats;
         for (int t = 0; t < n_trees; t++) {
-            const double *nd = node_ptrs[t];
-            const double *co = coef_ptrs[t];
+            const double *nd  = node_ptrs[t];
+            const int    *ico = idx_ptrs[t];
+            const double *vco = val_ptrs[t];
             int ni = 0, depth = 0;
             for (;;) {
                 const double *node = nd + (size_t)ni * IF_NZ;
@@ -351,20 +371,22 @@ void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
                 } else {
                     int coff = (int)node[1], nf = (int)node[2];
                     double b = node[5], dot = 0.0;
-                    const double *cpp = co + (size_t)coff * 2;
-                    /* Extended-mode oblique dot product.  omp-simd
-                     * reduction lets the compiler vectorize the
-                     * scalar-times-gathered-feature multiply-accumulate
-                     * (on AVX2+ via vgatherdpd + vfmadd231pd, or a
-                     * straightforward unrolled FMA chain otherwise).
-                     * Without _OPENMP defined the pragma is ignored
-                     * and the loop runs serially -- still benefits
-                     * from the bounds-check removal above. */
+                    const int    *idx_p = ico + (size_t)coff;
+                    const double *val_p = vco + (size_t)coff;
+                    /* Extended-mode oblique dot product.  With idx as
+                     * contiguous int32 and val as contiguous doubles,
+                     * the compiler can emit a clean vfmadd231pd over
+                     * the val[] stream while gathering xi[idx[k]] -- a
+                     * markedly cheaper pattern than the old stride-2
+                     * (idx-as-double, val) interleave.  omp simd
+                     * permits reordering of the reduction; without
+                     * _OPENMP defined the pragma is ignored and the
+                     * loop runs serially. */
                     #ifdef _OPENMP
                     #pragma omp simd reduction(+:dot)
                     #endif
                     for (int k = 0; k < nf; k++) {
-                        dot += cpp[k * 2 + 1] * xi[(int)cpp[k * 2]];
+                        dot += val_p[k] * xi[idx_p[k]];
                     }
                     ni = (dot <= b) ? (int)node[3] : (int)node[4];
                 }
@@ -376,6 +398,30 @@ void score_all_xs(SV* nodes_av_sv, SV* coefs_av_sv,
 }
 __INLINE_C__
 
+    # -O3 is safe to enable unconditionally and matters here: the
+    # extended-mode oblique dot product is wrapped in `#pragma omp simd`,
+    # but without aggressive optimization the compiler may still emit
+    # scalar code.  Use OPTIMIZE (not CCFLAGS) -- CCFLAGS is prepended
+    # to the cc line and would be shadowed by Perl's own `-O2 -g` that
+    # ExtUtils::MakeMaker appends afterward (last `-O` wins in gcc).
+    #
+    # -march=native lets the compiler pick AVX2 gather + FMA tuned to
+    # the build host; it's opt-in via IF_NATIVE=1 because the cached
+    # artefact under _Inline/ would otherwise refuse to run on a CPU
+    # without the same instruction set extensions.
+    my $opt_level = '-O3';
+    $opt_level .= ' -march=native' if $ENV{IF_NATIVE};
+
+    # Inline::C hashes the C source to decide whether to rebuild but
+    # does NOT include CCFLAGS / OPTIMIZE in that hash.  Without the
+    # tag below, toggling IF_NATIVE (or editing the optimisation flags
+    # here) would silently reuse a cached binary built with stale
+    # flags.  Embedding the active flags as a leading comment forces
+    # the hash to differ when they change.  The OpenMP and serial
+    # builds get distinct tags so they cache to separate artefacts.
+    my $omp_tag    = "/* if_build: openmp $opt_level */\n";
+    my $serial_tag = "/* if_build: serial $opt_level */\n";
+
     # Try compiling with OpenMP first; on any failure (compiler doesn't
     # accept -fopenmp, libgomp missing, etc.) fall back to a serial build.
     {
@@ -383,9 +429,10 @@ __INLINE_C__
         eval {
             require Inline;
             Inline->import(
-                C       => $C_CODE,
-                CCFLAGS => '-fopenmp -O2',
-                LIBS    => '-lm -lgomp',
+                C        => $omp_tag . $C_CODE,
+                CCFLAGS  => '-fopenmp',
+                OPTIMIZE => $opt_level,
+                LIBS     => '-lm -lgomp',
             );
             $HAS_C = 1;
         };
@@ -394,7 +441,11 @@ __INLINE_C__
         local $@;
         eval {
             require Inline;
-            Inline->import( C => $C_CODE, LIBS => '-lm' );
+            Inline->import(
+                C        => $serial_tag . $C_CODE,
+                OPTIMIZE => $opt_level,
+                LIBS     => '-lm',
+            );
             $HAS_C = 1;
         };
     }
@@ -502,6 +553,15 @@ slower; without OpenMP the C backend runs single-threaded.
 The bundled C<iforest accel> subcommand performs a tiny fit + score and
 prints which backend is active, which is the recommended way to verify
 the build picked up the optional dependencies on a given machine.
+
+The C backend is compiled with C<-O3> by default.  Set the environment
+variable C<IF_NATIVE=1> before first load to add C<-march=native>, which
+lets the compiler emit AVX2/AVX-512 gather and FMA instructions tuned
+to the build host.  This typically gives a meaningful speedup on the
+extended-mode oblique dot product at high feature counts.  The cached
+artefact under C<_Inline/> is pinned to the host CPU, so leave
+C<IF_NATIVE> unset if the directory is shared across machines with
+different instruction-set support.
 
 =head1 GENERAL METHODS
 
@@ -819,7 +879,8 @@ sub path_lengths {
 	if ( $self->{_use_c} && $self->{_c_nodes} ) {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+		score_all_xs( $self->{_c_nodes},
+			$self->{_c_coef_idx}, $self->{_c_coef_val},
 			$x_packed, $sums_packed, $n_pts, $nf, $t,
 			$self->{_use_openmp} );
 		my $result = [];
@@ -882,7 +943,8 @@ sub predict {
 		my $c     = $self->{c_psi};
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+		score_all_xs( $self->{_c_nodes},
+			$self->{_c_coef_idx}, $self->{_c_coef_val},
 			$x_packed, $sums_packed, $n_pts, $nf, $t,
 			$self->{_use_openmp} );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
@@ -929,7 +991,8 @@ sub score_samples {
 	if ( $self->{_use_c} && $self->{_c_nodes} ) {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+		score_all_xs( $self->{_c_nodes},
+			$self->{_c_coef_idx}, $self->{_c_coef_val},
 			$x_packed, $sums_packed, $n_pts, $nf, $t,
 			$self->{_use_openmp} );
 		if ( $c > 0 ) {
@@ -1002,7 +1065,8 @@ sub score_predict_samples {
 		my $c     = $self->{c_psi};
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+		score_all_xs( $self->{_c_nodes},
+			$self->{_c_coef_idx}, $self->{_c_coef_val},
 			$x_packed, $sums_packed, $n_pts, $nf, $t,
 			$self->{_use_openmp} );
 		my $inv           = log(2) / ( $c * $t );
@@ -1071,7 +1135,8 @@ sub score_predict_split {
 		my $c     = $self->{c_psi};
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes}, $self->{_c_coefs},
+		score_all_xs( $self->{_c_nodes},
+			$self->{_c_coef_idx}, $self->{_c_coef_val},
 			$x_packed, $sums_packed, $n_pts, $nf, $t,
 			$self->{_use_openmp} );
 		my $inv           = log(2) / ( $c * $t );
@@ -1429,18 +1494,25 @@ sub _hash_node_to_array {
 } ## end sub _hash_node_to_array
 
 # ---------------------------------------------------------------------------
-# _pack_tree($root) -- flatten one tree into two packed double strings.
+# _pack_tree($root) -- flatten one tree into three packed buffers.
 #
-# Returns ($nodes_packed, $coefs_packed) where:
-#   nodes_packed: 6 doubles per node (see score_tree_xs comment above)
-#   coefs_packed: pairs (feat_idx, coef_val) for oblique nodes
+# Returns ($nodes_packed, $idx_packed, $val_packed) where:
+#   nodes_packed: 6 doubles per node (see score_all_xs comment above)
+#   idx_packed:   int32 feature indices for every oblique-node coefficient
+#   val_packed:   double values matching idx_packed one-for-one
+#
+# Storing idx and val in separate buffers (SoA) instead of interleaved
+# doubles lets the oblique dot product's SIMD inner loop run over a
+# contiguous val[] stream without a per-iteration (int) cast, and
+# halves the index bandwidth (int32 vs double).  The same `coff`
+# offset addresses paired entries in both buffers.
 #
 # Nodes are numbered in DFS pre-order: the root is always index 0 and
 # children always get indices larger than their parent's.
 # ---------------------------------------------------------------------------
 sub _pack_tree {
 	my ($root) = @_;
-	my ( @node_data, @coefs );
+	my ( @node_data, @coef_idx, @coef_val );
 
 	my $assign;
 	$assign = sub {
@@ -1465,10 +1537,11 @@ sub _pack_tree {
 		}
 		else {                       # _NODE_OBLIQUE
 			my ( $idx_arr, $coef_arr, $b ) = ( $node->[1], $node->[2], $node->[3] );
-			my $coef_off = scalar(@coefs) / 2;
+			my $coef_off = scalar @coef_idx;
 			my $num      = scalar @$idx_arr;
 			for my $i ( 0 .. $num - 1 ) {
-				push @coefs, $idx_arr->[$i] + 0.0, $coef_arr->[$i] + 0.0;
+				push @coef_idx, int( $idx_arr->[$i] );
+				push @coef_val, $coef_arr->[$i] + 0.0;
 			}
 			my $li = $assign->( $node->[4] );
 			my $ri = $assign->( $node->[5] );
@@ -1486,23 +1559,26 @@ sub _pack_tree {
 	$assign->($root);
 
 	my $nodes_packed = pack( 'd*', map { @$_ } @node_data );
-	my $coefs_packed = @coefs ? pack( 'd*', @coefs ) : pack( 'd*' );
-	return ( $nodes_packed, $coefs_packed );
+	my $idx_packed   = @coef_idx ? pack( 'l*', @coef_idx ) : pack( 'l*' );
+	my $val_packed   = @coef_val ? pack( 'd*', @coef_val ) : pack( 'd*' );
+	return ( $nodes_packed, $idx_packed, $val_packed );
 } ## end sub _pack_tree
 
 # Build packed C-ready representations for all trees and store them in
-# $self->{_c_nodes} and $self->{_c_coefs}.  Called after fit() and from_json()
-# when _use_c is true.
+# $self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val}.
+# Called after fit() and from_json() when _use_c is true.
 sub _rebuild_c_trees {
 	my ($self) = @_;
-	my ( @c_nodes, @c_coefs );
+	my ( @c_nodes, @c_coef_idx, @c_coef_val );
 	for my $tree ( @{ $self->{trees} } ) {
-		my ( $np, $cp ) = _pack_tree($tree);
-		push @c_nodes, $np;
-		push @c_coefs, $cp;
+		my ( $np, $ip, $vp ) = _pack_tree($tree);
+		push @c_nodes,    $np;
+		push @c_coef_idx, $ip;
+		push @c_coef_val, $vp;
 	}
-	$self->{_c_nodes} = \@c_nodes;
-	$self->{_c_coefs} = \@c_coefs;
+	$self->{_c_nodes}    = \@c_nodes;
+	$self->{_c_coef_idx} = \@c_coef_idx;
+	$self->{_c_coef_val} = \@c_coef_val;
 } ## end sub _rebuild_c_trees
 
 sub _check_fitted {
