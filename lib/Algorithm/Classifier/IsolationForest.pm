@@ -8,7 +8,7 @@ use POSIX       qw(ceil);
 use JSON::PP    ();
 use File::Slurp qw(read_file write_file);
 
-our $VERSION = '0.2.1';
+our $VERSION = '0.3.0';
 
 use constant EULER  => 0.5772156649015329;
 use constant TWO_PI => 6.283185307179586;
@@ -22,9 +22,11 @@ use constant _NODE_OBLIQUE => 2;
 # ---------------------------------------------------------------------------
 # Optional Inline::C accelerator for the scoring hot path.
 #
-# pack_input_xs(data_sv, out_sv, n_pts, n_feats)
+# pack_input_xs(data_sv, out_sv, n_pts, n_feats, miss_mode, fill_sv)
 #     Walks the Perl arrayref-of-arrayrefs and writes a packed double buffer
 #     into out_sv.  Replaces the dominant per-call Perl map-pack loop.
+#     miss_mode selects how an undef cell is packed: 0 => 0.0, 1 => the
+#     per-feature fill from fill_sv (impute), 2 => NaN (nan strategy).
 #
 # score_all_xs(nodes_av, idx_av, val_av, x_sv, sm_sv,
 #              n_pts, n_feats, n_trees, use_openmp)
@@ -101,7 +103,7 @@ int has_simd_xs(){
 #endif
 }
 
-/* pack_input_xs(data_sv, out_sv, n_pts, n_feats)
+/* pack_input_xs(data_sv, out_sv, n_pts, n_feats, miss_mode, fill_sv)
  *
  * Walks a Perl arrayref-of-arrayrefs (n_pts rows of n_feats doubles each)
  * directly in C and writes the packed double buffer into out_sv (which the
@@ -110,10 +112,22 @@ int has_simd_xs(){
  *   pack('d*', map { my $r=$_; map { $r->[$_] // 0 } 0..$nf-1 } @$data)
  *
  * which was the dominant per-call overhead for high feature counts.
- * Undef cells (and missing rows) are coerced to 0.0 with no warning. */
-void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
+ *
+ * miss_mode selects what an undef cell (or missing row) becomes:
+ *   0 => 0.0          (the 'die'/'zero' missing strategies)
+ *   1 => fill[k]      (the 'impute' strategy; fill_sv is a packed
+ *                      double buffer of n_feats per-feature fill values)
+ *   2 => NaN          (the 'nan' strategy; the C scorer's `<` / `<=`
+ *                      comparisons are both false for NaN, so a point
+ *                      missing the split feature falls to the right
+ *                      child -- matching how fit() routes it)
+ * fill_sv is only dereferenced when miss_mode == 1. */
+void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats,
+                   int miss_mode, SV* fill_sv){
     STRLEN tl;
     double* out;
+    const double* fill = NULL;
+    double missval;
     AV* outer;
     int i, k;
 
@@ -123,12 +137,19 @@ void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
     outer = (AV*)SvRV(data_sv);
     out   = (double*)SvPVbyte_force(out_sv, tl);
 
+    if (miss_mode == 1) {
+        STRLEN fl;
+        fill = (const double*)SvPVbyte(fill_sv, fl);
+    }
+    missval = (miss_mode == 2) ? NAN : 0.0;
+
     for (i = 0; i < n_pts; i++) {
         SV** row_pp = av_fetch(outer, i, 0);
         double* dst = out + (size_t)i * (size_t)n_feats;
         if (!row_pp || !*row_pp || !SvROK(*row_pp) ||
             SvTYPE(SvRV(*row_pp)) != SVt_PVAV) {
-            for (k = 0; k < n_feats; k++) dst[k] = 0.0;
+            for (k = 0; k < n_feats; k++)
+                dst[k] = (miss_mode == 1) ? fill[k] : missval;
             continue;
         }
         {
@@ -138,7 +159,7 @@ void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats){
                 if (v && *v && SvOK(*v)) {
                     dst[k] = SvNV(*v);
                 } else {
-                    dst[k] = 0.0;
+                    dst[k] = (miss_mode == 1) ? fill[k] : missval;
                 }
             }
         }
@@ -621,6 +642,27 @@ Inits the object.
           => no learned threshold (predict() falls back to 0.5).
         default :: undef
 
+    - missing :: how fit() treats undef (missing) feature cells. Scoring always
+          tolerates undef regardless of this setting; it governs fit().
+            die    :: croak from fit() if the training data contains any
+                      undef cell. Scoring still maps undef to 0 (the
+                      long-standing behaviour), so a model fitted on clean
+                      data can still score rows with missing features.
+            zero   :: treat a missing cell as the value 0, at fit and score.
+            impute :: replace a missing cell with the per-feature mean (or
+                      median, see impute_with) learned from the present
+                      values at fit time. The fill vector is stored on the
+                      model and reused for scoring and persistence.
+            nan    :: build feature ranges from present values only and route
+                      a point missing the split feature to the right child,
+                      consistently at fit and score time. Missingness is
+                      preserved as signal rather than filled.
+        default :: die
+
+    - impute_with :: 'mean' or 'median'; the statistic used to compute the
+          per-feature fill under missing => 'impute'. Ignored otherwise.
+        default :: mean
+
     - parallel_fit :: positive integer N => build the trees across N forked
           worker processes during fit(). Each worker gets a derived seed
           (parent seed + worker_id * 1009) so the parallel fit is
@@ -656,6 +698,23 @@ sub new {
 	croak "mode must be 'axis' or 'extended'"
 		unless $mode eq 'axis' || $mode eq 'extended';
 
+	# How fit() treats undef (missing) feature cells.  Scoring always
+	# tolerates undef regardless of this setting -- it governs fit only.
+	#   die    :: croak if the training data contains any undef cell (default)
+	#   zero   :: treat a missing cell as the value 0
+	#   impute :: replace a missing cell with the per-feature mean/median
+	#             learned from the present values at fit time
+	#   nan    :: build ranges over present values only and route a point
+	#             missing the split feature consistently to one branch, at
+	#             both fit and score time
+	my $missing = $args{missing} // 'die';
+	croak "missing must be one of: die, zero, impute, nan"
+		unless $missing =~ /\A(?:die|zero|impute|nan)\z/;
+
+	my $impute_with = $args{impute_with} // 'mean';
+	croak "impute_with must be 'mean' or 'median'"
+		unless $impute_with =~ /\A(?:mean|median)\z/;
+
 	if ( defined( $args{seed} ) ) {
 		$args{seed} = abs( int( $args{seed} ) );
 	}
@@ -685,6 +744,9 @@ sub new {
 		extension_level => $args{extension_level},    # undef => max, resolved in fit()
 		contamination   => $args{contamination},      # undef => no learned threshold
 		parallel_fit    => $args{parallel_fit},       # undef/0/1 => serial; N>1 => fork
+		missing         => $missing,                  # die|zero|impute|nan
+		impute_with     => $impute_with,              # mean|median (impute mode only)
+		missing_fill    => undef,                     # per-feature fill, learned in fit() if impute
 		_use_c          => $use_c,
 		_use_openmp     => $use_openmp,
 		threshold       => undef,                     # learned in fit() if contamination set
@@ -779,9 +841,17 @@ sub fit {
 	croak "each sample must be an arrayref of features"
 		unless ref $data->[0] eq 'ARRAY' && @{ $data->[0] };
 
-	my $n          = scalar @$data;
 	my $n_features = scalar @{ $data->[0] };
 	$self->{n_features} = $n_features;
+
+	# Apply the missing-value strategy before any tree is built.  Depending
+	# on the strategy this either croaks (die), returns a dense copy with
+	# undef cells filled (zero/impute), or passes the data through with
+	# undef preserved for the split logic to route (nan).  Everything below
+	# trains on $train, never the raw $data.
+	my $train = $self->_prepare_fit_data($data);
+
+	my $n = scalar @$train;
 
 	# The sub-sample cannot be larger than the data set itself.
 	my $psi = min( $self->{sample_size}, $n );
@@ -820,12 +890,12 @@ sub fit {
 		&& _fork_supported() )
 	{
 		$self->{trees}
-			= $self->_fit_trees_parallel( $data, $psi, $limit, $workers );
+			= $self->_fit_trees_parallel( $train, $psi, $limit, $workers );
 	}
 	else {
 		my @trees;
 		for ( 1 .. $self->{n_trees} ) {
-			my $sample = _subsample( $data, $psi );
+			my $sample = _subsample( $train, $psi );
 			push @trees, $self->_build_tree( $sample, 0, $limit );
 		}
 		$self->{trees} = \@trees;
@@ -837,7 +907,7 @@ sub fit {
 	# between flagged and unflagged points -- unambiguous and robust to the
 	# tiny float rounding introduced by JSON serialisation.
 	if ( defined $self->{contamination} ) {
-		my $scores = $self->score_samples($data);
+		my $scores = $self->score_samples($train);
 		my @desc   = sort { $b <=> $a } @$scores;
 		my $n_pts  = scalar @desc;
 		my $k      = int( $self->{contamination} * $n_pts + 0.5 );
@@ -911,13 +981,14 @@ sub path_lengths {
 		return $result;
 	}
 
-	$data = $self->_to_arrayref($data);
+	$data = $self->_prepare_perl_input($data);
+	my $nan = $self->{missing} eq 'nan' ? 1 : 0;
 
 	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
 	my @sums = (0) x @$data;
 	for my $tree (@$trees) {
 		for my $i ( 0 .. $#$data ) {
-			$sums[$i] += _path_length( $data->[$i], $tree, 0 );
+			$sums[$i] += _path_length( $data->[$i], $tree, 0, $nan );
 		}
 	}
 	return [ map { $_ / $t } @sums ];
@@ -1027,13 +1098,14 @@ sub score_samples {
 		return [ (0.5) x $n_pts ];
 	}
 
-	$data = $self->_to_arrayref($data);
+	$data = $self->_prepare_perl_input($data);
+	my $nan = $self->{missing} eq 'nan' ? 1 : 0;
 
 	# Pure-Perl fallback (tree-outer, sample-inner for cache locality).
 	my @sums = (0) x @$data;
 	for my $tree (@$trees) {
 		for my $i ( 0 .. $#$data ) {
-			$sums[$i] += _path_length( $data->[$i], $tree, 0 );
+			$sums[$i] += _path_length( $data->[$i], $tree, 0, $nan );
 		}
 	}
 
@@ -1206,6 +1278,9 @@ sub to_json {
 			psi_used        => $self->{psi_used},
 			c_psi           => $self->{c_psi},
 			max_depth_used  => $self->{max_depth_used},
+			missing         => $self->{missing},
+			impute_with     => $self->{impute_with},
+			missing_fill    => $self->{missing_fill},
 		},
 		trees => $self->{trees},
 	};
@@ -1251,6 +1326,11 @@ sub from_json {
 		psi_used             => $p->{psi_used},
 		c_psi                => $p->{c_psi},
 		max_depth_used       => $p->{max_depth_used},
+		# Models saved before missing-value support lack these keys; default
+		# to 'zero', which reproduces the old undef -> 0 scoring behaviour.
+		missing              => $p->{missing} // 'zero',
+		impute_with          => $p->{impute_with} // 'mean',
+		missing_fill         => $p->{missing_fill},
 		trees                => $trees,
 		_use_c               => $HAS_C,
 		_use_openmp          => $HAS_OPENMP,
@@ -1373,18 +1453,24 @@ sub _build_tree {
 
 	my $nf = $self->{n_features};
 
-	# Per-feature min and max within this node, in a single pass.
+	# Per-feature min and max within this node, in a single pass.  Missing
+	# (undef) cells never reach here under die/zero/impute -- those fill the
+	# data before fit -- so the "next unless defined" guard only fires in
+	# nan mode, where missing values must not constrain a feature's range.
 	my ( @lo, @hi );
 	for my $row (@$X) {
 		for my $f ( 0 .. $nf - 1 ) {
 			my $v = $row->[$f];
+			next unless defined $v;
 			$lo[$f] = $v if !defined $lo[$f] || $v < $lo[$f];
 			$hi[$f] = $v if !defined $hi[$f] || $v > $hi[$f];
 		}
 	}
 
-	# Features with spread are the only ones that can split the data.
-	my @varying = grep { $lo[$_] < $hi[$_] } 0 .. $nf - 1;
+	# Features with spread are the only ones that can split the data.  A
+	# feature whose values are all missing within this node has an undef
+	# range and is excluded.
+	my @varying = grep { defined $lo[$_] && $lo[$_] < $hi[$_] } 0 .. $nf - 1;
 
 	# No spread on any feature => all points identical => cannot isolate.
 	return [ _NODE_LEAF, $size ] unless @varying;
@@ -1414,10 +1500,14 @@ sub _axis_split {
 	my $attr  = $varying->[ int( rand( scalar @$varying ) ) ];
 	my $split = $lo->[$attr] + rand() * ( $hi->[$attr] - $lo->[$attr] );
 
+	# A point missing the split feature (nan mode only) routes to the right
+	# child -- the same side NaN reaches in the C scorer, where (NaN < split)
+	# is false.  Under die/zero/impute every cell is defined.
 	my ( @left, @right );
 	for my $row (@$X) {
-		if   ( $row->[$attr] < $split ) { push @left,  $row }
-		else                            { push @right, $row }
+		my $v = $row->[$attr];
+		if   ( defined($v) && $v < $split ) { push @left,  $row }
+		else                                { push @right, $row }
 	}
 	return [ _NODE_AXIS, $attr, $split, \@left, \@right ];
 } ## end sub _axis_split
@@ -1451,12 +1541,21 @@ sub _oblique_split {
 		$b += $c * $p;
 	}
 
+	# A point missing any feature on the hyperplane (nan mode only) routes
+	# to the right child: in the C scorer the dot product becomes NaN and
+	# (NaN <= b) is false, so this keeps fit and score consistent.  Under
+	# die/zero/impute every cell is defined and the missing branch is dead.
 	my ( @left, @right );
 	for my $row (@$X) {
-		my $dot = 0.0;
-		$dot += $coef[$_] * $row->[ $idx[$_] ] for 0 .. $#idx;
-		if   ( $dot <= $b ) { push @left,  $row }
-		else                { push @right, $row }
+		my $dot     = 0.0;
+		my $missing = 0;
+		for ( 0 .. $#idx ) {
+			my $v = $row->[ $idx[$_] ];
+			if ( !defined $v ) { $missing = 1; last }
+			$dot += $coef[$_] * $v;
+		}
+		if   ( !$missing && $dot <= $b ) { push @left,  $row }
+		else                             { push @right, $row }
 	}
 	return [ _NODE_OBLIQUE, \@idx, \@coef, $b, \@left, \@right ];
 } ## end sub _oblique_split
@@ -1473,17 +1572,40 @@ sub _oblique_split {
 # The type tag is also used as a loop sentinel: 0 (_NODE_LEAF) is falsy.
 # No $self argument -- the node type encodes everything needed.
 #-------------------------------------------------------------------------------
+# The optional $nan flag selects the nan-strategy routing: a point missing
+# the split feature goes to the right child (matching the C scorer, where
+# the NaN comparison is false).  Without it, undef is coerced to 0 -- the
+# behaviour the die/zero/impute strategies rely on (their data is dense by
+# the time it reaches here, so the "// 0" is normally a no-op).
 sub _path_length {
-	my ( $x, $node, $depth ) = @_;
+	my ( $x, $node, $depth, $nan ) = @_;
 	while ( $node->[0] ) {                       # false only for leaf (type 0)
 		if ( $node->[0] == _NODE_AXIS ) {        # [1, attr, split, left, right]
-			$node = ( $x->[ $node->[1] ] // 0 ) < $node->[2]
-				? $node->[3] : $node->[4];
+			if ($nan) {
+				my $v = $x->[ $node->[1] ];
+				$node = ( defined($v) && $v < $node->[2] )
+					? $node->[3] : $node->[4];
+			} else {
+				$node = ( $x->[ $node->[1] ] // 0 ) < $node->[2]
+					? $node->[3] : $node->[4];
+			}
 		} else {                                 # [2, \@idx, \@coef, b, left, right]
 			my ( $idx, $coef, $b ) = ( $node->[1], $node->[2], $node->[3] );
-			my $dot = 0.0;
-			$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 ) for 0 .. $#$idx;
-			$node = $dot <= $b ? $node->[4] : $node->[5];
+			if ($nan) {
+				my $dot     = 0.0;
+				my $missing = 0;
+				for ( 0 .. $#$idx ) {
+					my $v = $x->[ $idx->[$_] ];
+					if ( !defined $v ) { $missing = 1; last }
+					$dot += $coef->[$_] * $v;
+				}
+				$node = ( !$missing && $dot <= $b ) ? $node->[4] : $node->[5];
+			} else {
+				my $dot = 0.0;
+				$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 )
+					for 0 .. $#$idx;
+				$node = $dot <= $b ? $node->[4] : $node->[5];
+			}
 		}
 		$depth++;
 	}
@@ -1746,7 +1868,8 @@ sub pack_data {
 	my $n_pts    = scalar @$data;
 	my $nf       = $self->{n_features};
 	my $x_packed = "\0" x ( $n_pts * $nf * 8 );
-	pack_input_xs( $data, $x_packed, $n_pts, $nf );
+	my ( $mode, $fill ) = $self->_pack_args;
+	pack_input_xs( $data, $x_packed, $n_pts, $nf, $mode, $fill );
 	return bless {
 		packed  => $x_packed,
 		n_pts   => $n_pts,
@@ -1768,7 +1891,8 @@ sub _resolve_input {
 	my $n_pts    = scalar @$data;
 	my $nf       = $self->{n_features};
 	my $x_packed = "\0" x ( $n_pts * $nf * 8 );
-	pack_input_xs( $data, $x_packed, $n_pts, $nf );
+	my ( $mode, $fill ) = $self->_pack_args;
+	pack_input_xs( $data, $x_packed, $n_pts, $nf, $mode, $fill );
 	return ( $n_pts, $nf, $x_packed );
 }
 
@@ -1790,6 +1914,129 @@ sub _to_arrayref {
 		return \@rows;
 	}
 	croak "expected arrayref or PackedData, got " . ( ref($data) || 'scalar' );
+}
+
+# ---------------------------------------------------------------------------
+# Missing-value handling.
+#
+# The `missing` strategy chosen at new() decides how undef feature cells are
+# treated.  Scoring always tolerates undef; the strategy governs fit() and
+# how undef is represented for the scorer:
+#
+#   die    -- croak from fit() if the training data holds any undef cell.
+#             Scoring still maps undef -> 0 (the long-standing behaviour).
+#   zero   -- undef counts as the value 0, at fit and score time.
+#   impute -- undef is replaced by a learned per-feature mean/median; the
+#             fill vector is stored on the model and reused at score time.
+#   nan    -- ranges are built over present values only and a point missing
+#             the split feature is routed to the right child, consistently
+#             at fit (Perl) and score (C packs NaN; `<`/`<=` send it right).
+# ---------------------------------------------------------------------------
+
+# Returns the training data to actually build trees on, after applying the
+# missing-value strategy.  May croak (die), return a dense filled copy
+# (zero/impute), or pass $data through unchanged (nan).
+sub _prepare_fit_data {
+	my ( $self, $data ) = @_;
+	my $m  = $self->{missing};
+	my $nf = $self->{n_features};
+
+	if ( $m eq 'die' ) {
+		for my $i ( 0 .. $#$data ) {
+			my $row = $data->[$i];
+			for my $f ( 0 .. $nf - 1 ) {
+				next if defined $row->[$f];
+				croak "fit(): undef feature value at sample $i, column $f; "
+					. "construct with missing => 'zero', 'impute', or 'nan' "
+					. "to train on data with missing values";
+			}
+		}
+		return $data;
+	}
+
+	# nan: leave undef in place -- _build_tree / the split routers handle it.
+	return $data if $m eq 'nan';
+
+	# zero / impute: build a dense copy with every undef cell filled.
+	my $fill
+		= $m eq 'impute'
+		? $self->_compute_impute_fill($data)
+		: [ (0) x $nf ];
+	$self->{missing_fill} = $fill if $m eq 'impute';
+	delete $self->{_fill_packed};
+	return _densify( $data, $fill );
+}
+
+# Per-feature fill value (mean or median of the present values) for impute
+# mode.  Croaks if a feature has no present value to learn from.
+sub _compute_impute_fill {
+	my ( $self, $data ) = @_;
+	my $nf  = $self->{n_features};
+	my $how = $self->{impute_with};
+	my @fill;
+	for my $f ( 0 .. $nf - 1 ) {
+		my @vals = grep { defined } map { $_->[$f] } @$data;
+		croak "impute: feature column $f has no present values"
+			unless @vals;
+		if ( $how eq 'median' ) {
+			my @s = sort { $a <=> $b } @vals;
+			my $k = scalar @s;
+			$fill[$f]
+				= $k % 2
+				? $s[ int( $k / 2 ) ]
+				: ( $s[ $k / 2 - 1 ] + $s[ $k / 2 ] ) / 2.0;
+		} else {    # mean
+			my $sum = 0;
+			$sum += $_ for @vals;
+			$fill[$f] = $sum / scalar @vals;
+		}
+	}
+	return \@fill;
+}
+
+# Return a dense copy of $data with every undef cell replaced by the
+# matching per-feature fill value.  Leaves present cells untouched.
+sub _densify {
+	my ( $data, $fill ) = @_;
+	my $nf = scalar @$fill;
+	return [
+		map {
+			my $r = $_;
+			[ map { defined $r->[$_] ? $r->[$_] : $fill->[$_] } 0 .. $nf - 1 ]
+		} @$data
+	];
+}
+
+# (miss_mode, fill_packed) pair for pack_input_xs, per the active strategy.
+# die/zero -> 0 (undef becomes 0.0); impute -> 1 (undef becomes fill[k]);
+# nan -> 2 (undef becomes NaN, which the C scorer routes right).
+sub _pack_args {
+	my ($self) = @_;
+	my $m = $self->{missing};
+	return ( 2, '' ) if $m eq 'nan';
+	if ( $m eq 'impute' ) {
+		my $fill = $self->{missing_fill};
+		croak "impute model is missing its fill vector"
+			unless ref $fill eq 'ARRAY' && @$fill == $self->{n_features};
+		$self->{_fill_packed} //= pack( 'd*', @$fill );
+		return ( 1, $self->{_fill_packed} );
+	}
+	return ( 0, '' );    # die, zero
+}
+
+# Pure-Perl fallback input prep: arrayref-ify, then fill for impute so the
+# tree walk sees dense rows.  zero/die rely on _path_length's "// 0"; nan
+# keeps undef in place for _path_length to route.  Returns the rows; the
+# caller passes the nan flag to _path_length separately.
+sub _prepare_perl_input {
+	my ( $self, $data ) = @_;
+	my $rows = $self->_to_arrayref($data);
+	if ( $self->{missing} eq 'impute' ) {
+		croak "impute model is missing its fill vector"
+			unless ref $self->{missing_fill} eq 'ARRAY';
+		$rows = _densify( $rows, $self->{missing_fill} );
+	}
+	return $rows;
 }
 
 # Minimal PackedData package: opaque token returned by pack_data().
