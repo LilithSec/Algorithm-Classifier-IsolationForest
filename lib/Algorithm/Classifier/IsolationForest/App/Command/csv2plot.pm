@@ -18,8 +18,9 @@ sub opt_spec {
 			'Type of plot. Default: auto',
 			{ 'default' => 'auto', completion => [ 'auto', '2heat', '3range', '3binary' ] }
 		],
-		[ 'print', 'Print what would be used with gnuplot instead of calling gnuplot' ],
-		[ 'open',  'Call xdg-open to open the generated graph.' ],
+		[ 'print',        'Print what would be used with gnuplot instead of calling gnuplot' ],
+		[ 'open',         'Call xdg-open to open the generated graph.' ],
+		[ 'small-points', 'Use smaller points (ps 0.8) for dense 3range datasets.' ],
 	);
 } ## end sub opt_spec
 
@@ -102,19 +103,23 @@ sub execute {
 
 	my ( $tempfh, $tempfile ) = tempfile( 'UNLINK' => 1 );
 
-	my $gnu_plot_stuff = 'set terminal pngcairo size 900,700
+	my $ps = $opt->{'small_points'} ? '0.8' : '1.5';
+
+	my $gnu_plot_stuff = 'set terminal pngcairo size 1200,900 font "Sans,11"
 set output "' . $opt->{'o'} . '"
 
 set datafile separator ","
 set key autotitle columnhead
 
+set grid lc "gray70" lw 0.5 dt 2
+
 ';
 
 	if ( $opt->{'p'} eq '3range' ) {
 		$gnu_plot_stuff = $gnu_plot_stuff . '
-set palette defined (0 "green", 1 "red")
+set palette defined (0 "#4575b4", 0.5 "#ffffbf", 1 "#d73027")
 set cblabel "outlier score"
-plot "' . $opt->{'i'} . '" using 1:2:' . $score_col . ' with points pt 7 ps 1.5 palette title ""
+plot "' . $opt->{'i'} . '" using 1:2:' . $score_col . ' with points pt 7 ps ' . $ps . ' palette title ""
 ';
 	} elsif ( $opt->{'p'} eq '3binary' ) {
 		$gnu_plot_stuff
@@ -123,8 +128,8 @@ plot "' . $opt->{'i'} . '" using 1:2:' . $score_col . ' with points pt 7 ps 1.5 
 			. $opt->{'i'}
 			. '" using 1:($'
 			. $pred_col
-			. '==0 ? $2 : 1/0) with points pt 7 ps 1.2 lc rgb "green" title "normal", \
-     "' . $opt->{'i'} . '" using 1:($' . $pred_col . '==1 ? $2 : 1/0) with points pt 9 ps 2.0 lc rgb "red"    title "abnormal"
+			. '==0 ? $2 : 1/0) with points pt 7  ps 1.2 lc rgb "#4575b4" title "normal", \
+     "' . $opt->{'i'} . '" using 1:($' . $pred_col . '==1 ? $2 : 1/0) with points pt 13 ps 2.0 lc rgb "#d73027" title "abnormal"
 ';
 	} elsif ( $opt->{'p'} eq '2heat' ) {
 		$gnu_plot_stuff = $gnu_plot_stuff . '
