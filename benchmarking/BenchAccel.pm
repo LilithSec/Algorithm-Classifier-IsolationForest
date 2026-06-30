@@ -101,25 +101,40 @@ sub _fmt_rate {
 }
 
 # wall_rate($code, $secs) -- scalar ops/second over $secs wall-clock
-# seconds after a brief warm-up.  Returns the rate as a plain number
-# so callers can format their own tables.
+# seconds.  Returns the rate as a plain number so callers can format
+# their own tables.
+#
+# The measurement is split into 3 equal sub-windows and the median of
+# their rates is returned.  At small workloads (a few hundred
+# microseconds per call) OpenMP thread scheduling is non-deterministic
+# enough that a single 2-second window can land in a slow stretch and
+# report ~30x lower throughput than steady state; median across
+# windows smooths that without spending extra time.
 sub wall_rate {
     my ( $code, $secs ) = @_;
     $secs ||= 1;
 
-    # Warm-up: 5% of measurement budget, capped at 0.3 s to handle
-    # callers (e.g. sklearn-via-subprocess) whose first call is much
-    # more expensive than steady state.
-    my $warmup = $secs * 0.05;
-    $warmup = 0.3 if $warmup > 0.3;
+    # Warm-up: at least 0.3 s (matches the original Perl bench() helper
+    # this replaced) so OpenMP thread pools are firmly hot before any
+    # measurement window starts.  Scales up for long budgets -- a 30 s
+    # measurement gets a 3 s warmup.
+    my $warmup = $secs * 0.1;
+    $warmup = 0.3 if $warmup < 0.3;
     my $wt0 = time;
     $code->() while time - $wt0 < $warmup;
 
-    my $t0 = time;
-    my $n  = 0;
-    while ( time - $t0 < $secs ) { $code->(); $n++ }
-    my $elapsed = ( time - $t0 ) || 1e-9;
-    return $n / $elapsed;
+    my $WINDOWS  = 3;
+    my $win_secs = $secs / $WINDOWS;
+    my @rates;
+    for ( 1 .. $WINDOWS ) {
+        my $t0 = time;
+        my $n  = 0;
+        while ( time - $t0 < $win_secs ) { $code->(); $n++ }
+        my $elapsed = ( time - $t0 ) || 1e-9;
+        push @rates, $n / $elapsed;
+    }
+    my @s = sort { $a <=> $b } @rates;
+    return $s[ int( @s / 2 ) ];
 }
 
 # wall_time_median($code, $reps) -- single warm-up + $reps timed
