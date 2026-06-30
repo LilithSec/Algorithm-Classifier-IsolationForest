@@ -8,7 +8,7 @@ use POSIX       qw(ceil);
 use JSON::PP    ();
 use File::Slurp qw(read_file write_file);
 
-our $VERSION = '0.1.0';
+our $VERSION = '0.2.0';
 
 use constant EULER  => 0.5772156649015329;
 use constant TWO_PI => 6.283185307179586;
@@ -476,6 +476,8 @@ __INLINE_C__
         ? 1 : 0;
 }
 
+=encoding UTF-8
+
 =head1 NAME
 
 Algorithm::Classifier::IsolationForest - unsupervised anomaly detection via Isolation Forest or Extended Isolation Forest
@@ -921,7 +923,7 @@ sub path_lengths {
 	return [ map { $_ / $t } @sums ];
 } ## end sub path_lengths
 
-=head predict(\@data, $threshold)
+=head2 predict(\@data, $threshold)
 
 Returns an arrayref of 0/1 labels for the specified data.
 
