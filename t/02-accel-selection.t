@@ -185,6 +185,64 @@ SKIP: {
     };
 }
 
+subtest 'use_openmp clamped to 0 when use_c is off' => sub {
+    # OpenMP only matters with the C tree walk; if the C backend is off
+    # the OpenMP flag is meaningless, so the constructor should clear it
+    # rather than leaving it set to a value that never gets read.
+    my $f = $CLASS->new(
+        n_trees     => 10,
+        sample_size => 16,
+        seed        => 1,
+        use_c       => 0,
+        use_openmp  => 1,
+    );
+    is( $f->{_use_c},      0, '_use_c is 0' );
+    is( $f->{_use_openmp}, 0, '_use_openmp clamped to 0 since C backend is off' );
+};
+
+subtest 'use_c => 1 clamped against $HAS_C in the constructor' => sub {
+    # Fake "no Inline::C compiled" by localising the package flags.  The
+    # XS subs themselves remain defined in this process (they were loaded
+    # at module init), but the constructor's contract is to clamp against
+    # $HAS_C so a fresh build without Inline::C wouldn't end up calling
+    # an undefined sub at score time.
+    local $Algorithm::Classifier::IsolationForest::HAS_C      = 0;
+    local $Algorithm::Classifier::IsolationForest::HAS_OPENMP = 0;
+
+    my $f = $CLASS->new(
+        n_trees     => 10,
+        sample_size => 16,
+        seed        => 1,
+        use_c       => 1,
+        use_openmp  => 1,
+    );
+    is( $f->{_use_c}, 0,
+        'use_c => 1 clamped to 0 when $HAS_C is 0' );
+    is( $f->{_use_openmp}, 0,
+        'use_openmp => 1 clamped to 0 when $HAS_OPENMP is 0' );
+
+    # Defaults follow the (faked) flags too.
+    my $g = $CLASS->new( n_trees => 10, sample_size => 16, seed => 1 );
+    is( $g->{_use_c},      0, 'default _use_c follows the faked $HAS_C' );
+    is( $g->{_use_openmp}, 0, 'default _use_openmp follows the faked $HAS_OPENMP' );
+};
+
+subtest 'use_openmp => 1 clamped against $HAS_OPENMP' => sub {
+    # $HAS_C stays on so the C backend is still picked up; only OpenMP
+    # is faked off.  use_openmp => 1 should clamp to 0.
+    local $Algorithm::Classifier::IsolationForest::HAS_OPENMP = 0;
+
+    my $f = $CLASS->new(
+        n_trees     => 10,
+        sample_size => 16,
+        seed        => 1,
+        use_openmp  => 1,
+    );
+    is( $f->{_use_c},      $HAS_C, '_use_c follows $HAS_C' );
+    is( $f->{_use_openmp}, 0,
+        'use_openmp => 1 clamped to 0 when $HAS_OPENMP is 0' );
+};
+
 subtest 'pack_data croaks when use_c is off' => sub {
     my $f = $CLASS->new(
         n_trees     => 10,

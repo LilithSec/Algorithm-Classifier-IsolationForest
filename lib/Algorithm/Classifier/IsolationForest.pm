@@ -577,6 +577,22 @@ sub new {
 		$args{seed} = abs( int( $args{seed} ) );
 	}
 
+	# Clamp the accel knobs against what the build actually has.  Passing
+	# use_c => 1 on a machine where Inline::C never compiled would otherwise
+	# leave score_samples() calling an undefined XS sub at first use.
+	# OpenMP is meaningless without the C tree walk, so force it off
+	# whenever the C backend is off -- matches the documented
+	# "Ignored when use_c is false" semantics.
+	my $use_c
+		= defined $args{use_c}
+		? ( $args{use_c} && $HAS_C ? 1 : 0 )
+		: $HAS_C;
+	my $use_openmp
+		= defined $args{use_openmp}
+		? ( $args{use_openmp} && $HAS_OPENMP ? 1 : 0 )
+		: $HAS_OPENMP;
+	$use_openmp = 0 unless $use_c;
+
 	my $self = {
 		n_trees         => $args{n_trees}     // 100,
 		sample_size     => $args{sample_size} // 256,
@@ -586,8 +602,8 @@ sub new {
 		extension_level => $args{extension_level},    # undef => max, resolved in fit()
 		contamination   => $args{contamination},      # undef => no learned threshold
 		parallel_fit    => $args{parallel_fit},       # undef/0/1 => serial; N>1 => fork
-		_use_c          => ( defined $args{use_c} ? ( $args{use_c} ? 1 : 0 ) : $HAS_C ),
-		_use_openmp     => ( defined $args{use_openmp} ? ( $args{use_openmp} ? 1 : 0 ) : $HAS_OPENMP ),
+		_use_c          => $use_c,
+		_use_openmp     => $use_openmp,
 		threshold       => undef,                     # learned in fit() if contamination set
 		trees           => [],
 		c_psi           => undef,                     # c(psi), set during fit()

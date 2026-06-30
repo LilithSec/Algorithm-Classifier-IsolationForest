@@ -23,7 +23,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Benchmark qw(cmpthese);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel qw(wall_cmpthese);
 use Algorithm::Classifier::IsolationForest;
 
 use constant PI => 3.14159265358979;
@@ -55,7 +57,7 @@ print "=" x 70, "\n";
 printf "Backend availability: HAS_C=%d  HAS_OPENMP=%d  HAS_SIMD=%d\n",
     $HAS_C, $HAS_OPENMP,
     $Algorithm::Classifier::IsolationForest::HAS_SIMD;
-print "(rates shown as fits/second; higher is faster)\n";
+print "(rates shown as fits/second wall-clock; higher is faster)\n";
 
 sub accel_variants {
     my (%base) = @_;
@@ -90,7 +92,7 @@ srand(42);
 my $d1k = make_data( 1000, 2 );
 for my $nt ( 10, 50, 100, 200, 500 ) {
     printf "\n  n_trees=%d\n", $nt;
-    cmpthese(
+    wall_cmpthese(
         -2,
         accel_variants(
             n_trees     => $nt,
@@ -110,7 +112,7 @@ my %ds;
 $ds{$_} = make_data( $_, 2 ) for ( 500, 1_000, 2_500, 5_000, 10_000 );
 for my $n ( 500, 1_000, 2_500, 5_000, 10_000 ) {
     printf "\n  %d samples\n", $n;
-    cmpthese(
+    wall_cmpthese(
         -2,
         accel_variants(
             n_trees     => 100,
@@ -130,7 +132,7 @@ my %dfd;
 $dfd{$_} = make_data( 1000, $_ ) for ( 2, 5, 10, 20, 50 );
 for my $nf ( 2, 5, 10, 20, 50 ) {
     printf "\n  %d features\n", $nf;
-    cmpthese(
+    wall_cmpthese(
         -2,
         accel_variants(
             n_trees     => 100,
@@ -150,7 +152,7 @@ my %dfc;
 $dfc{$_} = make_data( 1000, $_ ) for ( 2 .. 10 );
 for my $nf ( 2 .. 10 ) {
     printf "\n  %d columns\n", $nf;
-    cmpthese(
+    wall_cmpthese(
         -2,
         accel_variants(
             n_trees     => 100,

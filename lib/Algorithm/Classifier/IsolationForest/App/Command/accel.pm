@@ -29,18 +29,31 @@ sub execute {
 	my ( $self, $opt, $args ) = @_;
 
 	# Tiny deterministic dataset.  Fitting + scoring confirms the chosen
-	# backend is callable end-to-end, not merely that it compiled.
+	# backend is callable end-to-end, not merely that it compiled.  We
+	# exercise both axis mode (covers score_all_xs's axis branch) and
+	# extended mode (covers the oblique branch -- where the
+	# `#pragma omp simd` reduction lives, so this is the only path
+	# SIMD actually matters for).
 	srand(1);
 	my @data = map { [ rand(), rand(), rand() ] } 1 .. 30;
 	push @data, [ 10, 10, 10 ], [ -10, -10, -10 ];
 
-	my $iforest = Algorithm::Classifier::IsolationForest->new(
+	my $axis = Algorithm::Classifier::IsolationForest->new(
 		n_trees     => 10,
 		sample_size => 32,
 		seed        => 1,
 	);
-	$iforest->fit( \@data );
-	$iforest->score_samples( [ [ 0.5, 0.5, 0.5 ] ] );
+	$axis->fit( \@data );
+	$axis->score_samples( [ [ 0.5, 0.5, 0.5 ] ] );
+
+	my $ext = Algorithm::Classifier::IsolationForest->new(
+		n_trees     => 10,
+		sample_size => 32,
+		seed        => 1,
+		mode        => 'extended',
+	);
+	$ext->fit( \@data );
+	$ext->score_samples( [ [ 0.5, 0.5, 0.5 ] ] );
 
 	my $has_c
 		= $Algorithm::Classifier::IsolationForest::HAS_C ? 1 : 0;

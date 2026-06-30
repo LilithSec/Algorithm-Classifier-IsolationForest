@@ -27,7 +27,9 @@
 use strict;
 use warnings;
 use lib '../lib';
-use Benchmark qw(cmpthese);
+use FindBin;
+use lib "$FindBin::Bin";
+use BenchAccel qw(wall_cmpthese);
 use Algorithm::Classifier::IsolationForest;
 
 use constant PI => 3.14159265358979;
@@ -79,7 +81,7 @@ print "=" x 70, "\n";
 printf "Backend availability: HAS_C=%d  HAS_OPENMP=%d  HAS_SIMD=%d\n",
     $HAS_C, $HAS_OPENMP,
     $Algorithm::Classifier::IsolationForest::HAS_SIMD;
-print "(rates shown as calls/second; higher is faster)\n";
+print "(rates shown as calls/second wall-clock; higher is faster)\n";
 
 # -----------------------------------------------------------------------
 # 1. Scoring method comparison  (n_trees=100, 1000 query points)
@@ -112,7 +114,7 @@ for my $method (qw(score_samples predict score_predict_samples
             $v{$accel} = sub { $m->$method($q1k) };
         }
     }
-    cmpthese( -2, \%v );
+    wall_cmpthese( -2, \%v );
 }
 
 # -----------------------------------------------------------------------
@@ -128,7 +130,7 @@ for my $n ( 100, 500, 1_000, 5_000, 10_000 ) {
     for my $accel ( sort keys %$models ) {
         $v{$accel} = sub { $models->{$accel}->score_samples( $q{$n} ) };
     }
-    cmpthese( -2, \%v );
+    wall_cmpthese( -2, \%v );
 }
 
 # -----------------------------------------------------------------------
@@ -150,7 +152,7 @@ for my $nt ( 10, 50, 100, 200, 500 ) {
     for my $accel ( sort keys %$ms ) {
         $v{$accel} = sub { $ms->{$accel}->score_samples($q1k) };
     }
-    cmpthese( -2, \%v );
+    wall_cmpthese( -2, \%v );
 }
 
 # -----------------------------------------------------------------------
@@ -173,7 +175,7 @@ for my $nf ( 2, 5, 10, 20, 50 ) {
     for my $accel ( sort keys %$ms ) {
         $v{$accel} = sub { $ms->{$accel}->score_samples($qr) };
     }
-    cmpthese( -2, \%v );
+    wall_cmpthese( -2, \%v );
 }
 
 # -----------------------------------------------------------------------
@@ -196,5 +198,5 @@ for my $nf ( 2 .. 10 ) {
     for my $accel ( sort keys %$ms ) {
         $v{$accel} = sub { $ms->{$accel}->score_samples($qr) };
     }
-    cmpthese( -2, \%v );
+    wall_cmpthese( -2, \%v );
 }
