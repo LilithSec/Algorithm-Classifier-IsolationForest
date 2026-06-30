@@ -1,8 +1,8 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
-0.2.0   2026-06-30
-        - C acceleration via Inline::C for core fit and predict operations
-        - OpenMP support for parallel multi-threaded fitting
+0.2.0   2026-06-30/14:15
+        - C acceleration via Inline::C for core fit and predict ops
+        - OpenMP support for parallel multi-threaded fitting and predict ops
         - SIMD (AVX/SSE) acceleration where available
         - Data packing support for compact model storage (new `pack` CLI command)
         - Parallel fit capability
