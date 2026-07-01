@@ -438,6 +438,246 @@ void score_all_xs(SV* nodes_av_sv, SV* idx_av_sv, SV* val_av_sv,
         sm[i] = sum;
     }
 }
+
+/* ---------------------------------------------------------------------
+ * build_forest_xs -- C-accelerated fit() tree builder.
+ *
+ * Replaces the pure-Perl _subsample + _build_tree + _axis_split /
+ * _oblique_split recursion with an equivalent C implementation that
+ * partitions plain `int` row-index arrays instead of copying arrayrefs
+ * of Perl SVs at every split.  Random draws go through Drand01() --
+ * the exact generator Perl's own rand()/srand() use internally -- in
+ * the same call order the Perl code used, so a fit() with a given
+ * seed produces BIT-IDENTICAL trees whether use_c is on or off.  This
+ * is what lets fit() reuse the existing `use_c` knob instead of a new
+ * one: switching backends never changes the model, only how fast it's
+ * built.  (Verified by t/02-accel-selection.t's "identical seed =>
+ * identical trees" subtest, which exercises both backends.)
+ *
+ * Output trees are plain Perl arrayrefs in the same node shape
+ * _build_tree produces (leaf/axis/oblique -- see the file-top
+ * comment), so every downstream consumer (_pack_tree, to_json,
+ * from_json, the pure-Perl scorer) is unchanged.
+ *
+ * x_sv: packed row-major double buffer, n_pts rows of n_feats each
+ *       (from pack_input_xs -- NaN marks a missing cell under the
+ *       'nan' missing-strategy).
+ * mode_flag: 0 => axis-parallel splits, 1 => oblique (extended).
+ * ext_level: extension_level_used (ignored when mode_flag == 0).
+ * out_rv: pre-existing arrayref; filled with n_trees tree roots.
+ * ------------------------------------------------------------------ */
+
+/* Box-Muller normal draw, in the same rand() call order as _randn(). */
+static double _c_randn(pTHX) {
+    double u1 = Drand01();
+    double u2;
+    if (u1 == 0.0) u1 = 1e-12;
+    u2 = Drand01();
+    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
+
+static SV* _mk_leaf(pTHX_ int size) {
+    AV* av = newAV();
+    av_extend(av, 1);
+    AvARRAY(av)[0] = newSVnv(0.0);
+    AvARRAY(av)[1] = newSViv(size);
+    AvFILLp(av)    = 1;
+    return newRV_noinc((SV*)av);
+}
+
+static SV* _mk_axis(pTHX_ int attr, double split, SV* left, SV* right) {
+    AV* av = newAV();
+    av_extend(av, 4);
+    AvARRAY(av)[0] = newSVnv(1.0);
+    AvARRAY(av)[1] = newSViv(attr);
+    AvARRAY(av)[2] = newSVnv(split);
+    AvARRAY(av)[3] = left;
+    AvARRAY(av)[4] = right;
+    AvFILLp(av)    = 4;
+    return newRV_noinc((SV*)av);
+}
+
+static SV* _mk_oblique(pTHX_ const int* idx, const double* coef, int n,
+                        double b, SV* left, SV* right) {
+    AV *iav, *cav, *av;
+    int k;
+    iav = newAV();
+    cav = newAV();
+    if (n > 0) {
+        av_extend(iav, n - 1);
+        av_extend(cav, n - 1);
+    }
+    for (k = 0; k < n; k++) {
+        AvARRAY(iav)[k] = newSViv(idx[k]);
+        AvARRAY(cav)[k] = newSVnv(coef[k]);
+    }
+    AvFILLp(iav) = n - 1;
+    AvFILLp(cav) = n - 1;
+
+    av = newAV();
+    av_extend(av, 5);
+    AvARRAY(av)[0] = newSVnv(2.0);
+    AvARRAY(av)[1] = newRV_noinc((SV*)iav);
+    AvARRAY(av)[2] = newRV_noinc((SV*)cav);
+    AvARRAY(av)[3] = newSVnv(b);
+    AvARRAY(av)[4] = left;
+    AvARRAY(av)[5] = right;
+    AvFILLp(av)    = 5;
+    return newRV_noinc((SV*)av);
+}
+
+/* Builds one node from the point set `idxs` (row indices into `x`,
+ * length `size`); recurses left-then-right, matching _build_tree's
+ * traversal order so nested splits draw random numbers in the same
+ * sequence the pure-Perl path would.  Takes ownership of `idxs` --
+ * frees it before returning. */
+static SV* _build_node_c(pTHX_ const double* x, int nf, int* idxs, int size,
+                          int depth, int limit, int mode_flag,
+                          int ext_active) {
+    double *lo, *hi;
+    int *varying, nv, f;
+    SV *result;
+
+    if (depth >= limit || size <= 1) {
+        SV* leaf = _mk_leaf(aTHX_ size);
+        free(idxs);
+        return leaf;
+    }
+
+    lo = (double*)malloc(nf * sizeof(double));
+    hi = (double*)malloc(nf * sizeof(double));
+    for (f = 0; f < nf; f++) {
+        lo[f] = HUGE_VAL;
+        hi[f] = -HUGE_VAL;
+    }
+    for (int i = 0; i < size; i++) {
+        const double* row = x + (size_t)idxs[i] * (size_t)nf;
+        for (f = 0; f < nf; f++) {
+            double v = row[f];
+            if (isnan(v)) continue;
+            if (v < lo[f]) lo[f] = v;
+            if (v > hi[f]) hi[f] = v;
+        }
+    }
+
+    varying = (int*)malloc(nf * sizeof(int));
+    nv      = 0;
+    for (f = 0; f < nf; f++) {
+        if (lo[f] < hi[f]) varying[nv++] = f;
+    }
+
+    if (nv == 0) {
+        free(lo); free(hi); free(varying);
+        SV* leaf = _mk_leaf(aTHX_ size);
+        free(idxs);
+        return leaf;
+    }
+
+    if (mode_flag == 0) {
+        /* Axis-parallel split: one varying feature, one threshold. */
+        int attr      = varying[(int)(Drand01() * nv)];
+        double split  = lo[attr] + Drand01() * (hi[attr] - lo[attr]);
+        int *lidx = (int*)malloc(size * sizeof(int));
+        int *ridx = (int*)malloc(size * sizeof(int));
+        int ln = 0, rn = 0, i;
+        SV *left, *right;
+
+        for (i = 0; i < size; i++) {
+            int row = idxs[i];
+            double v = x[(size_t)row * (size_t)nf + attr];
+            if (v < split) lidx[ln++] = row; else ridx[rn++] = row;
+        }
+        free(idxs); free(lo); free(hi); free(varying);
+
+        left  = _build_node_c(aTHX_ x, nf, lidx, ln, depth + 1, limit,
+                               mode_flag, ext_active);
+        right = _build_node_c(aTHX_ x, nf, ridx, rn, depth + 1, limit,
+                               mode_flag, ext_active);
+        result = _mk_axis(aTHX_ attr, split, left, right);
+    } else {
+        /* Oblique split: a random hyperplane over `active` features. */
+        int active = ext_active + 1;
+        int *pool, *lidx, *ridx;
+        double *coef;
+        double b = 0.0;
+        int ln = 0, rn = 0, i, k;
+        SV *left, *right;
+
+        if (active > nv) active = nv;
+        pool = (int*)malloc(nv * sizeof(int));
+        memcpy(pool, varying, nv * sizeof(int));
+        for (i = 0; i < active; i++) {
+            int j = i + (int)(Drand01() * (nv - i));
+            int tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+        }
+
+        coef = (double*)malloc(active * sizeof(double));
+        for (k = 0; k < active; k++) {
+            int ff  = pool[k];
+            double c = _c_randn(aTHX);
+            double p = lo[ff] + Drand01() * (hi[ff] - lo[ff]);
+            coef[k] = c;
+            b += c * p;
+        }
+
+        lidx = (int*)malloc(size * sizeof(int));
+        ridx = (int*)malloc(size * sizeof(int));
+        for (i = 0; i < size; i++) {
+            int row = idxs[i];
+            double dot = 0.0;
+            for (k = 0; k < active; k++) {
+                dot += coef[k] * x[(size_t)row * (size_t)nf + pool[k]];
+            }
+            if (dot <= b) lidx[ln++] = row; else ridx[rn++] = row;
+        }
+        free(idxs); free(lo); free(hi); free(varying);
+
+        left  = _build_node_c(aTHX_ x, nf, lidx, ln, depth + 1, limit,
+                               mode_flag, ext_active);
+        right = _build_node_c(aTHX_ x, nf, ridx, rn, depth + 1, limit,
+                               mode_flag, ext_active);
+        result = _mk_oblique(aTHX_ pool, coef, active, b, left, right);
+        free(pool); free(coef);
+    }
+    return result;
+}
+
+void build_forest_xs(SV* x_sv, int n_pts, int n_feats, int n_trees,
+                      int psi, int limit, int mode_flag, int ext_level,
+                      SV* out_rv) {
+    dTHX;
+    STRLEN tl;
+    const double* x;
+    AV* out;
+    int* all;
+    int t, i;
+
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("build_forest_xs: out must be an arrayref");
+    }
+    x   = (const double*)SvPVbyte(x_sv, tl);
+    out = (AV*)SvRV(out_rv);
+    av_clear(out);
+    if (n_trees > 0) av_extend(out, n_trees - 1);
+
+    all = (int*)malloc(n_pts * sizeof(int));
+    for (t = 0; t < n_trees; t++) {
+        int* sample;
+
+        for (i = 0; i < n_pts; i++) all[i] = i;
+        for (i = 0; i < psi; i++) {
+            int j = i + (int)(Drand01() * (n_pts - i));
+            int tmp = all[i]; all[i] = all[j]; all[j] = tmp;
+        }
+        sample = (int*)malloc(psi * sizeof(int));
+        memcpy(sample, all, psi * sizeof(int));
+
+        av_store(out, t,
+            _build_node_c(aTHX_ x, n_feats, sample, psi, 0, limit,
+                          mode_flag, ext_level));
+    }
+    free(all);
+}
 __INLINE_C__
 
     # -O3 is safe to enable unconditionally and matters here: the
@@ -571,9 +811,9 @@ L<https://www.researchgate.net/publication/224384174_Isolation_Forest>
 
 =head1 NATIVE ACCELERATION (Inline::C and OpenMP)
 
-The scoring hot path (C<score_samples>, C<predict>, C<path_lengths>,
-C<score_predict_samples>, and C<score_predict_split>) is automatically
-accelerated through
+Both the scoring hot path (C<score_samples>, C<predict>, C<path_lengths>,
+C<score_predict_samples>, and C<score_predict_split>) and the C<fit()>
+tree builder are automatically accelerated through
 L<Inline::C> when it is installed and a working C compiler is reachable.
 If the toolchain also accepts C<-fopenmp> and can link against
 C<libgomp>, the per-point tree walk runs in parallel across all
@@ -581,6 +821,25 @@ available CPU cores using OpenMP, and the extended-mode oblique dot
 product is vectorised via C<#pragma omp simd> -- which on modern x86
 compilers translates to an unrolled FMA / AVX gather chain that's
 substantially faster for high-feature-count extended models.
+
+C<fit()>'s tree builder (subsampling plus the recursive axis/oblique
+split search) runs in C the same way when C<use_c> is on, replacing the
+per-node Perl arrayref copying with plain int-array partitioning --
+typically an order of magnitude faster, and dramatically more so at
+higher feature counts where the pure-Perl per-cell loop dominates. Its
+random draws go through the same generator C<rand()>/C<srand()> use
+internally, in the same call order the pure-Perl builder uses, so a
+given C<seed> produces bit-identical trees whether C<use_c> is on or
+off -- switching backends changes only how fast the model is built, not
+the model itself. Because it is single-threaded per call (Perl's RNG
+state isn't safe to share across OpenMP threads), scaling across cores
+still goes through C<parallel_fit>, which now forks workers that each
+use this faster builder internally -- so the two compose. Forking
+across processes has fixed IPC/serialisation overhead per worker, so on
+smaller datasets where a C-accelerated fit already completes in
+milliseconds, C<parallel_fit> can cost more than it saves; it's most
+useful once a single-process fit is large enough that the fork/Storable
+overhead is small relative to the work being split.
 
 Detection happens once when the module is loaded; the compiled artefact
 is cached under C<_Inline/> and reused on subsequent runs.  Three
@@ -673,10 +932,12 @@ Inits the object.
           platforms without a real fork() (e.g. Windows without Cygwin).
         default :: undef (serial)
 
-    - use_c :: boolean, override whether the Inline::C scoring backend is
-          used.  When false the instance falls back to pure Perl even if
-          the C backend compiled successfully.  When true (or unset) the
-          C backend is used if available ($HAS_C).
+    - use_c :: boolean, override whether the Inline::C backend is used for
+          both scoring and fit()'s tree builder.  When false the instance
+          falls back to pure Perl for both even if the C backend compiled
+          successfully.  When true (or unset) the C backend is used if
+          available ($HAS_C).  fit() with use_c on produces bit-identical
+          trees to use_c off for the same seed -- only build speed differs.
         default :: $HAS_C
 
     - use_openmp :: boolean, override whether OpenMP parallel scoring is
@@ -891,6 +1152,10 @@ sub fit {
 	{
 		$self->{trees}
 			= $self->_fit_trees_parallel( $train, $psi, $limit, $workers );
+	}
+	elsif ( $self->{_use_c} ) {
+		$self->{trees}
+			= $self->_build_forest_c( $train, $psi, $limit, $self->{n_trees} );
 	}
 	else {
 		my @trees;
@@ -1451,19 +1716,33 @@ sub _build_tree {
 	return [ _NODE_LEAF, $size ]
 		if $depth >= $limit || $size <= 1;
 
-	my $nf = $self->{n_features};
+	my $nf  = $self->{n_features};
+	my $nan = $self->{missing} eq 'nan';
 
 	# Per-feature min and max within this node, in a single pass.  Missing
 	# (undef) cells never reach here under die/zero/impute -- those fill the
-	# data before fit -- so the "next unless defined" guard only fires in
-	# nan mode, where missing values must not constrain a feature's range.
+	# data before fit -- so the "next unless defined" guard is only needed
+	# in nan mode, where missing values must not constrain a feature's
+	# range; every other strategy skips it since every cell is defined and
+	# the check would never fire.
 	my ( @lo, @hi );
-	for my $row (@$X) {
-		for my $f ( 0 .. $nf - 1 ) {
-			my $v = $row->[$f];
-			next unless defined $v;
-			$lo[$f] = $v if !defined $lo[$f] || $v < $lo[$f];
-			$hi[$f] = $v if !defined $hi[$f] || $v > $hi[$f];
+	if ($nan) {
+		for my $row (@$X) {
+			for my $f ( 0 .. $nf - 1 ) {
+				my $v = $row->[$f];
+				next unless defined $v;
+				$lo[$f] = $v if !defined $lo[$f] || $v < $lo[$f];
+				$hi[$f] = $v if !defined $hi[$f] || $v > $hi[$f];
+			}
+		}
+	}
+	else {
+		for my $row (@$X) {
+			for my $f ( 0 .. $nf - 1 ) {
+				my $v = $row->[$f];
+				$lo[$f] = $v if !defined $lo[$f] || $v < $lo[$f];
+				$hi[$f] = $v if !defined $hi[$f] || $v > $hi[$f];
+			}
 		}
 	}
 
@@ -1477,8 +1756,8 @@ sub _build_tree {
 
 	my $node
 		= $self->{mode} eq 'extended'
-		? $self->_oblique_split( $X, \@varying, \@lo, \@hi )
-		: _axis_split( $X, \@varying, \@lo, \@hi );
+		? $self->_oblique_split( $X, \@varying, \@lo, \@hi, $nan )
+		: _axis_split( $X, \@varying, \@lo, \@hi, $nan );
 
 	# Split functions leave the raw point arrays at the child slots so that
 	# _build_tree can recurse into them; the subtree refs replace them in-place.
@@ -1495,19 +1774,28 @@ sub _build_tree {
 # Returns [_NODE_AXIS, attr, split, \@left_pts, \@right_pts].
 # _build_tree overwrites slots 3 and 4 with the recursed subtrees.
 sub _axis_split {
-	my ( $X, $varying, $lo, $hi ) = @_;
+	my ( $X, $varying, $lo, $hi, $nan ) = @_;
 
 	my $attr  = $varying->[ int( rand( scalar @$varying ) ) ];
 	my $split = $lo->[$attr] + rand() * ( $hi->[$attr] - $lo->[$attr] );
 
 	# A point missing the split feature (nan mode only) routes to the right
 	# child -- the same side NaN reaches in the C scorer, where (NaN < split)
-	# is false.  Under die/zero/impute every cell is defined.
+	# is false.  Under die/zero/impute every cell is defined, so the
+	# "defined($v)" guard is dead weight there and skipped entirely.
 	my ( @left, @right );
-	for my $row (@$X) {
-		my $v = $row->[$attr];
-		if   ( defined($v) && $v < $split ) { push @left,  $row }
-		else                                { push @right, $row }
+	if ($nan) {
+		for my $row (@$X) {
+			my $v = $row->[$attr];
+			if   ( defined($v) && $v < $split ) { push @left,  $row }
+			else                                { push @right, $row }
+		}
+	}
+	else {
+		for my $row (@$X) {
+			if   ( $row->[$attr] < $split ) { push @left,  $row }
+			else                            { push @right, $row }
+		}
 	}
 	return [ _NODE_AXIS, $attr, $split, \@left, \@right ];
 } ## end sub _axis_split
@@ -1519,7 +1807,7 @@ sub _axis_split {
 # Returns [_NODE_OBLIQUE, \@idx, \@coef, $b, \@left_pts, \@right_pts].
 # _build_tree overwrites slots 4 and 5 with the recursed subtrees.
 sub _oblique_split {
-	my ( $self, $X, $varying, $lo, $hi ) = @_;
+	my ( $self, $X, $varying, $lo, $hi, $nan ) = @_;
 
 	my $active = $self->{extension_level_used} + 1;
 	$active = scalar @$varying if $active > scalar @$varying;
@@ -1544,18 +1832,29 @@ sub _oblique_split {
 	# A point missing any feature on the hyperplane (nan mode only) routes
 	# to the right child: in the C scorer the dot product becomes NaN and
 	# (NaN <= b) is false, so this keeps fit and score consistent.  Under
-	# die/zero/impute every cell is defined and the missing branch is dead.
+	# die/zero/impute every cell is defined, so the per-feature "defined"
+	# check and early-exit are dead weight there and skipped entirely.
 	my ( @left, @right );
-	for my $row (@$X) {
-		my $dot     = 0.0;
-		my $missing = 0;
-		for ( 0 .. $#idx ) {
-			my $v = $row->[ $idx[$_] ];
-			if ( !defined $v ) { $missing = 1; last }
-			$dot += $coef[$_] * $v;
+	if ($nan) {
+		for my $row (@$X) {
+			my $dot     = 0.0;
+			my $missing = 0;
+			for ( 0 .. $#idx ) {
+				my $v = $row->[ $idx[$_] ];
+				if ( !defined $v ) { $missing = 1; last }
+				$dot += $coef[$_] * $v;
+			}
+			if   ( !$missing && $dot <= $b ) { push @left,  $row }
+			else                             { push @right, $row }
 		}
-		if   ( !$missing && $dot <= $b ) { push @left,  $row }
-		else                             { push @right, $row }
+	}
+	else {
+		for my $row (@$X) {
+			my $dot = 0.0;
+			$dot += $coef[$_] * $row->[ $idx[$_] ] for 0 .. $#idx;
+			if   ( $dot <= $b ) { push @left,  $row }
+			else                { push @right, $row }
+		}
 	}
 	return [ _NODE_OBLIQUE, \@idx, \@coef, $b, \@left, \@right ];
 } ## end sub _oblique_split
@@ -1769,7 +2068,8 @@ sub _check_fitted {
 # Fork-based parallel tree builder.  Used by fit() when parallel_fit > 1
 # and the platform has a real fork().  Divides n_trees evenly among
 # workers; each child seeds its own RNG ($seed + worker_id * 1009 so
-# fixed-worker-count runs are reproducible), builds its share, and
+# fixed-worker-count runs are reproducible), builds its share (via the
+# C builder when _use_c is on, same as the non-parallel path), and
 # returns the trees to the parent via Storable on a one-shot pipe.
 #
 # The trees that come back differ from a serial fit with the same seed
@@ -1810,12 +2110,19 @@ sub _fit_trees_parallel {
 			if ( defined $self->{seed} ) {
 				srand( $self->{seed} + $w * 1009 );
 			}
-			my @trees;
-			for ( 1 .. $share ) {
-				my $sample = _subsample( $data, $psi );
-				push @trees, $self->_build_tree( $sample, 0, $limit );
+			my $trees;
+			if ( $self->{_use_c} ) {
+				$trees = $self->_build_forest_c( $data, $psi, $limit, $share );
 			}
-			print $wh Storable::freeze( \@trees );
+			else {
+				my @t;
+				for ( 1 .. $share ) {
+					my $sample = _subsample( $data, $psi );
+					push @t, $self->_build_tree( $sample, 0, $limit );
+				}
+				$trees = \@t;
+			}
+			print $wh Storable::freeze($trees);
 			close $wh;
 			# _exit so we don't run parent END/DESTROY in the child.
 			POSIX::_exit(0);
@@ -1847,6 +2154,33 @@ sub _fit_trees_parallel {
 	}
 
 	return \@all_trees;
+}
+
+#-------------------------------------------------------------------------------
+# C-accelerated fit(): builds $n_trees trees against $data (a subset or
+# the full training set) via build_forest_xs, which does its own
+# per-tree subsampling internally.  Random draws inside the C builder
+# go through Drand01() -- the same generator Perl's rand() uses -- in
+# the same call order _subsample/_build_tree used, so the returned
+# trees are bit-identical to what the pure-Perl path would build from
+# the same RNG state.  That's what lets fit() switch backends on the
+# existing `use_c` knob instead of a new one.
+#-------------------------------------------------------------------------------
+sub _build_forest_c {
+	my ( $self, $data, $psi, $limit, $n_trees ) = @_;
+	my $n  = scalar @$data;
+	my $nf = $self->{n_features};
+	my $x_packed = "\0" x ( $n * $nf * 8 );
+	my ( $mode, $fill ) = $self->_pack_args;
+	pack_input_xs( $data, $x_packed, $n, $nf, $mode, $fill );
+
+	my $mode_flag = $self->{mode} eq 'extended' ? 1 : 0;
+	my $ext_level = $self->{extension_level_used} // 0;
+
+	my $trees = [];
+	build_forest_xs( $x_packed, $n, $nf, $n_trees, $psi, $limit,
+		$mode_flag, $ext_level, $trees );
+	return $trees;
 }
 
 #-------------------------------------------------------------------------------
