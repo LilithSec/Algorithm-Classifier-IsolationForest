@@ -175,6 +175,36 @@ for my $be (@BACKENDS) {
     }
 
     # -----------------------------------------------------------------------
+    # impute: a feature column that's entirely undef has no statistic to
+    # learn, and must croak -- on the first such column in feature order,
+    # matching the pure-Perl fallback's message exactly. This exercises
+    # the multi-column case (one good column, one entirely-undef column)
+    # specifically: an earlier regression in the C fast path freed a
+    # good column's scratch buffer once when computing its fill and then
+    # again while cleaning up after discovering the later, entirely-undef
+    # column -- a double free that only shows up with more than one
+    # feature column, so a single-column case wouldn't have caught it.
+    # -----------------------------------------------------------------------
+    subtest "[$be_name] impute mode croaks on a feature with no present values"
+        => sub {
+        my @all_missing_second = map { [ $_->[0], undef ] } @holey;
+        my $f = $CLASS->new(
+            n_trees => 20, seed => $SEED, missing => 'impute', use_c => $USE_C );
+        ok( !eval { $f->fit( \@all_missing_second ); 1 },
+            'fit croaks when a feature column is entirely undef' );
+        like( $@, qr/impute: feature column 1 has no present values/,
+            'names the offending column' );
+
+        my @all_missing_first = map { [ undef, $_->[1] ] } @holey;
+        my $g = $CLASS->new(
+            n_trees => 20, seed => $SEED, missing => 'impute', use_c => $USE_C );
+        ok( !eval { $g->fit( \@all_missing_first ); 1 },
+            'fit croaks when the first feature column is entirely undef' );
+        like( $@, qr/impute: feature column 0 has no present values/,
+            'names the offending column' );
+        };
+
+    # -----------------------------------------------------------------------
     # Persistence: every strategy round-trips, and impute carries its fill
     # -----------------------------------------------------------------------
     subtest "[$be_name] save/load round-trips each strategy" => sub {

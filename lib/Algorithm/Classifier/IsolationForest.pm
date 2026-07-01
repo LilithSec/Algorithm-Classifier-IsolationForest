@@ -68,6 +68,7 @@ use constant _NODE_OBLIQUE => 2;
 our $HAS_C      = 0;
 our $HAS_OPENMP = 0;
 our $HAS_SIMD   = 0;
+our $OPT_LEVEL  = '';    # the actual -O.../-march=... flags used to build, if any
 {
     my $C_CODE = <<'__INLINE_C__';
 #include <math.h>
@@ -554,11 +555,18 @@ static SV* _build_node_c(pTHX_ const double* x, int nf, int* idxs, int size,
     }
     for (int i = 0; i < size; i++) {
         const double* row = x + (size_t)idxs[i] * (size_t)nf;
-        for (f = 0; f < nf; f++) {
-            double v = row[f];
-            if (isnan(v)) continue;
-            if (v < lo[f]) lo[f] = v;
-            if (v > hi[f]) hi[f] = v;
+        /* No isnan() guard needed: NaN < x and NaN > x are always false
+         * under IEEE 754, so a NaN cell (the 'nan' missing strategy)
+         * already leaves lo/hi untouched without an explicit check --
+         * one less branch, and it's what lets this loop vectorize
+         * cleanly as a plain elementwise min/max scan. */
+        #ifdef _OPENMP
+        #pragma omp simd
+        #endif
+        for (int f2 = 0; f2 < nf; f2++) {
+            double v = row[f2];
+            if (v < lo[f2]) lo[f2] = v;
+            if (v > hi[f2]) hi[f2] = v;
         }
     }
 
@@ -822,11 +830,19 @@ static int _build_node_packed(const double* x, int nf, int* idxs, int size,
     }
     for (int i = 0; i < size; i++) {
         const double* row = x + (size_t)idxs[i] * (size_t)nf;
-        for (f = 0; f < nf; f++) {
-            double v = row[f];
-            if (isnan(v)) continue;
-            if (v < lo[f]) lo[f] = v;
-            if (v > hi[f]) hi[f] = v;
+        /* See the matching comment in _build_node_c: no isnan() guard
+         * needed, since NaN < x / NaN > x are always false already --
+         * that's what lets this vectorize as a plain min/max scan.
+         * omp simd here is thread-safe to call from inside the caller's
+         * omp parallel region: it's a per-thread vectorization hint,
+         * not a team construct, so it doesn't nest into anything. */
+        #ifdef _OPENMP
+        #pragma omp simd
+        #endif
+        for (int f2 = 0; f2 < nf; f2++) {
+            double v = row[f2];
+            if (v < lo[f2]) lo[f2] = v;
+            if (v > hi[f2]) hi[f2] = v;
         }
     }
 
@@ -991,7 +1007,170 @@ void build_forest_openmp_xs(SV* x_sv, int n_pts, int n_feats, int n_trees,
     }
     free(bufs);
 }
+
+/* ---------------------------------------------------------------------
+ * impute_fill_xs(data_sv, n_pts, n_feats, how, out_rv)
+ *
+ * C replacement for _compute_impute_fill's Perl loop: walks the raw
+ * arrayref-of-arrayrefs directly (like pack_input_xs), collecting each
+ * feature's present (defined) values, then reduces them to one fill
+ * value per feature -- mean (how == 0) or median (how == 1) -- and
+ * writes n_feats doubles into out_rv.
+ *
+ * Values are collected in row order (i = 0..n_pts-1), the same order
+ * the Perl version's `grep { defined } map { $_->[$f] } @data` walks
+ * them in, so the mean's left-to-right summation lands on the exact
+ * same float as the Perl path -- use_c toggles speed here, not the
+ * computed fill, matching the rest of the module.
+ *
+ * The median is an exact order statistic (not summation-dependent), so
+ * it matches the Perl path's sort-based median by definition regardless
+ * of which selection algorithm finds it. Croaks with the same message
+ * as the Perl fallback if a feature has no present values anywhere in
+ * the dataset. */
+typedef struct { double *v; size_t n, cap; } DVec;
+
+static void dvec_push(DVec *d, double x) {
+    if (d->n == d->cap) {
+        size_t newcap = d->cap ? d->cap * 2 : 64;
+        d->v = (double*)realloc(d->v, newcap * sizeof(double));
+        d->cap = newcap;
+    }
+    d->v[d->n++] = x;
+}
+
+static void _dswap(double *a, double *b) { double t = *a; *a = *b; *b = t; }
+
+/* Lomuto partition with a median-of-three pivot (avoids the O(n^2)
+ * worst case a fixed pivot hits on already-sorted or reverse-sorted
+ * input, which real feature columns -- timestamps, counters -- often
+ * are). Returns the pivot's final index. */
+static int _partition_lomuto(double *a, int lo, int hi) {
+    int mid = lo + (hi - lo) / 2;
+    double pivot;
+    int i, j;
+    if (a[mid] < a[lo]) _dswap(&a[lo],  &a[mid]);
+    if (a[hi]  < a[lo]) _dswap(&a[lo],  &a[hi]);
+    if (a[hi]  < a[mid]) _dswap(&a[mid], &a[hi]);
+    _dswap(&a[mid], &a[hi]);
+    pivot = a[hi];
+    i = lo;
+    for (j = lo; j < hi; j++) {
+        if (a[j] < pivot) { _dswap(&a[i], &a[j]); i++; }
+    }
+    _dswap(&a[i], &a[hi]);
+    return i;
+}
+
+/* Quickselect: returns the k-th smallest (0-indexed) of a[0..n-1],
+ * reordering a[] in the process (fine -- it's a private scratch copy).
+ * O(n) average case vs. a full O(n log n) sort. */
+static double _kth_smallest(double *a, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        int p = _partition_lomuto(a, lo, hi);
+        if (p == k) return a[p];
+        if (p < k) lo = p + 1; else hi = p - 1;
+    }
+    return a[lo];
+}
+
+/* Median of a[0..n-1] (reorders a[]).  Odd n: the single middle order
+ * statistic.  Even n: quickselect finds the lower-median at k = n/2-1,
+ * which leaves every a[i > k] >= a[k] (the standard quickselect
+ * post-condition) -- so the upper-median is just the min of that
+ * remaining slice, one more linear scan instead of a second full
+ * selection pass. */
+static double _median_select(double *a, int n) {
+    if (n % 2 == 1) {
+        return _kth_smallest(a, n, n / 2);
+    } else {
+        int k = n / 2 - 1;
+        double lower = _kth_smallest(a, n, k);
+        double upper = a[k + 1];
+        int i;
+        for (i = k + 2; i < n; i++) {
+            if (a[i] < upper) upper = a[i];
+        }
+        return (lower + upper) / 2.0;
+    }
+}
+
+void impute_fill_xs(SV* data_sv, int n_pts, int n_feats, int how,
+                     SV* out_rv) {
+    dTHX;
+    AV *outer, *out;
+    DVec *cols;
+    int i, f;
+
+    if (!SvROK(data_sv) || SvTYPE(SvRV(data_sv)) != SVt_PVAV) {
+        croak("impute_fill_xs: data must be an arrayref");
+    }
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("impute_fill_xs: out must be an arrayref");
+    }
+    outer = (AV*)SvRV(data_sv);
+    out   = (AV*)SvRV(out_rv);
+
+    cols = (DVec*)calloc((size_t)n_feats, sizeof(DVec));
+
+    for (i = 0; i < n_pts; i++) {
+        SV** row_pp = av_fetch(outer, i, 0);
+        AV* row;
+        if (!row_pp || !*row_pp || !SvROK(*row_pp) ||
+            SvTYPE(SvRV(*row_pp)) != SVt_PVAV) {
+            continue;
+        }
+        row = (AV*)SvRV(*row_pp);
+        for (f = 0; f < n_feats; f++) {
+            SV** v = av_fetch(row, f, 0);
+            if (v && *v && SvOK(*v)) {
+                dvec_push(&cols[f], SvNV(*v));
+            }
+        }
+    }
+
+    /* Validate every column before freeing anything: croak() longjmps
+     * out of this function, so any cleanup loop reachable after a
+     * partial computation has already started (and already freed some
+     * cols[i].v) risks a double free on those same pointers. Checking
+     * all columns up front, before the computation loop below frees
+     * anything, avoids that entirely. Matches the Perl fallback's
+     * behaviour of reporting the first empty column in feature order. */
+    for (f = 0; f < n_feats; f++) {
+        if (cols[f].n == 0) {
+            int col = f;
+            for (i = 0; i < n_feats; i++) free(cols[i].v);
+            free(cols);
+            croak("impute: feature column %d has no present values", col);
+        }
+    }
+
+    av_clear(out);
+    if (n_feats > 0) av_extend(out, n_feats - 1);
+
+    for (f = 0; f < n_feats; f++) {
+        double result;
+        if (how == 0) {
+            double sum = 0.0;
+            for (i = 0; i < (int)cols[f].n; i++) sum += cols[f].v[i];
+            result = sum / (double)cols[f].n;
+        } else {
+            result = _median_select(cols[f].v, (int)cols[f].n);
+        }
+        av_store(out, f, newSVnv(result));
+        free(cols[f].v);
+    }
+    free(cols);
+}
 __INLINE_C__
+
+    # IF_NO_C=1 skips even attempting to build the C backend -- useful for
+    # forcing the pure-Perl path without touching every constructor call
+    # (use_c => 0), e.g. to get a clean timing baseline or to avoid the
+    # compile attempt's overhead/noise in a container known to lack a
+    # compiler.  Everything below is skipped and $HAS_C stays 0.
+    unless ( $ENV{IF_NO_C} ) {
 
     # -O3 is safe to enable unconditionally and matters here: the
     # extended-mode oblique dot product is wrapped in `#pragma omp simd`,
@@ -999,21 +1178,61 @@ __INLINE_C__
     # scalar code.  Use OPTIMIZE (not CCFLAGS) -- CCFLAGS is prepended
     # to the cc line and would be shadowed by Perl's own `-O2 -g` that
     # ExtUtils::MakeMaker appends afterward (last `-O` wins in gcc).
-    #
-    # -march=native lets the compiler pick AVX2 gather + FMA tuned to
-    # the build host; it's opt-in via IF_NATIVE=1 because the cached
-    # artefact under _Inline/ would otherwise refuse to run on a CPU
-    # without the same instruction set extensions.
+    # IF_OPT overrides the level itself (e.g. IF_OPT=-O2 to work around a
+    # miscompile, or to shorten build time while developing); it's
+    # validated against a fixed set of GCC/Clang -O flags rather than
+    # interpolated as-is, since this string eventually reaches a shell
+    # command line via ExtUtils::MakeMaker.
     my $opt_level = '-O3';
-    $opt_level .= ' -march=native' if $ENV{IF_NATIVE};
+    if ( defined $ENV{IF_OPT} ) {
+        if ( $ENV{IF_OPT} =~ /\A-O[0123sgz]\z/ ) {
+            $opt_level = $ENV{IF_OPT};
+        }
+        else {
+            warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
+                . "IF_OPT value '$ENV{IF_OPT}' (expected one of -O0 -O1 -O2 "
+                . "-O3 -Os -Og -Oz); using $opt_level\n";
+        }
+    }
+
+    # -march=<value> lets the compiler target specific instruction-set
+    # extensions (AVX2 gather + FMA, etc.) for the oblique dot product
+    # and the fit-time min/max scan's `#pragma omp simd` loops.
+    #
+    # IF_ARCH=<value> sets it explicitly (e.g. "x86-64-v3", "skylake",
+    # "znver3") -- validated against a conservative identifier charset
+    # since, like IF_OPT, it flows into a compiler command line.
+    # IF_NATIVE=1 remains as shorthand for IF_ARCH=native and is used
+    # when IF_ARCH isn't set. Prefer a specific IF_ARCH value over
+    # IF_NATIVE on a machine you don't control exclusively: blanket
+    # -march=native pulls in whatever the build host has, including
+    # AVX-512 on some Intel CPUs, which is known to trigger clock
+    # throttling under sustained heavy use and can make throughput
+    # *worse* than a conservative target like x86-64-v3 (AVX2, no
+    # AVX-512). Either way, the cached artefact under _Inline/ is then
+    # pinned to that instruction set, so leave both unset if the
+    # directory is shared across machines with different CPUs.
+    if ( defined $ENV{IF_ARCH} ) {
+        if ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
+            $opt_level .= " -march=$ENV{IF_ARCH}";
+        }
+        else {
+            warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
+                . "IF_ARCH value '$ENV{IF_ARCH}'\n";
+        }
+    }
+    elsif ( $ENV{IF_NATIVE} ) {
+        $opt_level .= ' -march=native';
+    }
 
     # Inline::C hashes the C source to decide whether to rebuild but
     # does NOT include CCFLAGS / OPTIMIZE in that hash.  Without the
-    # tag below, toggling IF_NATIVE (or editing the optimisation flags
-    # here) would silently reuse a cached binary built with stale
-    # flags.  Embedding the active flags as a leading comment forces
-    # the hash to differ when they change.  The OpenMP and serial
-    # builds get distinct tags so they cache to separate artefacts.
+    # tag below, toggling IF_NATIVE/IF_ARCH/IF_OPT (or editing the
+    # optimisation flags here) would silently reuse a cached binary
+    # built with stale flags.  Embedding the active flags as a leading
+    # comment forces the hash to differ when they change.  The OpenMP
+    # and serial builds get distinct tags so they cache to separate
+    # artefacts.
     my $omp_tag    = "/* if_build: openmp $opt_level */\n";
     my $serial_tag = "/* if_build: serial $opt_level */\n";
 
@@ -1044,6 +1263,9 @@ __INLINE_C__
             $HAS_C = 1;
         };
     }
+    $OPT_LEVEL = $opt_level if $HAS_C;
+
+    } ## end unless IF_NO_C
     $HAS_OPENMP = ( $HAS_C && defined &has_openmp_xs && has_openmp_xs() )
         ? 1 : 0;
     $HAS_SIMD = ( $HAS_C && defined &has_simd_xs && has_simd_xs() )
@@ -1186,29 +1408,99 @@ C<use_openmp_fit> -- setting both just means C<parallel_fit> wins and
 C<use_openmp_fit> has no effect for that call.
 
 Detection happens once when the module is loaded; the compiled artefact
-is cached under C<_Inline/> and reused on subsequent runs.  Three
+is cached under C<_Inline/> and reused on subsequent runs.  Four
 package variables report what the build picked up:
 
     $Algorithm::Classifier::IsolationForest::HAS_C       # 0/1
     $Algorithm::Classifier::IsolationForest::HAS_OPENMP  # 0/1
     $Algorithm::Classifier::IsolationForest::HAS_SIMD    # 0/1 (OpenMP 4.0+)
+    $Algorithm::Classifier::IsolationForest::OPT_LEVEL   # e.g. "-O3 -march=native", '' if HAS_C is 0
 
 Neither dependency is required.  Without C<Inline::C> the module falls
 back to a pure-Perl implementation that produces identical results, just
 slower; without OpenMP the C backend runs single-threaded.
 
 The bundled C<iforest accel> subcommand performs a tiny fit + score and
-prints which backend is active, which is the recommended way to verify
-the build picked up the optional dependencies on a given machine.
+prints which backend is active (including the build flags below), which
+is the recommended way to verify the build picked up the optional
+dependencies on a given machine.
 
-The C backend is compiled with C<-O3> by default.  Set the environment
-variable C<IF_NATIVE=1> before first load to add C<-march=native>, which
-lets the compiler emit AVX2/AVX-512 gather and FMA instructions tuned
-to the build host.  This typically gives a meaningful speedup on the
-extended-mode oblique dot product at high feature counts.  The cached
-artefact under C<_Inline/> is pinned to the host CPU, so leave
-C<IF_NATIVE> unset if the directory is shared across machines with
-different instruction-set support.
+=head2 Tuning the C build
+
+These environment variables are read once, the first time the module is
+loaded, so they must be set before that -- e.g. in the shell before
+running a script, not via C<%ENV> inside the script itself.
+
+=over 4
+
+=item * C<IF_NO_C=1> -- skip attempting to build the C backend entirely.
+Equivalent to constructing every instance with C<use_c =E<gt> 0>, but
+without needing to touch every call site; useful for a clean pure-Perl
+timing baseline, or to avoid the compile attempt's overhead/noise on a
+host known to lack a C compiler (the attempt already fails gracefully
+without this, so it's a convenience, not a correctness fix).
+
+=item * C<IF_OPT=-O2> (or C<-O0>/C<-O1>/C<-Os>/C<-Og>/C<-Oz>) -- override
+the default C<-O3>, e.g. to shorten build time while iterating, or work
+around a miscompile on an unusual toolchain. Invalid values are ignored
+with a warning rather than passed through, since this string reaches a
+compiler command line.
+
+=item * C<IF_ARCH=E<lt>valueE<gt>> -- adds C<-march=E<lt>valueE<gt>> so the
+compiler can target specific instruction-set extensions (AVX2 gather +
+FMA, etc.) for the extended-mode oblique dot product and the fit-time
+min/max scan's C<#pragma omp simd> loops. Accepts values like
+C<x86-64-v3>, C<skylake>, or C<znver3> -- whatever your compiler's
+C<-march=> accepts. Also validated (a restricted character set, not
+passed through as-is) for the same reason as C<IF_OPT>.
+
+=item * C<IF_NATIVE=1> -- shorthand for C<IF_ARCH=native>; ignored if
+C<IF_ARCH> is also set. Prefer a specific C<IF_ARCH> value over this on
+a machine you don't control exclusively (a shared build host, a
+container base image): blanket C<-march=native> pulls in whatever
+instruction sets the build host happens to have, including AVX-512 on
+some Intel CPUs -- which is known to trigger clock throttling under
+sustained heavy use and can make throughput I<worse> than a
+conservative target like C<x86-64-v3> (AVX2, no AVX-512). If in doubt,
+benchmark both before committing to one.
+
+=back
+
+Whichever of these are used, the cached artefact under C<_Inline/> is
+pinned to that build's instruction set -- delete C<_Inline/> (or use a
+separate one per host) if the directory is shared across machines with
+different CPUs, or a stale binary built for a narrower instruction set
+than the current host will simply keep being reused.
+
+=head2 Tuning the OpenMP runtime
+
+These are standard OpenMP environment variables libgomp already reads
+at run time (set before running your script, no module-specific
+handling needed) -- listed here because they matter most for exactly
+the workloads this module has: C<score_all_xs>'s per-point parallel
+loop and C<use_openmp_fit>'s per-tree parallel loop.
+
+=over 4
+
+=item * C<OMP_NUM_THREADS=N> -- caps how many threads a parallel region
+uses. Useful to leave headroom for other work sharing the machine, or
+to pin down C<use_openmp_fit> reproducibility checks (see its docs
+above: results don't depend on this, but it's a natural thing to vary
+when confirming that).
+
+=item * C<OMP_PROC_BIND=close> / C<OMP_PLACES=cores> -- on multi-socket
+or otherwise NUMA machines, pins each thread to a core near where its
+data already lives instead of letting the OS scheduler migrate threads
+across sockets mid-run. Both C<score_all_xs> (each thread scans its own
+slice of the packed query buffer) and C<use_openmp_fit> (each thread
+builds one tree from packed training data) benefit from this when the
+input is large enough to not fit comfortably in one socket's cache.
+
+=back
+
+These cost nothing to try -- unlike C<IF_ARCH>/C<IF_NATIVE>, they're
+read fresh every run, not baked into a cached binary, so there's no
+downside to experimenting per invocation.
 
 =head1 GENERAL METHODS
 
@@ -2775,13 +3067,30 @@ sub _prepare_fit_data {
 	# nan: leave undef in place -- _build_tree / the split routers handle it.
 	return $data if $m eq 'nan';
 
-	# zero / impute: build a dense copy with every undef cell filled.
+	# zero / impute: undef has to become a real number somewhere before a
+	# split can look at it.  The fill vector is computed either way (it's
+	# needed for persistence and for scoring later), but densifying $data
+	# into a second, fully separate Perl array here is only necessary for
+	# the pure-Perl tree builder (_build_tree assumes every cell is
+	# defined once missing != 'nan' -- see its lo/hi scan).  The C
+	# tree-building path -- _build_forest_c/_build_forest_openmp, and
+	# every parallel_fit worker, all of which go through pack_input_xs --
+	# already fills undef cells itself from this same fill vector, so
+	# skip the redundant whole-dataset copy when that's the path fit()
+	# will actually take.  Scoring the training set for a learned
+	# contamination threshold (below, in fit()) is unaffected: it always
+	# runs through the pure-Perl scorer regardless of use_c (built before
+	# _rebuild_c_trees), and that path already tolerates raw undef cells
+	# for both zero (_path_length's "// 0") and impute (_prepare_perl_input
+	# densifies on demand from missing_fill).
 	my $fill
 		= $m eq 'impute'
 		? $self->_compute_impute_fill($data)
 		: [ (0) x $nf ];
 	$self->{missing_fill} = $fill if $m eq 'impute';
 	delete $self->{_fill_packed};
+
+	return $data if $self->{_use_c};
 	return _densify( $data, $fill );
 }
 
@@ -2791,6 +3100,20 @@ sub _compute_impute_fill {
 	my ( $self, $data ) = @_;
 	my $nf  = $self->{n_features};
 	my $how = $self->{impute_with};
+
+	# C fast path: walks the raw data directly and finds the median via
+	# quickselect (O(n) average) instead of the Perl fallback's full sort
+	# (O(n log n)).  Produces the same fill values either way -- see
+	# impute_fill_xs's file-top comment -- so use_c only changes speed
+	# here, matching the rest of the module.
+	if ( $self->{_use_c} ) {
+		my $n        = scalar @$data;
+		my $how_flag = $how eq 'median' ? 1 : 0;
+		my $fill     = [];
+		impute_fill_xs( $data, $n, $nf, $how_flag, $fill );
+		return $fill;
+	}
+
 	my @fill;
 	for my $f ( 0 .. $nf - 1 ) {
 		my @vals = grep { defined } map { $_->[$f] } @$data;
