@@ -71,6 +71,8 @@ our $HAS_SIMD   = 0;
 {
     my $C_CODE = <<'__INLINE_C__';
 #include <math.h>
+#include <string.h>
+#include <stdint.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -678,6 +680,317 @@ void build_forest_xs(SV* x_sv, int n_pts, int n_feats, int n_trees,
     }
     free(all);
 }
+
+/* ---------------------------------------------------------------------
+ * build_forest_openmp_xs -- OpenMP-parallel fit() tree builder.
+ *
+ * build_forest_xs (above) is bit-identical to the pure-Perl path
+ * because every random draw goes through Drand01(), the same
+ * generator Perl's rand()/srand() use -- but that generator is a
+ * single mutable struct shared by the whole interpreter, so calling
+ * it concurrently from multiple OpenMP threads would be a data race.
+ * The same is true of any Perl API call (newAV, newSViv, ...): Perl's
+ * SV allocator isn't safe to call from multiple OS threads sharing one
+ * interpreter without a lock that would just serialise everything
+ * anyway.
+ *
+ * So this builder trades the bit-identical guarantee for real thread
+ * parallelism: each tree gets its own splitmix64 PRNG stream, seeded
+ * from a tree index (not thread id or scheduling order), so results
+ * are still reproducible for a fixed seed and n_trees regardless of
+ * OMP_NUM_THREADS -- just different from what build_forest_xs or the
+ * pure-Perl path would produce for the same seed. The one Drand01()
+ * call in this function happens before the parallel region starts
+ * (single-threaded), so the result still varies with the model's
+ * `seed` the way every other code path does; it isn't used inside the
+ * parallel loop.
+ *
+ * Each tree is built entirely with plain C data (row-index int arrays,
+ * a growable TreeBuf of packed doubles/ints) -- no Perl API call
+ * happens anywhere inside the parallel region. Node layout in TreeBuf
+ * matches _pack_tree's SoA format exactly (see the file-top comment),
+ * except oblique coefficients are always stored sparse (in the random
+ * pool's order) -- the dense-pack fast path is skipped here because
+ * its only purpose is speeding up score_all_xs, and _rebuild_c_trees
+ * reapplies it anyway once the caller unpacks these buffers back into
+ * the standard Perl tree shape and re-derives the scoring buffers.
+ *
+ * After the parallel region, each tree's TreeBuf is copied into a Perl
+ * string SV (one memcpy each, serially) and stored into nodes_rv /
+ * idx_rv / val_rv -- the caller unpacks these into ordinary nested
+ * Perl trees for $self->{trees} (so to_json/persistence/_rebuild_c_trees
+ * are unaffected). ------------------------------------------------ */
+
+typedef struct {
+    double *nodes; size_t n_nodes, cap_nodes;
+    int    *idx;   size_t n_idx,   cap_idx;
+    double *val;   size_t n_val,   cap_val;
+} TreeBuf;
+
+static void tb_init(TreeBuf *b) {
+    b->nodes = NULL; b->n_nodes = 0; b->cap_nodes = 0;
+    b->idx   = NULL; b->n_idx   = 0; b->cap_idx   = 0;
+    b->val   = NULL; b->n_val   = 0; b->cap_val   = 0;
+}
+
+static void tb_free(TreeBuf *b) {
+    free(b->nodes); free(b->idx); free(b->val);
+}
+
+static int tb_push_node(TreeBuf *b, double f0, double f1, double f2,
+                         double f3, double f4, double f5) {
+    double *slot;
+    if (b->n_nodes == b->cap_nodes) {
+        size_t newcap = b->cap_nodes ? b->cap_nodes * 2 : 64;
+        b->nodes = (double*)realloc(b->nodes, newcap * 6 * sizeof(double));
+        b->cap_nodes = newcap;
+    }
+    slot = b->nodes + b->n_nodes * 6;
+    slot[0] = f0; slot[1] = f1; slot[2] = f2;
+    slot[3] = f3; slot[4] = f4; slot[5] = f5;
+    return (int)(b->n_nodes++);
+}
+
+/* Appends n (idx[k], val[k]) pairs and returns the offset they start
+ * at -- the `coff` an oblique node record stores. */
+static int tb_push_coef(TreeBuf *b, const int *idx, const double *val,
+                         int n) {
+    int off = (int)b->n_idx;
+    if (b->n_idx + (size_t)n > b->cap_idx) {
+        size_t newcap = b->cap_idx ? b->cap_idx * 2 : 64;
+        if (newcap < b->n_idx + (size_t)n) newcap = b->n_idx + (size_t)n;
+        b->idx     = (int*)realloc(b->idx, newcap * sizeof(int));
+        b->cap_idx = newcap;
+    }
+    if (b->n_val + (size_t)n > b->cap_val) {
+        size_t newcap = b->cap_val ? b->cap_val * 2 : 64;
+        if (newcap < b->n_val + (size_t)n) newcap = b->n_val + (size_t)n;
+        b->val     = (double*)realloc(b->val, newcap * sizeof(double));
+        b->cap_val = newcap;
+    }
+    memcpy(b->idx + b->n_idx, idx, (size_t)n * sizeof(int));
+    memcpy(b->val + b->n_val, val, (size_t)n * sizeof(double));
+    b->n_idx += n;
+    b->n_val += n;
+    return off;
+}
+
+/* splitmix64 -- fast, well-mixed, and per-stream state fits in one
+ * uint64_t, which is all a thread-private PRNG needs here. Not
+ * cryptographic; doesn't need to be. */
+static uint64_t sm64_next(uint64_t *s) {
+    uint64_t z = (*s += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static double sm64_drand(uint64_t *s) {
+    return (double)(sm64_next(s) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static double _ts_randn(uint64_t *s) {
+    double u1 = sm64_drand(s);
+    double u2;
+    if (u1 == 0.0) u1 = 1e-12;
+    u2 = sm64_drand(s);
+    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
+
+/* Thread-safe twin of _build_node_c: same split algorithm, but reads
+ * randomness from a thread-private splitmix64 stream instead of
+ * Drand01(), and writes into a TreeBuf instead of allocating Perl AVs
+ * -- so it touches no interpreter-global state and is safe to call
+ * concurrently from an OpenMP parallel region, one tree per thread. */
+static int _build_node_packed(const double* x, int nf, int* idxs, int size,
+                               int depth, int limit, int mode_flag,
+                               int ext_active, TreeBuf *buf, uint64_t *rng) {
+    double *lo, *hi;
+    int *varying, nv, f, my_idx;
+
+    if (depth >= limit || size <= 1) {
+        my_idx = tb_push_node(buf, 0.0, (double)size, 0.0, 0.0, 0.0, 0.0);
+        free(idxs);
+        return my_idx;
+    }
+
+    lo = (double*)malloc(nf * sizeof(double));
+    hi = (double*)malloc(nf * sizeof(double));
+    for (f = 0; f < nf; f++) {
+        lo[f] = HUGE_VAL;
+        hi[f] = -HUGE_VAL;
+    }
+    for (int i = 0; i < size; i++) {
+        const double* row = x + (size_t)idxs[i] * (size_t)nf;
+        for (f = 0; f < nf; f++) {
+            double v = row[f];
+            if (isnan(v)) continue;
+            if (v < lo[f]) lo[f] = v;
+            if (v > hi[f]) hi[f] = v;
+        }
+    }
+
+    varying = (int*)malloc(nf * sizeof(int));
+    nv      = 0;
+    for (f = 0; f < nf; f++) {
+        if (lo[f] < hi[f]) varying[nv++] = f;
+    }
+
+    if (nv == 0) {
+        free(lo); free(hi); free(varying);
+        my_idx = tb_push_node(buf, 0.0, (double)size, 0.0, 0.0, 0.0, 0.0);
+        free(idxs);
+        return my_idx;
+    }
+
+    if (mode_flag == 0) {
+        int attr     = varying[(int)(sm64_drand(rng) * nv)];
+        double split = lo[attr] + sm64_drand(rng) * (hi[attr] - lo[attr]);
+        int *lidx = (int*)malloc(size * sizeof(int));
+        int *ridx = (int*)malloc(size * sizeof(int));
+        int ln = 0, rn = 0, i, li, ri;
+
+        for (i = 0; i < size; i++) {
+            int row  = idxs[i];
+            double v = x[(size_t)row * (size_t)nf + attr];
+            if (v < split) lidx[ln++] = row; else ridx[rn++] = row;
+        }
+        free(idxs); free(lo); free(hi); free(varying);
+
+        li = _build_node_packed(x, nf, lidx, ln, depth + 1, limit,
+                                 mode_flag, ext_active, buf, rng);
+        ri = _build_node_packed(x, nf, ridx, rn, depth + 1, limit,
+                                 mode_flag, ext_active, buf, rng);
+        my_idx = tb_push_node(buf, 1.0, (double)attr, split,
+                               (double)li, (double)ri, 0.0);
+    } else {
+        int active = ext_active + 1;
+        int *pool, *lidx, *ridx;
+        double *coef;
+        double b = 0.0;
+        int ln = 0, rn = 0, i, k, li, ri, coff;
+
+        if (active > nv) active = nv;
+        pool = (int*)malloc(nv * sizeof(int));
+        memcpy(pool, varying, nv * sizeof(int));
+        for (i = 0; i < active; i++) {
+            int j = i + (int)(sm64_drand(rng) * (nv - i));
+            int tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+        }
+
+        coef = (double*)malloc(active * sizeof(double));
+        for (k = 0; k < active; k++) {
+            int ff   = pool[k];
+            double c = _ts_randn(rng);
+            double p = lo[ff] + sm64_drand(rng) * (hi[ff] - lo[ff]);
+            coef[k]  = c;
+            b += c * p;
+        }
+
+        lidx = (int*)malloc(size * sizeof(int));
+        ridx = (int*)malloc(size * sizeof(int));
+        for (i = 0; i < size; i++) {
+            int row    = idxs[i];
+            double dot = 0.0;
+            for (k = 0; k < active; k++) {
+                dot += coef[k] * x[(size_t)row * (size_t)nf + pool[k]];
+            }
+            if (dot <= b) lidx[ln++] = row; else ridx[rn++] = row;
+        }
+        free(idxs); free(lo); free(hi); free(varying);
+
+        li = _build_node_packed(x, nf, lidx, ln, depth + 1, limit,
+                                 mode_flag, ext_active, buf, rng);
+        ri = _build_node_packed(x, nf, ridx, rn, depth + 1, limit,
+                                 mode_flag, ext_active, buf, rng);
+        coff   = tb_push_coef(buf, pool, coef, active);
+        my_idx = tb_push_node(buf, 2.0, (double)coff, (double)active,
+                               (double)li, (double)ri, b);
+        free(pool); free(coef);
+    }
+    return my_idx;
+}
+
+void build_forest_openmp_xs(SV* x_sv, int n_pts, int n_feats, int n_trees,
+                             int psi, int limit, int mode_flag,
+                             int ext_level, SV* nodes_rv, SV* idx_rv,
+                             SV* val_rv, int use_openmp) {
+    dTHX;
+    STRLEN tl;
+    const double* x;
+    AV *nodes_av, *idx_av, *val_av;
+    TreeBuf *bufs;
+    uint64_t base_seed;
+    int t;
+
+    if (!SvROK(nodes_rv) || SvTYPE(SvRV(nodes_rv)) != SVt_PVAV ||
+        !SvROK(idx_rv)   || SvTYPE(SvRV(idx_rv))   != SVt_PVAV ||
+        !SvROK(val_rv)   || SvTYPE(SvRV(val_rv))   != SVt_PVAV) {
+        croak("build_forest_openmp_xs: nodes/idx/val must be arrayrefs");
+    }
+    x        = (const double*)SvPVbyte(x_sv, tl);
+    nodes_av = (AV*)SvRV(nodes_rv);
+    idx_av   = (AV*)SvRV(idx_rv);
+    val_av   = (AV*)SvRV(val_rv);
+    av_clear(nodes_av); av_clear(idx_av); av_clear(val_av);
+    if (n_trees > 0) {
+        av_extend(nodes_av, n_trees - 1);
+        av_extend(idx_av,   n_trees - 1);
+        av_extend(val_av,   n_trees - 1);
+    }
+
+    /* Single Drand01() call, before the parallel region starts, so it's
+     * still a plain serial call into the interpreter's RNG state. */
+    base_seed = (uint64_t)(Drand01() * 18446744073709551615.0);
+
+    bufs = (TreeBuf*)malloc((size_t)n_trees * sizeof(TreeBuf));
+    for (t = 0; t < n_trees; t++) tb_init(&bufs[t]);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic) if(use_openmp)
+    #endif
+    for (int t = 0; t < n_trees; t++) {
+        /* Seeded from the tree index, not thread id or iteration order,
+         * so the mapping from tree -> RNG stream is independent of
+         * OMP_NUM_THREADS / scheduling.  sm64_next() mixes once more so
+         * adjacent tree indices (which differ by one golden-ratio step)
+         * don't start from too-similar states. */
+        uint64_t rng = base_seed + (uint64_t)t * 0x9E3779B97F4A7C15ULL;
+        rng = sm64_next(&rng);
+        int *all = (int*)malloc((size_t)n_pts * sizeof(int));
+        int *sample;
+        int i;
+
+        for (i = 0; i < n_pts; i++) all[i] = i;
+        for (i = 0; i < psi; i++) {
+            int j = i + (int)(sm64_drand(&rng) * (n_pts - i));
+            int tmp = all[i]; all[i] = all[j]; all[j] = tmp;
+        }
+        sample = (int*)malloc((size_t)psi * sizeof(int));
+        memcpy(sample, all, (size_t)psi * sizeof(int));
+        free(all);
+
+        _build_node_packed(x, n_feats, sample, psi, 0, limit, mode_flag,
+                            ext_level, &bufs[t], &rng);
+    }
+
+    for (t = 0; t < n_trees; t++) {
+        /* newSVpvn(NULL, 0) makes an undef SV, not an empty-string one --
+         * axis-mode trees never call tb_push_coef, so idx/val stay NULL.
+         * Pass "" instead so the Perl side's unpack('...', $sv) always
+         * gets a defined (if empty) string, never undef. */
+        av_store(nodes_av, t, newSVpvn((char*)bufs[t].nodes,
+                     bufs[t].n_nodes * 6 * sizeof(double)));
+        av_store(idx_av, t, bufs[t].n_idx
+                     ? newSVpvn((char*)bufs[t].idx, bufs[t].n_idx * sizeof(int))
+                     : newSVpvn("", 0));
+        av_store(val_av, t, bufs[t].n_val
+                     ? newSVpvn((char*)bufs[t].val, bufs[t].n_val * sizeof(double))
+                     : newSVpvn("", 0));
+        tb_free(&bufs[t]);
+    }
+    free(bufs);
+}
 __INLINE_C__
 
     # -O3 is safe to enable unconditionally and matters here: the
@@ -831,15 +1144,36 @@ random draws go through the same generator C<rand()>/C<srand()> use
 internally, in the same call order the pure-Perl builder uses, so a
 given C<seed> produces bit-identical trees whether C<use_c> is on or
 off -- switching backends changes only how fast the model is built, not
-the model itself. Because it is single-threaded per call (Perl's RNG
-state isn't safe to share across OpenMP threads), scaling across cores
-still goes through C<parallel_fit>, which now forks workers that each
-use this faster builder internally -- so the two compose. Forking
-across processes has fixed IPC/serialisation overhead per worker, so on
-smaller datasets where a C-accelerated fit already completes in
-milliseconds, C<parallel_fit> can cost more than it saves; it's most
-useful once a single-process fit is large enough that the fork/Storable
+the model itself.
+
+By default this C builder is single-threaded per call, because Perl's
+RNG state isn't safe to share across OpenMP threads. Two ways to scale
+fit() across cores are available, and they compose:
+
+=over 4
+
+=item * C<parallel_fit> forks N worker processes, each building its
+share of the trees with the (still single-threaded) C builder. Fixed
+IPC/serialisation overhead per worker means this can cost more than it
+saves once a fit already completes in milliseconds; it's most useful
+once a single-process fit is large enough that the fork/Storable
 overhead is small relative to the work being split.
+
+=item * C<use_openmp_fit> builds trees across OpenMP threads within a
+single process (one tree per thread), using a separate, thread-safe
+PRNG seeded per tree index instead of Perl's C<rand()>. This means
+trees built with C<use_openmp_fit> are I<not> bit-identical to the
+default C<use_c> path for the same seed -- but a fixed seed and
+C<n_trees> still reproduce the same trees regardless of
+C<OMP_NUM_THREADS> or how OpenMP schedules the work. It's off by
+default (unlike C<use_c>/C<use_openmp>, which only ever change speed,
+this changes which trees get built) and only takes effect when C<use_c>
+is also on and OpenMP is linked in.
+
+=back
+
+Setting both lets each C<parallel_fit> worker also spread its share of
+trees across that worker's OpenMP threads.
 
 Detection happens once when the module is loaded; the compiled artefact
 is cached under C<_Inline/> and reused on subsequent runs.  Three
@@ -946,6 +1280,21 @@ Inits the object.
           use_c is false (pure Perl has no OpenMP path).
         default :: $HAS_OPENMP
 
+    - use_openmp_fit :: boolean, build fit()'s trees across OpenMP threads
+          (one tree per thread) instead of the single-threaded C builder.
+          Opt-in and off by default: unlike use_c/use_openmp, this changes
+          which trees get built. Perl's RNG isn't safe to call from
+          multiple OS threads sharing one interpreter, so this path seeds
+          an independent PRNG per tree from the tree index rather than
+          Drand01() -- trees differ from the use_c (single-threaded)
+          and pure-Perl paths even with the same seed, though a fixed
+          seed and n_trees still reproduce the same trees regardless of
+          OMP_NUM_THREADS or scheduling. Composes with parallel_fit: each
+          forked worker uses this internally for its own share of trees.
+          Ignored (clamped to 0) when use_c is false or OpenMP isn't
+          linked in.
+        default :: 0
+
 Note: log2 under Perl is as below...
 
     log($psi) / log(2)
@@ -996,6 +1345,12 @@ sub new {
 		: $HAS_OPENMP;
 	$use_openmp = 0 unless $use_c;
 
+	# Opt-in only (default 0, not $HAS_OPENMP): this path changes which
+	# trees fit() builds (see docs above), unlike use_c/use_openmp which
+	# only change speed.  Clamped the same way use_openmp is.
+	my $use_openmp_fit
+		= ( $args{use_openmp_fit} && $HAS_OPENMP && $use_c ) ? 1 : 0;
+
 	my $self = {
 		n_trees         => $args{n_trees}     // 100,
 		sample_size     => $args{sample_size} // 256,
@@ -1010,6 +1365,7 @@ sub new {
 		missing_fill    => undef,                     # per-feature fill, learned in fit() if impute
 		_use_c          => $use_c,
 		_use_openmp     => $use_openmp,
+		_use_openmp_fit => $use_openmp_fit,
 		threshold       => undef,                     # learned in fit() if contamination set
 		trees           => [],
 		c_psi           => undef,                     # c(psi), set during fit()
@@ -1152,6 +1508,11 @@ sub fit {
 	{
 		$self->{trees}
 			= $self->_fit_trees_parallel( $train, $psi, $limit, $workers );
+	}
+	elsif ( $self->{_use_c} && $self->{_use_openmp_fit} ) {
+		$self->{trees}
+			= $self->_build_forest_openmp( $train, $psi, $limit,
+			$self->{n_trees} );
 	}
 	elsif ( $self->{_use_c} ) {
 		$self->{trees}
@@ -1599,6 +1960,7 @@ sub from_json {
 		trees                => $trees,
 		_use_c               => $HAS_C,
 		_use_openmp          => $HAS_OPENMP,
+		_use_openmp_fit      => 0,    # opt-in only; loaded models never re-fit implicitly
 	};
 	croak "model contains no trees" unless @{ $self->{trees} };
 
@@ -2111,7 +2473,12 @@ sub _fit_trees_parallel {
 				srand( $self->{seed} + $w * 1009 );
 			}
 			my $trees;
-			if ( $self->{_use_c} ) {
+			if ( $self->{_use_c} && $self->{_use_openmp_fit} ) {
+				$trees
+					= $self->_build_forest_openmp( $data, $psi, $limit,
+					$share );
+			}
+			elsif ( $self->{_use_c} ) {
 				$trees = $self->_build_forest_c( $data, $psi, $limit, $share );
 			}
 			else {
@@ -2181,6 +2548,94 @@ sub _build_forest_c {
 	build_forest_xs( $x_packed, $n, $nf, $n_trees, $psi, $limit,
 		$mode_flag, $ext_level, $trees );
 	return $trees;
+}
+
+#-------------------------------------------------------------------------------
+# OpenMP-parallel fit(): builds $n_trees trees across OpenMP threads (one
+# tree per thread) via build_forest_openmp_xs.  Unlike _build_forest_c,
+# random draws come from a thread-private PRNG seeded per tree index
+# rather than Drand01() -- Perl's RNG state can't be shared safely
+# across OpenMP threads -- so the resulting trees are NOT bit-identical
+# to the use_c (serial) or pure-Perl paths for the same seed, though a
+# fixed seed + n_trees still reproduce the same trees regardless of
+# OMP_NUM_THREADS.  This is why it's gated by the separate, opt-in
+# use_openmp_fit knob rather than reusing use_c/use_openmp.
+#
+# build_forest_openmp_xs hands back three arrayrefs of per-tree packed
+# buffers (the same SoA layout _pack_tree produces) instead of Perl tree
+# structures -- that's how it avoids any Perl API call inside its
+# parallel region.  _unpack_forest converts them back into the ordinary
+# nested-arrayref tree shape so to_json/from_json/_rebuild_c_trees don't
+# need to know this path exists.
+#-------------------------------------------------------------------------------
+sub _build_forest_openmp {
+	my ( $self, $data, $psi, $limit, $n_trees ) = @_;
+	my $n  = scalar @$data;
+	my $nf = $self->{n_features};
+	my $x_packed = "\0" x ( $n * $nf * 8 );
+	my ( $mode, $fill ) = $self->_pack_args;
+	pack_input_xs( $data, $x_packed, $n, $nf, $mode, $fill );
+
+	my $mode_flag = $self->{mode} eq 'extended' ? 1 : 0;
+	my $ext_level = $self->{extension_level_used} // 0;
+
+	my ( @nodes, @idx, @val );
+	build_forest_openmp_xs( $x_packed, $n, $nf, $n_trees, $psi, $limit,
+		$mode_flag, $ext_level, \@nodes, \@idx, \@val, 1 );
+
+	return _unpack_forest( \@nodes, \@idx, \@val );
+}
+
+# Inverse of _pack_tree's SoA layout: given one tree's packed node
+# buffer plus the shared idx/val coefficient buffers, reconstructs the
+# ordinary nested-arrayref tree structure _build_tree/_build_node_c
+# produce.  Node indices in the packed buffer are DFS pre-order with
+# root at 0 (see _pack_tree's file-top comment); li/ri fields point at
+# the child's index directly, so this just follows them recursively.
+sub _unpack_node {
+	my ( $nodes, $idx, $val, $node_i ) = @_;
+	my $off  = $node_i * 6;
+	my $type = $nodes->[$off];
+
+	if ( $type == 0 ) {
+		return [ _NODE_LEAF, int( $nodes->[ $off + 1 ] ) ];
+	}
+	elsif ( $type == 1 ) {
+		my ( $attr, $split, $li, $ri )
+			= @{$nodes}[ $off + 1 .. $off + 4 ];
+		return [
+			_NODE_AXIS, int($attr), $split,
+			_unpack_node( $nodes, $idx, $val, int($li) ),
+			_unpack_node( $nodes, $idx, $val, int($ri) ),
+		];
+	}
+	else {
+		my ( $coff, $num, $li, $ri, $b ) = @{$nodes}[ $off + 1 .. $off + 5 ];
+		$coff = int($coff);
+		$num  = int($num);
+		return [
+			_NODE_OBLIQUE,
+			[ @{$idx}[ $coff .. $coff + $num - 1 ] ],
+			[ @{$val}[ $coff .. $coff + $num - 1 ] ],
+			$b,
+			_unpack_node( $nodes, $idx, $val, int($li) ),
+			_unpack_node( $nodes, $idx, $val, int($ri) ),
+		];
+	}
+} ## end sub _unpack_node
+
+# Unpacks every tree in the three per-tree packed-buffer arrayrefs
+# build_forest_openmp_xs returns into the ordinary nested tree shape.
+sub _unpack_forest {
+	my ( $nodes_list, $idx_list, $val_list ) = @_;
+	my @trees;
+	for my $i ( 0 .. $#$nodes_list ) {
+		my @nodes = unpack( 'd*', $nodes_list->[$i] );
+		my @idx   = unpack( 'l*', $idx_list->[$i] );
+		my @val   = unpack( 'd*', $val_list->[$i] );
+		push @trees, _unpack_node( \@nodes, \@idx, \@val, 0 );
+	}
+	return \@trees;
 }
 
 #-------------------------------------------------------------------------------
