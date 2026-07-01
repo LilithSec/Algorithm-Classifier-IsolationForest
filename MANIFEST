@@ -34,6 +34,7 @@ t/34-missing-values.t
 t/01-accel-flags.t
 t/90-cli-commands.t
 t/02-accel-selection.t
+t/03-fit-determinism.t
 examples/README.md
 examples/basic-anomaly-detection.pl
 examples/axis-vs-extended.pl

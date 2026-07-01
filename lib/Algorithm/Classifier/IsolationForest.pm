@@ -1148,7 +1148,7 @@ the model itself.
 
 By default this C builder is single-threaded per call, because Perl's
 RNG state isn't safe to share across OpenMP threads. Two ways to scale
-fit() across cores are available, and they compose:
+fit() across cores are available (see below for why they don't compose):
 
 =over 4
 
@@ -1172,8 +1172,18 @@ is also on and OpenMP is linked in.
 
 =back
 
-Setting both lets each C<parallel_fit> worker also spread its share of
-trees across that worker's OpenMP threads.
+These two do NOT compose, despite both existing to parallelise fit().
+A process that has run any OpenMP region -- including plain
+C<score_samples()>/C<predict()> with the default C<use_openmp> -- and
+then C<fork()>s (as C<parallel_fit> does) hands each child a copy of
+libgomp's thread pool whose worker threads did not survive the fork. A
+child that then starts its own C<#pragma omp parallel> region (as
+C<use_openmp_fit> would) tries to reuse that now-invalid pool and
+hangs. This is a general limitation of combining C<fork()> with OpenMP,
+not something fixable from Perl, so C<parallel_fit>'s forked workers
+always use the single-threaded C builder regardless of
+C<use_openmp_fit> -- setting both just means C<parallel_fit> wins and
+C<use_openmp_fit> has no effect for that call.
 
 Detection happens once when the module is loaded; the compiled artefact
 is cached under C<_Inline/> and reused on subsequent runs.  Three
@@ -1289,8 +1299,12 @@ Inits the object.
           Drand01() -- trees differ from the use_c (single-threaded)
           and pure-Perl paths even with the same seed, though a fixed
           seed and n_trees still reproduce the same trees regardless of
-          OMP_NUM_THREADS or scheduling. Composes with parallel_fit: each
-          forked worker uses this internally for its own share of trees.
+          OMP_NUM_THREADS or scheduling. Does NOT compose with
+          parallel_fit: a forked child starting its own OpenMP region
+          after the parent process has used OpenMP for anything can
+          hang (a general fork()+libgomp limitation), so parallel_fit's
+          workers always use the single-threaded C builder regardless
+          of this setting -- setting both just means parallel_fit wins.
           Ignored (clamped to 0) when use_c is false or OpenMP isn't
           linked in.
         default :: 0
@@ -2472,13 +2486,21 @@ sub _fit_trees_parallel {
 			if ( defined $self->{seed} ) {
 				srand( $self->{seed} + $w * 1009 );
 			}
+			# Deliberately never _build_forest_openmp here, even when
+			# use_openmp_fit is on: if this process (or the parent that
+			# fork()ed us) already ran any OpenMP region before this
+			# fork -- including plain score_samples()/predict() with
+			# the default use_openmp -- libgomp's thread pool exists
+			# but its worker threads didn't survive the fork. A child
+			# starting its own #pragma omp parallel region then tries
+			# to reuse that now-invalid pool and hangs. This is a
+			# general fork()+libgomp limitation, not fixable from here,
+			# so forked workers always use the single-threaded C
+			# builder (or pure Perl) instead. See t/03-fit-determinism.t
+			# and the NATIVE ACCELERATION docs for the observed hang and
+			# why parallel_fit + use_openmp_fit isn't composed for real.
 			my $trees;
-			if ( $self->{_use_c} && $self->{_use_openmp_fit} ) {
-				$trees
-					= $self->_build_forest_openmp( $data, $psi, $limit,
-					$share );
-			}
-			elsif ( $self->{_use_c} ) {
+			if ( $self->{_use_c} ) {
 				$trees = $self->_build_forest_c( $data, $psi, $limit, $share );
 			}
 			else {
@@ -2560,6 +2582,13 @@ sub _build_forest_c {
 # fixed seed + n_trees still reproduce the same trees regardless of
 # OMP_NUM_THREADS.  This is why it's gated by the separate, opt-in
 # use_openmp_fit knob rather than reusing use_c/use_openmp.
+#
+# Only called from fit()'s non-forked branch.  _fit_trees_parallel's
+# workers never call this, even when use_openmp_fit is on: a forked
+# child starting its own OpenMP region after the parent process has
+# used OpenMP for anything (this includes plain score_samples()) can
+# hang -- see the comment above that branch for the fork()+libgomp
+# hazard this avoids.
 #
 # build_forest_openmp_xs hands back three arrayrefs of per-tree packed
 # buffers (the same SoA layout _pack_tree produces) instead of Perl tree
