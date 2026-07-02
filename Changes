@@ -1,6 +1,6 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
-0.3.0   2026-06-30
+0.3.0   2026-07-01
         - fit() can now handle training data with missing (undef) feature
           cells, selectable via the new `missing =>` constructor option:
             die    :: croak on undef in the training data (default)
@@ -12,9 +12,51 @@ Revision history for Algorithm-Classifier-IsolationForest
         - missing strategy + impute fill vector are persisted in saved models;
           models from older releases load as `zero` (the prior undef -> 0
           scoring behaviour)
+        - new `use_openmp_fit` constructor option: builds fit()'s trees across
+          OpenMP threads within a single process using a thread-private
+          splitmix64 PRNG per tree; reproducible for a fixed seed + n_trees
+          regardless of OMP_NUM_THREADS, but NOT bit-identical to the
+          pure-Perl / serial-C paths (documented trade-off: thread-safety
+          requires a separate PRNG, unlike use_c which uses Drand01())
+        - serial C fit builder (build_forest_xs) is now bit-identical to the
+          pure-Perl fit path for the same seed, in both axis and extended mode
+          and across all missing strategies; switching use_c on/off never
+          changes the model, only how fast it is built
+        - pack_input_xs extended with miss_mode / fill_sv so the C input
+          packer handles all four missing strategies (zero, impute, nan)
+          rather than hard-coding 0.0 for undef cells
+        - parallel_fit and use_openmp_fit do not compose: forked children
+          never start their own OpenMP region to avoid a fork()+libgomp hang;
+          setting both just means parallel_fit wins
+        - new impute_fill_xs C helper computes the per-feature mean/median
+          impute fill vector in C when the backend is available
+        - the C build is now tunable via environment variables read at first
+          module load: IF_ARCH=<value> adds -march=<value>, IF_NATIVE=1 is
+          shorthand for IF_ARCH=native, IF_OPT overrides the default -O3,
+          and IF_NO_C=1 skips building the C backend entirely; values are
+          validated (bad ones warn and fall back to the defaults) and the
+          flags actually used are exposed via $OPT_LEVEL
+        - new POD sections on tuning the C build and the OpenMP runtime
+          (OMP_NUM_THREADS, OMP_PROC_BIND/OMP_PLACES)
+        - `accel` CLI command now documents the IF_* build tuning variables
+          and prints the build flags in use when the C backend is active
         - Tests: t/34-missing-values.t covering all four strategies, the
           C/pure-Perl agreement under nan mode, and persistence round-trips
-        - Tests: update various ones to test against both C and pure perl
+        - Tests: t/03-fit-determinism.t verifying reproducibility across all
+          backends (pure Perl, serial C, OpenMP-parallel C) and confirming
+          the parallel_fit + use_openmp_fit safety behaviour
+        - Tests: t/04-accel-tuning.t covering the IF_* build tuning
+          variables, including that invalid IF_OPT/IF_ARCH values are
+          rejected rather than passed to the compiler command line
+        - Tests: update various ones to test against both C and pure Perl
+        - Benchmarking: bench-sklearn-scoring.pl now compares pure Perl, C,
+          and C+OpenMP fit/score paths against sklearn side by side
+        - fix: calling fit() a second time on an already-fitted model with
+          contamination set no longer learns the threshold against the
+          previous fit's packed scoring buffers (bug present since 0.2.0)
+        - minor POD fixes (wrong method names in the path_lengths /
+          score_samples / score_predict_samples examples, missing package
+          name in the extended-mode SYNOPSIS example, assorted typos)
 
 0.2.1   2026-06-30/14:30
         - derp... actually update MANIFEST so a bunch of files from last release

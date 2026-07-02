@@ -715,10 +715,14 @@ void build_forest_xs(SV* x_sv, int n_pts, int n_feats, int n_trees,
  *
  * Each tree is built entirely with plain C data (row-index int arrays,
  * a growable TreeBuf of packed doubles/ints) -- no Perl API call
- * happens anywhere inside the parallel region. Node layout in TreeBuf
- * matches _pack_tree's SoA format exactly (see the file-top comment),
- * except oblique coefficients are always stored sparse (in the random
- * pool's order) -- the dense-pack fast path is skipped here because
+ * happens anywhere inside the parallel region. Each node record in
+ * TreeBuf uses _pack_tree's 6-double SoA layout (see the file-top
+ * comment), but the node ORDER differs: records are appended
+ * post-order (a node is pushed after both its children, since child
+ * indices must be known first), so the root is the last record --
+ * _pack_tree's pre-order puts it at 0.  _unpack_forest accounts for
+ * this.  Oblique coefficients are also always stored sparse (in the
+ * random pool's order) -- the dense-pack fast path is skipped because
  * its only purpose is speeding up score_all_xs, and _rebuild_c_trees
  * reapplies it anyway once the caller unpacks these buffers back into
  * the standard Perl tree shape and re-derives the scoring buffers.
@@ -1300,7 +1304,10 @@ Algorithm::Classifier::IsolationForest - unsupervised anomaly detection via Isol
     my $reloaded = Algorithm::Classifier::IsolationForest->load('model.json');
 
     # Extended Isolation Forest (oblique hyperplane splits)
-    my $eif = IsolationForest->new(mode => 'extended', seed => 42);
+    my $eif = Algorithm::Classifier::IsolationForest->new(
+        mode => 'extended',
+        seed => 42,
+    );
     $eif->fit(\@data);
 
     # Parallel training (fork-based, Unix-like platforms): build the
@@ -1337,7 +1344,7 @@ variant. Each split is a random hyperplane instead of an axis-aligned cut,
 which removes the rectangular, axis-aligned bias in the score field and
 tends to help on elongated or multi-modal data.
 
-psi refernced below is ψ or the pitchfork math symbol refrenced in paper,
+psi referenced below is ψ or the pitchfork math symbol referenced in the paper,
 Liu, Fei Tony & Ting, Kai & Zhou, Zhi-Hua. (2008). Isolation Forest. 413 - 422. 10.1109/ICDM.2008.17.
 
 ... or max samples.
@@ -1723,12 +1730,12 @@ of features. There is no upper limit on dimensionality.
         ...
     );
 
-Below shows a example of building a gausing cluster and using that for training.
+Below shows an example of building a gaussian cluster and using that for training.
 
     # so it is reproducible
     srand(7);
 
-    # build a gaussian cluster and add a handful out outliers...
+    # build a gaussian cluster and add a handful of outliers...
 
     use constant PI => 3.14159265358979;
     sub gaussian {
@@ -1752,7 +1759,7 @@ Below shows a example of building a gausing cluster and using that for training.
         push @truth, 1;
     }
 
-    $iforest->fit(\@training_data);
+    $iforest->fit(\@data);
 
 =cut
 
@@ -1833,6 +1840,13 @@ sub fit {
 		$self->{trees} = \@trees;
 	}
 
+	# On a re-fit, packed scoring buffers from the previous fit are still
+	# sitting on the object; score_samples() below would pick them up and
+	# learn the contamination threshold against the OLD forest.  Drop them
+	# so the training-set scoring runs pure-Perl against the trees just
+	# built; _rebuild_c_trees repacks from the new trees at the end.
+	delete @$self{qw(_c_nodes _c_coef_idx _c_coef_val)};
+
 	# If a contamination rate was requested, learn the score cutoff that flags
 	# that fraction of the training set. We place the threshold midway between
 	# the k-th and (k+1)-th highest training scores, so it sits in the gap
@@ -1880,15 +1894,15 @@ packed dataset built for a different feature count is a fatal error.
 
 =head2 path_lengths(\@data)
 
-Returns the mean isolation depth per sample, for inspection.
+Returns an arrayref of the mean isolation depth per sample, for inspection.
 
-    my @lenghts = $forest->path_lengths(\@data);
+    my $lengths = $forest->path_lengths(\@data);
 
     print "x, y, length\n";
 
     my $int=0;
     while (defined($data[$int])) {
-        print $data[$int][0].', '.$data[$int][1].', '.$lenghts[$int]."\n";
+        print $data[$int][0].', '.$data[$int][1].', '.$lengths->[$int]."\n";
 
         $int++;
     }
@@ -1930,7 +1944,8 @@ sub path_lengths {
 
 Returns an arrayref of 0/1 labels for the specified data.
 
-If theshold is not specified it uses whatever the set default.
+If threshold is not specified it uses the contamination-learned cutoff (if
+C<fit> was called with C<contamination>), otherwise 0.5.
 
     my $results = $forest->predict(\@data, $threshold);
 
@@ -1994,9 +2009,9 @@ Scores well below 0.5 are normal.
 
 Scores ~0.5 means the points are hard to tell apart.
 
-    my $scores = $forest->path_lengths(\@data);
+    my $scores = $forest->score_samples(\@data);
 
-    print "x, y, length\n";
+    print "x, y, score\n";
 
     my $int=0;
     while (defined($data[$int])) {
@@ -2053,10 +2068,12 @@ sub score_samples {
 
 =head2 score_predict_samples
 
-Returns a array ref of arrays. First value of each sub array is the score with the second being
+Returns an array ref of arrays. First value of each sub array is the score with the second being
 0/1 for if it is a anomaly or not.
 
-    my $results = $forest->predict(\@data, $threshold);
+C<$threshold> defaults the same way as in C<predict>.
+
+    my $results = $forest->score_predict_samples(\@data, $threshold);
 
     print "x, y, score, result\n";
 
@@ -2185,9 +2202,9 @@ sub score_predict_split {
 
 =head2 to_json
 
-Returns a JSON representation of the module.
+Returns a JSON representation of the model.
 
-Required being fit having to be called.
+Requires fit to have been called.
 
     my $json = $iforest->to_json;
 
@@ -2293,7 +2310,7 @@ sub save {
 	write_file( $path, { 'atomic' => 1 }, $self->to_json );
 }
 
-=head2 load($path);
+=head2 load($path)
 
 Init the object from the model in the specified file.
 
@@ -2910,9 +2927,12 @@ sub _build_forest_openmp {
 # Inverse of _pack_tree's SoA layout: given one tree's packed node
 # buffer plus the shared idx/val coefficient buffers, reconstructs the
 # ordinary nested-arrayref tree structure _build_tree/_build_node_c
-# produce.  Node indices in the packed buffer are DFS pre-order with
-# root at 0 (see _pack_tree's file-top comment); li/ri fields point at
-# the child's index directly, so this just follows them recursively.
+# produce.  li/ri fields hold the child's absolute node index, so this
+# just follows them recursively from whatever index the caller says the
+# root lives at.  NOTE: _pack_tree numbers nodes DFS pre-order (root at
+# 0), but build_forest_openmp_xs appends nodes post-order (children
+# before parent), putting the root LAST -- the caller must pass the
+# right root index for the buffer's origin.
 sub _unpack_node {
 	my ( $nodes, $idx, $val, $node_i ) = @_;
 	my $off  = $node_i * 6;
@@ -2947,6 +2967,9 @@ sub _unpack_node {
 
 # Unpacks every tree in the three per-tree packed-buffer arrayrefs
 # build_forest_openmp_xs returns into the ordinary nested tree shape.
+# The C builder pushes nodes post-order (a node is recorded after both
+# of its children), so each tree's root is the LAST node record, not
+# index 0 as in _pack_tree's pre-order layout.
 sub _unpack_forest {
 	my ( $nodes_list, $idx_list, $val_list ) = @_;
 	my @trees;
@@ -2954,7 +2977,8 @@ sub _unpack_forest {
 		my @nodes = unpack( 'd*', $nodes_list->[$i] );
 		my @idx   = unpack( 'l*', $idx_list->[$i] );
 		my @val   = unpack( 'd*', $val_list->[$i] );
-		push @trees, _unpack_node( \@nodes, \@idx, \@val, 0 );
+		my $root  = @nodes / 6 - 1;
+		push @trees, _unpack_node( \@nodes, \@idx, \@val, $root );
 	}
 	return \@trees;
 }
@@ -3079,8 +3103,10 @@ sub _prepare_fit_data {
 	# skip the redundant whole-dataset copy when that's the path fit()
 	# will actually take.  Scoring the training set for a learned
 	# contamination threshold (below, in fit()) is unaffected: it always
-	# runs through the pure-Perl scorer regardless of use_c (built before
-	# _rebuild_c_trees), and that path already tolerates raw undef cells
+	# runs through the pure-Perl scorer regardless of use_c (fit() drops
+	# any previous fit's packed buffers before that scoring, and
+	# _rebuild_c_trees runs after), and that path already tolerates raw
+	# undef cells
 	# for both zero (_path_length's "// 0") and impute (_prepare_perl_input
 	# densifies on demand from missing_fill).
 	my $fill
