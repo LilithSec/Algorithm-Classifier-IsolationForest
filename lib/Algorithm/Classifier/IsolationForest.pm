@@ -8,7 +8,7 @@ use POSIX       qw(ceil);
 use JSON::PP    ();
 use File::Slurp qw(read_file write_file);
 
-our $VERSION = '0.3.0';
+our $VERSION = '0.4.0';
 
 use constant EULER  => 0.5772156649015329;
 use constant TWO_PI => 6.283185307179586;
@@ -38,9 +38,16 @@ use constant _NODE_OBLIQUE => 2;
 #     raw int / double buffers.
 #
 # Node layout (6 doubles per node, "IF_NZ = 6"):
-#   leaf:    [0, size, 0,   0,  0, 0]
+#   leaf:    [0, size, c(size), 0, 0, 0]
 #   axis:    [1, attr, split, li, ri, 0]
 #   oblique: [2, coff, nf,  li, ri, b]
+#
+# c(size) is the expected-path-length adjustment for a leaf holding
+# `size` points, precomputed by _pack_tree (it involves a log(); doing
+# it at pack time keeps transcendentals out of the per-point per-tree
+# scoring loop).  The fit-time TreeBuf writer leaves that slot 0 --
+# its buffers are unpacked into Perl trees and re-packed by
+# _pack_tree before score_all_xs ever sees them.
 #
 # Coefficient storage uses a Structure-of-Arrays layout: one int32 array
 # per tree (feature indices, packed with 'l*') and one double array per
@@ -69,6 +76,9 @@ our $HAS_C      = 0;
 our $HAS_OPENMP = 0;
 our $HAS_SIMD   = 0;
 our $OPT_LEVEL  = '';    # the actual -O.../-march=... flags used to build, if any
+our $C_SOURCE   = '';    # 'prebuilt' (object installed at `make` time) or
+                         # 'runtime' (compiled at first load into _Inline/);
+                         # '' when $HAS_C is 0
 {
     my $C_CODE = <<'__INLINE_C__';
 #include <math.h>
@@ -78,12 +88,14 @@ our $OPT_LEVEL  = '';    # the actual -O.../-march=... flags used to build, if a
 #include <omp.h>
 #endif
 #define IF_NZ 6
-static double _ifc(double n){
-    if(n<=1.0)return 0.0;
-    if(n<2.5) return 1.0;
-    double h=log(n-1.0)+0.5772156649015329;
-    return 2.0*h-2.0*(n-1.0)/n;
-}
+
+/* Data prefetch hint; a no-op on compilers without __builtin_prefetch.
+ * Purely a performance hint -- never affects results. */
+#if defined(__GNUC__) || defined(__clang__)
+#define IF_PREFETCH(p) __builtin_prefetch(p)
+#else
+#define IF_PREFETCH(p)
+#endif
 
 int has_openmp_xs(){
 #ifdef _OPENMP
@@ -318,12 +330,88 @@ void score_predict_split_xs(SV* sm_sv, int n_pts, double inv,
     }
 }
 
+/* Walk one point through one tree; returns the path length (depth plus
+ * the precomputed c(leaf size) adjustment from the leaf record).
+ *
+ * Invariant: every feature index stored in a tree node is in
+ * [0, n_feats).  fit() builds trees against n_features columns and
+ * pack_input_xs writes exactly that many doubles per row, and
+ * _resolve_input rejects PackedData with a mismatched feature count.
+ * So the loop can omit per-iteration bounds checks on attr / fi --
+ * this is what lets the oblique dot product vectorize cleanly under
+ * the omp-simd reductions below. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline double if_walk_tree(const double *nd, const int *ico,
+                                  const double *vco, const double *xi,
+                                  int n_feats) {
+    int ni = 0, depth = 0;
+    for (;;) {
+        const double *node = nd + (size_t)ni * IF_NZ;
+        int type = (int)node[0];
+        if (type == 0) {
+            /* node[2] is c(leaf size), precomputed by _pack_tree; a
+             * log() here would otherwise run once per point per tree. */
+            return depth + node[2];
+        }
+        if (type == 1) {
+            double fv = xi[(int)node[1]];
+            ni = (fv < node[2]) ? (int)node[3] : (int)node[4];
+        } else {
+            int coff = (int)node[1], nf = (int)node[2];
+            double b = node[5], dot = 0.0;
+            const double *val_p = vco + (size_t)coff;
+
+            /* Both children are known before the dot product resolves
+             * which one gets taken, so start pulling their records in
+             * now and let the FMA loop below hide the latency.  One of
+             * the two prefetches is always wasted -- affordable here
+             * on the oblique path, where there is real work to hide it
+             * under, but not on the axis path, whose single compare
+             * resolves immediately. */
+            const int li = (int)node[3], ri = (int)node[4];
+            IF_PREFETCH(nd + (size_t)li * IF_NZ);
+            IF_PREFETCH(nd + (size_t)ri * IF_NZ);
+            if (nf == n_feats) {
+                /* Dense oblique split: this node uses every feature,
+                 * so _pack_tree laid the coefficients out in feature
+                 * order.  No gather -- the inner loop is a textbook
+                 * FMA-vectorizable dot product over two contiguous
+                 * double streams.  Common case in extended mode at
+                 * the default extension_level (== n_feats-1). */
+                #ifdef _OPENMP
+                #pragma omp simd reduction(+:dot)
+                #endif
+                for (int k = 0; k < n_feats; k++) {
+                    dot += val_p[k] * xi[k];
+                }
+            } else {
+                /* Sparse oblique split: only nf < n_feats features
+                 * participate, so we still need the gather on
+                 * xi[idx_p[k]].  Storing idx as contiguous int32
+                 * (rather than interleaved doubles) keeps the gather
+                 * pattern clean and the val[] load contiguous. */
+                const int *idx_p = ico + (size_t)coff;
+                #ifdef _OPENMP
+                #pragma omp simd reduction(+:dot)
+                #endif
+                for (int k = 0; k < nf; k++) {
+                    dot += val_p[k] * xi[idx_p[k]];
+                }
+            }
+            ni = (dot <= b) ? li : ri;
+        }
+        depth++;
+    }
+}
+
 /* score_all_xs(nodes_av, idx_av, val_av, x_sv, sm_sv,
  *              n_pts, n_feats, n_trees, use_openmp)
  *
  * Scores all points across all trees in one C call.  See header comment
- * above for the bigger picture.  Writes sm[i] = sum_over_trees(path_len),
- * not accumulating, so the caller need not zero-init sm.
+ * above for the bigger picture.  Writes sm[i] = sum_over_trees(path_len);
+ * the caller need not zero-init sm.
  *
  * idx_av holds per-tree packed int32 buffers of feature indices and
  * val_av holds per-tree packed double buffers of coefficients (the SoA
@@ -357,6 +445,9 @@ void score_all_xs(SV* nodes_av_sv, SV* idx_av_sv, SV* val_av_sv,
     const int    *idx_ptrs[n_trees];
     const double *val_ptrs[n_trees];
 
+    /* forest_bytes totals every buffer the tree walks touch; it decides
+     * between the two loop shapes below. */
+    size_t forest_bytes = 0;
     for (ti = 0; ti < n_trees; ti++) {
         SV** np = av_fetch(nodes_av, ti, 0);
         SV** ip = av_fetch(idx_av,   ti, 0);
@@ -364,81 +455,86 @@ void score_all_xs(SV* nodes_av_sv, SV* idx_av_sv, SV* val_av_sv,
         if (!np || !*np || !ip || !*ip || !vp || !*vp) {
             croak("score_all_xs: missing tree %d", ti);
         }
-        node_ptrs[ti] = (const double*)SvPVbyte(*np, tl);
-        idx_ptrs[ti]  = (const int*)   SvPVbyte(*ip, tl);
-        val_ptrs[ti]  = (const double*)SvPVbyte(*vp, tl);
+        node_ptrs[ti] = (const double*)SvPVbyte(*np, tl); forest_bytes += tl;
+        idx_ptrs[ti]  = (const int*)   SvPVbyte(*ip, tl); forest_bytes += tl;
+        val_ptrs[ti]  = (const double*)SvPVbyte(*vp, tl); forest_bytes += tl;
     }
 
     xd = (const double*)SvPVbyte(x_sv, tl);
     sm = (double*)SvPVbyte_force(sm_sv, tl);
 
+    /* Two loop shapes over the same per-point ascending-t additions --
+     * bit-identical results either way, so the size heuristic choosing
+     * between them can never change scores.
+     *
+     * Point-major (small forests): each point walks all trees with its
+     * path-length sum held in a register.  Cheapest per walk, and the
+     * whole forest stays cache-resident across points anyway.
+     *
+     * Tree-blocked (large forests): once the forest outgrows L3, the
+     * point-major loop re-streams every tree's nodes and coefficients
+     * from memory for every point -- an extended-mode tree is ~56 KB
+     * at 16 features (24 KB nodes + 32 KB dense coefficients), and its
+     * per-tree scoring cost measured 2.2x worse at 400 trees than at
+     * 100.  Walking a block of points through ONE tree at a time keeps
+     * that tree hot in L1/L2 while the block's rows stream through it
+     * (measured 3.1x faster at 400 extended trees, 20k points).  The
+     * blocked shape pays an sm[i] load+store per walk instead of a
+     * register add, which measurably hurts cheap axis walks while the
+     * forest still fits in cache -- hence the byte threshold rather
+     * than always tiling. */
+    if (forest_bytes <= (size_t)4 * 1024 * 1024) {
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if(use_openmp)
+        #pragma omp parallel for schedule(static) if(use_openmp)
 #endif
-    /* Invariant: every feature index stored in a tree node is in
-     * [0, n_feats).  fit() builds trees against n_features columns and
-     * pack_input_xs writes exactly that many doubles per row, and
-     * _resolve_input rejects PackedData with a mismatched feature
-     * count.  So the inner loop can omit per-iteration bounds checks
-     * on attr / fi -- this is what lets the oblique dot product
-     * vectorize cleanly under the omp-simd reduction below. */
-    for (int i = 0; i < n_pts; i++) {
-        double sum = 0.0;
-        const double *xi = xd + (size_t)i * (size_t)n_feats;
-        for (int t = 0; t < n_trees; t++) {
-            const double *nd  = node_ptrs[t];
-            const int    *ico = idx_ptrs[t];
-            const double *vco = val_ptrs[t];
-            int ni = 0, depth = 0;
-            for (;;) {
-                const double *node = nd + (size_t)ni * IF_NZ;
-                int type = (int)node[0];
-                if (type == 0) {
-                    sum += depth + _ifc(node[1]);
-                    break;
-                }
-                if (type == 1) {
-                    double fv = xi[(int)node[1]];
-                    ni = (fv < node[2]) ? (int)node[3] : (int)node[4];
-                } else {
-                    int coff = (int)node[1], nf = (int)node[2];
-                    double b = node[5], dot = 0.0;
-                    const double *val_p = vco + (size_t)coff;
-                    if (nf == n_feats) {
-                        /* Dense oblique split: this node uses every
-                         * feature, so _pack_tree laid the coefficients
-                         * out in feature order.  No gather -- the
-                         * inner loop is a textbook FMA-vectorizable
-                         * dot product over two contiguous double
-                         * streams.  Common case in extended mode at
-                         * the default extension_level (== n_feats-1). */
-                        #ifdef _OPENMP
-                        #pragma omp simd reduction(+:dot)
-                        #endif
-                        for (int k = 0; k < n_feats; k++) {
-                            dot += val_p[k] * xi[k];
-                        }
-                    } else {
-                        /* Sparse oblique split: only nf < n_feats
-                         * features participate, so we still need the
-                         * gather on xi[idx_p[k]].  Storing idx as
-                         * contiguous int32 (rather than interleaved
-                         * doubles) keeps the gather pattern clean and
-                         * the val[] load contiguous. */
-                        const int *idx_p = ico + (size_t)coff;
-                        #ifdef _OPENMP
-                        #pragma omp simd reduction(+:dot)
-                        #endif
-                        for (int k = 0; k < nf; k++) {
-                            dot += val_p[k] * xi[idx_p[k]];
-                        }
-                    }
-                    ni = (dot <= b) ? (int)node[3] : (int)node[4];
-                }
-                depth++;
+        for (int i = 0; i < n_pts; i++) {
+            const double *xi = xd + (size_t)i * (size_t)n_feats;
+            double sum = 0.0;
+            for (int t = 0; t < n_trees; t++) {
+                sum += if_walk_tree(node_ptrs[t], idx_ptrs[t],
+                                    val_ptrs[t], xi, n_feats);
+            }
+            sm[i] = sum;
+        }
+    }
+    else {
+        /* 256 rows x 16 features x 8 bytes = 32 KB of input per block
+         * -- comfortable in L2 next to one tree.  Each OpenMP thread
+         * owns whole blocks and therefore a unique slice of sm[], so
+         * there is still no synchronisation.  For small batches the
+         * tile shrinks to keep ~4 blocks per thread available; losing
+         * per-block tree reuse there is fine, since a small batch
+         * never re-streams much anyway. */
+        int tile = 256;
+#ifdef _OPENMP
+        if (use_openmp) {
+            int min_blocks = omp_get_max_threads() * 4;
+            if (min_blocks > 0 && (n_pts + tile - 1) / tile < min_blocks) {
+                tile = (n_pts + min_blocks - 1) / min_blocks;
+                if (tile < 1) tile = 1;
             }
         }
-        sm[i] = sum;
+#endif
+        int n_blocks = (n_pts + tile - 1) / tile;
+
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(use_openmp)
+#endif
+        for (int blk = 0; blk < n_blocks; blk++) {
+            const int i0 = blk * tile;
+            const int i1 = (i0 + tile < n_pts) ? i0 + tile : n_pts;
+            for (int i = i0; i < i1; i++) sm[i] = 0.0;
+            for (int t = 0; t < n_trees; t++) {
+                const double *nd  = node_ptrs[t];
+                const int    *ico = idx_ptrs[t];
+                const double *vco = val_ptrs[t];
+                for (int i = i0; i < i1; i++) {
+                    sm[i] += if_walk_tree(nd, ico, vco,
+                                          xd + (size_t)i * (size_t)n_feats,
+                                          n_feats);
+                }
+            }
+        }
     }
 }
 
@@ -1169,33 +1265,54 @@ void impute_fill_xs(SV* data_sv, int n_pts, int n_feats, int how,
 }
 __INLINE_C__
 
-    # IF_NO_C=1 skips even attempting to build the C backend -- useful for
+    # IF_NO_C=1 skips even attempting to set up the C backend -- useful for
     # forcing the pure-Perl path without touching every constructor call
     # (use_c => 0), e.g. to get a clean timing baseline or to avoid the
     # compile attempt's overhead/noise in a container known to lack a
     # compiler.  Everything below is skipped and $HAS_C stays 0.
     unless ( $ENV{IF_NO_C} ) {
 
-    # -O3 is safe to enable unconditionally and matters here: the
-    # extended-mode oblique dot product is wrapped in `#pragma omp simd`,
-    # but without aggressive optimization the compiler may still emit
-    # scalar code.  Use OPTIMIZE (not CCFLAGS) -- CCFLAGS is prepended
-    # to the cc line and would be shadowed by Perl's own `-O2 -g` that
-    # ExtUtils::MakeMaker appends afterward (last `-O` wins in gcc).
+    # Defaults recorded when `perl Makefile.PL` ran.  Makefile.PL generates
+    # Algorithm::Classifier::IsolationForest::BuildFlags, capturing the
+    # IF_* values active at configure time plus whether a prebuilt object
+    # was scheduled for install (see "Compile at install time" in the POD
+    # below).  From a plain source checkout the generated file is absent,
+    # the hard defaults here apply, and no prebuilt object is looked for.
+    my ( $def_opt, $def_arch, $def_no_omp, $prebuilt ) = ( '-O3', '', 0, 0 );
+    {
+        local $@;
+        my $rec = eval {
+            require Algorithm::Classifier::IsolationForest::BuildFlags;
+            Algorithm::Classifier::IsolationForest::BuildFlags::flags();
+        };
+        if ( ref $rec eq 'HASH' ) {
+            $def_opt    = $rec->{opt}  if defined $rec->{opt};
+            $def_arch   = $rec->{arch} if defined $rec->{arch};
+            $def_no_omp = $rec->{no_openmp} ? 1 : 0;
+            $prebuilt   = $rec->{prebuilt}  ? 1 : 0;
+        }
+    }
+
+    # -O3 is the usual default: it's safe to enable unconditionally and
+    # matters here -- the extended-mode oblique dot product is wrapped in
+    # `#pragma omp simd`, but without aggressive optimization the compiler
+    # may still emit scalar code.  Use OPTIMIZE (not CCFLAGS) -- CCFLAGS is
+    # prepended to the cc line and would be shadowed by Perl's own `-O2 -g`
+    # that ExtUtils::MakeMaker appends afterward (last `-O` wins in gcc).
     # IF_OPT overrides the level itself (e.g. IF_OPT=-O2 to work around a
     # miscompile, or to shorten build time while developing); it's
     # validated against a fixed set of GCC/Clang -O flags rather than
     # interpolated as-is, since this string eventually reaches a shell
     # command line via ExtUtils::MakeMaker.
-    my $opt_level = '-O3';
+    my $opt = $def_opt;
     if ( defined $ENV{IF_OPT} ) {
         if ( $ENV{IF_OPT} =~ /\A-O[0123sgz]\z/ ) {
-            $opt_level = $ENV{IF_OPT};
+            $opt = $ENV{IF_OPT};
         }
         else {
             warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
                 . "IF_OPT value '$ENV{IF_OPT}' (expected one of -O0 -O1 -O2 "
-                . "-O3 -Os -Og -Oz); using $opt_level\n";
+                . "-O3 -Os -Og -Oz); using $opt\n";
         }
     }
 
@@ -1216,9 +1333,17 @@ __INLINE_C__
     # AVX-512). Either way, the cached artefact under _Inline/ is then
     # pinned to that instruction set, so leave both unset if the
     # directory is shared across machines with different CPUs.
+    my $arch = $def_arch;
     if ( defined $ENV{IF_ARCH} ) {
-        if ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
-            $opt_level .= " -march=$ENV{IF_ARCH}";
+        if ( $ENV{IF_ARCH} eq '' or $ENV{IF_ARCH} eq 'none' ) {
+
+            # Explicit opt-out: overrides an arch recorded at configure
+            # time (there is no other way to request a plain build on
+            # an install configured with IF_ARCH).
+            $arch = '';
+        }
+        elsif ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
+            $arch = $ENV{IF_ARCH};
         }
         else {
             warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
@@ -1226,8 +1351,46 @@ __INLINE_C__
         }
     }
     elsif ( $ENV{IF_NATIVE} ) {
-        $opt_level .= ' -march=native';
+        $arch = 'native';
     }
+    # -ffp-contract=off rides along with any -march: once the target
+    # has FMA (x86-64-v3, most -march=native hosts), the compiler may
+    # otherwise contract a*b+c expressions into fused multiply-adds
+    # whose different rounding breaks the documented guarantee that
+    # use_c => 1 and use_c => 0 build bit-identical trees (one ulp in a
+    # split value cascades into a structurally different tree).  The
+    # -march speedup comes from AVX2 vectorization, not contraction,
+    # so this costs little (verified against the fit-determinism and
+    # scoring-parity tests).
+    my $opt_level = $opt;
+    $opt_level .= " -march=$arch -ffp-contract=off" if length $arch;
+
+    # IF_NO_OPENMP=1 forces the serial C build: the OpenMP compile attempt
+    # is skipped, so the object has no libgomp linkage and never starts an
+    # OpenMP runtime in the process.  Distinct from OMP_NUM_THREADS=1,
+    # which runs the parallel code on a single thread but still loads
+    # libgomp.  An explicit IF_NO_OPENMP=0 re-enables OpenMP over a
+    # no-openmp configure-time default.
+    my $no_omp =
+        defined $ENV{IF_NO_OPENMP}
+        ? ( $ENV{IF_NO_OPENMP} ? 1 : 0 )
+        : $def_no_omp;
+
+    # The prebuilt object is only trusted when the effective flags match
+    # what it was compiled with; any difference -- or an explicit
+    # IF_RUNTIME_BUILD=1 -- falls through to the classic runtime Inline::C
+    # build below, which honours the requested flags via the MD5-keyed
+    # _Inline/ cache exactly as before prebuilt support existed.
+    # IF_INSTALL_BUILD is the `make` rule driving the install-time compile
+    # (see Makefile.PL); it must never short-circuit into loading an
+    # older object.
+    my $use_prebuilt =
+           $prebuilt
+        && !$ENV{IF_RUNTIME_BUILD}
+        && !$ENV{IF_INSTALL_BUILD}
+        && $opt eq $def_opt
+        && $arch eq $def_arch
+        && $no_omp == $def_no_omp;
 
     # Inline::C hashes the C source to decide whether to rebuild but
     # does NOT include CCFLAGS / OPTIMIZE in that hash.  Without the
@@ -1240,32 +1403,103 @@ __INLINE_C__
     my $omp_tag    = "/* if_build: openmp $opt_level */\n";
     my $serial_tag = "/* if_build: serial $opt_level */\n";
 
-    # Try compiling with OpenMP first; on any failure (compiler doesn't
-    # accept -fopenmp, libgomp missing, etc.) fall back to a serial build.
-    {
-        local $@;
-        eval {
-            require Inline;
-            Inline->import(
-                C        => $omp_tag . $C_CODE,
-                CCFLAGS  => '-fopenmp',
-                OPTIMIZE => $opt_level,
-                LIBS     => '-lm -lgomp',
-            );
-            $HAS_C = 1;
-        };
+    if ( $ENV{IF_INSTALL_BUILD} ) {
+
+        # `make` is driving: the rule Makefile.PL appended runs this load
+        # with IF_INSTALL_BUILD=1 and @ARGV = (version, INST_ARCHLIB),
+        # which is where Inline's install mode reads them from.  _INSTALL_
+        # makes Inline compile the backend and place the shared object
+        # under blib/arch so `make install` ships it; NAME/VERSION give
+        # the object a fixed identity XSLoader can find at run time
+        # (Inline's install mode also requires both and checks VERSION
+        # against $ARGV[0]).  Same OpenMP-then-serial fallback as the
+        # runtime build below.
+        my @install = (
+            NAME      => __PACKAGE__,
+            VERSION   => $VERSION,
+            _INSTALL_ => 1,
+        );
+        unless ($no_omp) {
+            local $@;
+            eval {
+                require Inline;
+                Inline->import(
+                    C        => $omp_tag . $C_CODE,
+                    CCFLAGS  => '-fopenmp',
+                    OPTIMIZE => $opt_level,
+                    LIBS     => '-lm -lgomp',
+                    @install,
+                );
+                $HAS_C = 1;
+            };
+        }
+        unless ($HAS_C) {
+            local $@;
+            eval {
+                require Inline;
+                Inline->import(
+                    C        => $serial_tag . $C_CODE,
+                    OPTIMIZE => $opt_level,
+                    LIBS     => '-lm',
+                    @install,
+                );
+                $HAS_C = 1;
+            };
+        }
+        $C_SOURCE = 'prebuilt' if $HAS_C;
     }
-    unless ($HAS_C) {
-        local $@;
-        eval {
-            require Inline;
-            Inline->import(
-                C        => $serial_tag . $C_CODE,
-                OPTIMIZE => $opt_level,
-                LIBS     => '-lm',
-            );
-            $HAS_C = 1;
-        };
+    else {
+
+        # Fast path: the object compiled at `make` time was installed
+        # under auto/ like any XS module, so plain XSLoader digs it out of
+        # @INC with no Inline involvement -- no compiler, no _Inline/
+        # directory, and a few ms instead of a first-run compile.  Any
+        # failure (object deleted, different perl, version mismatch after
+        # an upgrade, libgomp since removed) just falls through to the
+        # runtime build.
+        if ($use_prebuilt) {
+            local $@;
+            eval {
+                require XSLoader;
+                XSLoader::load( __PACKAGE__, $VERSION );
+                $HAS_C    = 1;
+                $C_SOURCE = 'prebuilt';
+            };
+        }
+
+        # Classic runtime Inline::C build, MD5-cached under _Inline/.
+        # Reached when there is no matching prebuilt object: a source
+        # checkout, IF_RUNTIME_BUILD=1, or IF_* values differing from the
+        # ones recorded at configure time.  Try compiling with OpenMP
+        # first; on any failure (compiler doesn't accept -fopenmp, libgomp
+        # missing, etc.) fall back to a serial build.
+        unless ( $HAS_C or $no_omp ) {
+            local $@;
+            eval {
+                require Inline;
+                Inline->import(
+                    C        => $omp_tag . $C_CODE,
+                    CCFLAGS  => '-fopenmp',
+                    OPTIMIZE => $opt_level,
+                    LIBS     => '-lm -lgomp',
+                );
+                $HAS_C    = 1;
+                $C_SOURCE = 'runtime';
+            };
+        }
+        unless ($HAS_C) {
+            local $@;
+            eval {
+                require Inline;
+                Inline->import(
+                    C        => $serial_tag . $C_CODE,
+                    OPTIMIZE => $opt_level,
+                    LIBS     => '-lm',
+                );
+                $HAS_C    = 1;
+                $C_SOURCE = 'runtime';
+            };
+        }
     }
     $OPT_LEVEL = $opt_level if $HAS_C;
 
@@ -1414,14 +1648,19 @@ always use the single-threaded C builder regardless of
 C<use_openmp_fit> -- setting both just means C<parallel_fit> wins and
 C<use_openmp_fit> has no effect for that call.
 
-Detection happens once when the module is loaded; the compiled artefact
-is cached under C<_Inline/> and reused on subsequent runs.  Four
-package variables report what the build picked up:
+Detection happens once when the module is loaded.  When the
+distribution was installed with C<Inline::C> available, the C backend
+was already compiled during C<make> and the installed object is loaded
+directly (see L</Compile at install time (the prebuilt object)> below);
+otherwise the backend is compiled on first load and the artefact is
+cached under C<_Inline/> and reused on subsequent runs.  Five package
+variables report what the load picked up:
 
     $Algorithm::Classifier::IsolationForest::HAS_C       # 0/1
     $Algorithm::Classifier::IsolationForest::HAS_OPENMP  # 0/1
     $Algorithm::Classifier::IsolationForest::HAS_SIMD    # 0/1 (OpenMP 4.0+)
     $Algorithm::Classifier::IsolationForest::OPT_LEVEL   # e.g. "-O3 -march=native", '' if HAS_C is 0
+    $Algorithm::Classifier::IsolationForest::C_SOURCE    # 'prebuilt' / 'runtime', '' if HAS_C is 0
 
 Neither dependency is required.  Without C<Inline::C> the module falls
 back to a pure-Perl implementation that produces identical results, just
@@ -1432,11 +1671,68 @@ prints which backend is active (including the build flags below), which
 is the recommended way to verify the build picked up the optional
 dependencies on a given machine.
 
+=head2 Compile at install time (the prebuilt object)
+
+When C<Inline::C> is usable while the distribution itself is being
+built, C<perl Makefile.PL> arranges for the C backend to be compiled
+once during C<make> and installed alongside the module like any XS
+object.  At run time that object is loaded directly through
+L<XSLoader>: no C compiler, no C<Inline> modules, and no C<_Inline/>
+cache directory are needed on the machine the module ends up running
+on, and the first-load compile pause disappears entirely.
+
+On x86-64 hardware from roughly the last decade,
+C<IF_ARCH=x86-64-v3 perl Makefile.PL> is a reasonable configure line:
+it bakes AVX2 + FMA (without AVX-512) into the prebuilt object, which
+can speed up extended-mode scoring (how much is hardware-dependent --
+benchmark with C<iforest bench> before assuming) while avoiding the
+C<-march=native> caveats described under L</Tuning the C build>.
+Bit-for-bit result parity with the pure-Perl backend is preserved
+either way (see C<IF_ARCH> below).
+
+The C<IF_*> build flags described below are captured when
+C<perl Makefile.PL> runs -- set them in the environment of I<that>
+command, not of C<make> -- and recorded in the generated
+C<Algorithm::Classifier::IsolationForest::BuildFlags> module, which
+thereby also fixes what the prebuilt object was compiled with.  At run
+time the recorded values serve as the defaults, so a process started
+with no C<IF_*> variables set uses the prebuilt object as-is.
+
+Setting C<IF_*> variables at run time keeps working exactly as in
+releases without prebuilt support: if the requested flags differ from
+the recorded ones, the prebuilt object (compiled with the wrong flags
+for the request) is skipped and the module compiles at first load into
+C<_Inline/> -- which does need C<Inline::C> and a compiler on that
+machine.  Two related knobs exist:
+
+=over 4
+
+=item * C<IF_RUNTIME_BUILD=1> -- ignore the prebuilt object
+unconditionally and compile at first load even though the requested
+flags match the recorded ones.  Useful when the installed object is
+suspect (built on a different CPU than it now runs on, linked against a
+libgomp that has since changed) or to A/B a fresh local build against
+the shipped one.
+
+=item * C<IF_INSTALL_BUILD=1> -- internal; set by the generated
+Makefile rule that performs the install-time compile.  Not meant for
+manual use.
+
+=back
+
+If the prebuilt object cannot be loaded for any reason (deleted, built
+against a different perl, version mismatch after an upgrade), the
+module quietly falls through the same chain as always: runtime
+Inline::C build first, pure Perl last.
+
 =head2 Tuning the C build
 
 These environment variables are read once, the first time the module is
 loaded, so they must be set before that -- e.g. in the shell before
-running a script, not via C<%ENV> inside the script itself.
+running a script, not via C<%ENV> inside the script itself.  They are
+also read by C<perl Makefile.PL> to pick the flags baked into the
+prebuilt object (see above); at run time they override the recorded
+configure-time values, at the price of a runtime compile.
 
 =over 4
 
@@ -1459,7 +1755,15 @@ FMA, etc.) for the extended-mode oblique dot product and the fit-time
 min/max scan's C<#pragma omp simd> loops. Accepts values like
 C<x86-64-v3>, C<skylake>, or C<znver3> -- whatever your compiler's
 C<-march=> accepts. Also validated (a restricted character set, not
-passed through as-is) for the same reason as C<IF_OPT>.
+passed through as-is) for the same reason as C<IF_OPT>.  The special
+value C<none> (or an empty string) opts out of any arch recorded at
+configure time, yielding a plain build.  Whenever a C<-march> is in
+effect the build also adds C<-ffp-contract=off>: with FMA available
+the compiler would otherwise contract C<a*b+c> into fused
+multiply-adds whose different rounding breaks the guarantee that
+C<use_c =E<gt> 1> and C<use_c =E<gt> 0> build bit-identical trees (the
+C<-march> speedup comes from vectorization, not contraction, so this
+costs essentially nothing).
 
 =item * C<IF_NATIVE=1> -- shorthand for C<IF_ARCH=native>; ignored if
 C<IF_ARCH> is also set. Prefer a specific C<IF_ARCH> value over this on
@@ -1470,6 +1774,16 @@ some Intel CPUs -- which is known to trigger clock throttling under
 sustained heavy use and can make throughput I<worse> than a
 conservative target like C<x86-64-v3> (AVX2, no AVX-512). If in doubt,
 benchmark both before committing to one.
+
+=item * C<IF_NO_OPENMP=1> -- build (or select) the serial C backend: the
+OpenMP compile attempt is skipped entirely, so the resulting object has
+no libgomp linkage and never starts an OpenMP runtime inside the
+process. This differs from C<OMP_NUM_THREADS=1>, which merely runs the
+parallel code on one thread but still loads libgomp. Set at
+C<perl Makefile.PL> time it yields a serial prebuilt object; set at run
+time against an OpenMP prebuilt install it triggers a runtime serial
+build (needing a compiler). An explicit C<IF_NO_OPENMP=0> re-enables
+OpenMP over a serial configure-time default.
 
 =back
 
@@ -2650,7 +2964,14 @@ sub _pack_tree {
 		push @node_data, undef;    # reserve slot; filled in after children
 
 		if ( $node->[0] == _NODE_LEAF ) {
-			$node_data[$my_idx] = [ 0.0, $node->[1] + 0.0, 0.0, 0.0, 0.0, 0.0 ];
+
+			# Slot 2 carries c(size) precomputed, so the C scoring loop
+			# adds it straight to the depth instead of paying a log()
+			# per point per tree at every leaf hit.  _c is the same
+			# function the pure-Perl scorer uses, so both backends keep
+			# producing bit-identical path lengths.
+			$node_data[$my_idx] =
+				[ 0.0, $node->[1] + 0.0, _c( $node->[1] ), 0.0, 0.0, 0.0 ];
 		}
 		elsif ( $node->[0] == _NODE_AXIS ) {
 			my $li = $assign->( $node->[3] );

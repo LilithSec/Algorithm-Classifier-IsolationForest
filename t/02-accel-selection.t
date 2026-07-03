@@ -280,7 +280,33 @@ SKIP: {
         like( $out, qr/Inline::C\s*:/, 'mentions Inline::C' );
         like( $out, qr/OpenMP\s*:/,    'mentions OpenMP' );
         like( $out, qr/SIMD\s*:/,      'mentions SIMD' );
+        like( $out, qr/C object\s*:/,  'mentions the C object source' );
         like( $out, qr/Active backend:/, 'prints an Active backend line' );
+
+        # The C object line must always resolve to one of the three
+        # states, consistent with the availability row in the same
+        # output (the CLI runs in its own process, so we compare the
+        # CLI's output against itself, not against this process's
+        # flags -- prebuilt vs runtime may legitimately differ).
+        if ( $out =~ /Inline::C\s*:\s*available/ ) {
+            like(
+                $out,
+                qr/C object\s*:\s*(prebuilt at install time|compiled at run time)/,
+                'C object line says prebuilt or runtime when C is active'
+            );
+            like(
+                $out,
+                qr/Active backend:.*-- (prebuilt at install time|compiled at run time)/,
+                'Active backend summary includes the C object source'
+            );
+        }
+        else {
+            like(
+                $out,
+                qr/C object\s*:\s*none/,
+                'C object line says none without a C backend'
+            );
+        }
 
         # Cross-check the per-feature status lines against the package
         # flags the test process observed.  This is what makes this test

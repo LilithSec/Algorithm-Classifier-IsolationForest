@@ -98,7 +98,11 @@ that:
   vectorised via `#pragma omp simd` — substantially faster for
   high-feature-count extended models.
 
-Detection happens once at module load and is cached under `_Inline/`.
+When `Inline::C` is available while the distribution is being built,
+the C backend is compiled once during `make` and installed with the
+module — at run time it loads like any XS module, with no compiler,
+Inline, or `_Inline/` cache directory needed.  Otherwise detection
+happens once at module load and the build is cached under `_Inline/`.
 None of these dependencies are required: without them the module falls
 back to a pure-Perl implementation that produces identical results,
 just slower.
@@ -116,17 +120,20 @@ Algorithm::Classifier::IsolationForest acceleration status
   Inline::C : available
   OpenMP    : available
   SIMD      : available
+  C object  : prebuilt at install time
+  Build flags: -O3 -march=x86-64-v3
 
-Active backend: Inline::C with OpenMP + SIMD
+Active backend: Inline::C with OpenMP + SIMD -- prebuilt at install time
 ```
 
-User code that wants to introspect the active backend can read three
+User code that wants to introspect the active backend can read these
 package variables:
 
 ```perl
 $Algorithm::Classifier::IsolationForest::HAS_C       # 0/1
 $Algorithm::Classifier::IsolationForest::HAS_OPENMP  # 0/1
 $Algorithm::Classifier::IsolationForest::HAS_SIMD    # 0/1
+$Algorithm::Classifier::IsolationForest::C_SOURCE    # 'prebuilt' / 'runtime' / ''
 ```
 
 # Install
@@ -140,6 +147,19 @@ make test
 make install
 ```
 
+On x86-64 machines from roughly the last decade, configuring with
+
+```shell
+IF_ARCH=x86-64-v3 perl Makefile.PL
+```
+
+bakes `-march=x86-64-v3` (AVX2 + FMA, no AVX-512) into the installed C
+backend, which can speed up extended-mode scoring — how much is
+hardware-dependent, so benchmark before assuming.  Results stay
+bit-identical to the pure-Perl backend either way.  See "Tuning the C
+build" in the module documentation for the other `IF_*` knobs and why
+`-march=native` is not always the better choice.
+
 ## FreeBSD
 
 ```shell
@@ -150,7 +170,7 @@ cpanm Algorithm::Classifier::IsolationForest
 
 `gcc` ships with `libgomp` and provides the OpenMP runtime; the system
 clang does not by default.  `p5-Inline-C` is what makes the C backend
-build at module load.
+build (at install time, or at first module load from a plain checkout).
 
 ## Debian
 
