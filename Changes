@@ -1,6 +1,6 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
-0.3.0   2026-07-01
+0.3.0   2026-07-02/23:00
         - lots of POD fixes/cleanup
 		- various further C optmizations
         - fit() can now handle training data with missing (undef) feature
