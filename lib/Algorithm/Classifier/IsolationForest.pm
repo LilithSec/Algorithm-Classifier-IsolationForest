@@ -80,7 +80,7 @@ our $C_SOURCE   = '';    # 'prebuilt' (object installed at `make` time) or
                          # 'runtime' (compiled at first load into _Inline/);
                          # '' when $HAS_C is 0
 {
-    my $C_CODE = <<'__INLINE_C__';
+	my $C_CODE = <<'__INLINE_C__';
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
@@ -1265,249 +1265,241 @@ void impute_fill_xs(SV* data_sv, int n_pts, int n_feats, int how,
 }
 __INLINE_C__
 
-    # IF_NO_C=1 skips even attempting to set up the C backend -- useful for
-    # forcing the pure-Perl path without touching every constructor call
-    # (use_c => 0), e.g. to get a clean timing baseline or to avoid the
-    # compile attempt's overhead/noise in a container known to lack a
-    # compiler.  Everything below is skipped and $HAS_C stays 0.
-    unless ( $ENV{IF_NO_C} ) {
+	# IF_NO_C=1 skips even attempting to set up the C backend -- useful for
+	# forcing the pure-Perl path without touching every constructor call
+	# (use_c => 0), e.g. to get a clean timing baseline or to avoid the
+	# compile attempt's overhead/noise in a container known to lack a
+	# compiler.  Everything below is skipped and $HAS_C stays 0.
+	unless ( $ENV{IF_NO_C} ) {
 
-    # Defaults recorded when `perl Makefile.PL` ran.  Makefile.PL generates
-    # Algorithm::Classifier::IsolationForest::BuildFlags, capturing the
-    # IF_* values active at configure time plus whether a prebuilt object
-    # was scheduled for install (see "Compile at install time" in the POD
-    # below).  From a plain source checkout the generated file is absent,
-    # the hard defaults here apply, and no prebuilt object is looked for.
-    my ( $def_opt, $def_arch, $def_no_omp, $prebuilt ) = ( '-O3', '', 0, 0 );
-    {
-        local $@;
-        my $rec = eval {
-            require Algorithm::Classifier::IsolationForest::BuildFlags;
-            Algorithm::Classifier::IsolationForest::BuildFlags::flags();
-        };
-        if ( ref $rec eq 'HASH' ) {
-            $def_opt    = $rec->{opt}  if defined $rec->{opt};
-            $def_arch   = $rec->{arch} if defined $rec->{arch};
-            $def_no_omp = $rec->{no_openmp} ? 1 : 0;
-            $prebuilt   = $rec->{prebuilt}  ? 1 : 0;
-        }
-    }
+		# Defaults recorded when `perl Makefile.PL` ran.  Makefile.PL generates
+		# Algorithm::Classifier::IsolationForest::BuildFlags, capturing the
+		# IF_* values active at configure time plus whether a prebuilt object
+		# was scheduled for install (see "Compile at install time" in the POD
+		# below).  From a plain source checkout the generated file is absent,
+		# the hard defaults here apply, and no prebuilt object is looked for.
+		my ( $def_opt, $def_arch, $def_no_omp, $prebuilt ) = ( '-O3', '', 0, 0 );
+		{
+			local $@;
+			my $rec = eval {
+				require Algorithm::Classifier::IsolationForest::BuildFlags;
+				Algorithm::Classifier::IsolationForest::BuildFlags::flags();
+			};
+			if ( ref $rec eq 'HASH' ) {
+				$def_opt    = $rec->{opt}  if defined $rec->{opt};
+				$def_arch   = $rec->{arch} if defined $rec->{arch};
+				$def_no_omp = $rec->{no_openmp} ? 1 : 0;
+				$prebuilt   = $rec->{prebuilt}  ? 1 : 0;
+			}
+		}
 
-    # -O3 is the usual default: it's safe to enable unconditionally and
-    # matters here -- the extended-mode oblique dot product is wrapped in
-    # `#pragma omp simd`, but without aggressive optimization the compiler
-    # may still emit scalar code.  Use OPTIMIZE (not CCFLAGS) -- CCFLAGS is
-    # prepended to the cc line and would be shadowed by Perl's own `-O2 -g`
-    # that ExtUtils::MakeMaker appends afterward (last `-O` wins in gcc).
-    # IF_OPT overrides the level itself (e.g. IF_OPT=-O2 to work around a
-    # miscompile, or to shorten build time while developing); it's
-    # validated against a fixed set of GCC/Clang -O flags rather than
-    # interpolated as-is, since this string eventually reaches a shell
-    # command line via ExtUtils::MakeMaker.
-    my $opt = $def_opt;
-    if ( defined $ENV{IF_OPT} ) {
-        if ( $ENV{IF_OPT} =~ /\A-O[0123sgz]\z/ ) {
-            $opt = $ENV{IF_OPT};
-        }
-        else {
-            warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
-                . "IF_OPT value '$ENV{IF_OPT}' (expected one of -O0 -O1 -O2 "
-                . "-O3 -Os -Og -Oz); using $opt\n";
-        }
-    }
+		# -O3 is the usual default: it's safe to enable unconditionally and
+		# matters here -- the extended-mode oblique dot product is wrapped in
+		# `#pragma omp simd`, but without aggressive optimization the compiler
+		# may still emit scalar code.  Use OPTIMIZE (not CCFLAGS) -- CCFLAGS is
+		# prepended to the cc line and would be shadowed by Perl's own `-O2 -g`
+		# that ExtUtils::MakeMaker appends afterward (last `-O` wins in gcc).
+		# IF_OPT overrides the level itself (e.g. IF_OPT=-O2 to work around a
+		# miscompile, or to shorten build time while developing); it's
+		# validated against a fixed set of GCC/Clang -O flags rather than
+		# interpolated as-is, since this string eventually reaches a shell
+		# command line via ExtUtils::MakeMaker.
+		my $opt = $def_opt;
+		if ( defined $ENV{IF_OPT} ) {
+			if ( $ENV{IF_OPT} =~ /\A-O[0123sgz]\z/ ) {
+				$opt = $ENV{IF_OPT};
+			} else {
+				warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
+					. "IF_OPT value '$ENV{IF_OPT}' (expected one of -O0 -O1 -O2 "
+					. "-O3 -Os -Og -Oz); using $opt\n";
+			}
+		}
 
-    # -march=<value> lets the compiler target specific instruction-set
-    # extensions (AVX2 gather + FMA, etc.) for the oblique dot product
-    # and the fit-time min/max scan's `#pragma omp simd` loops.
-    #
-    # IF_ARCH=<value> sets it explicitly (e.g. "x86-64-v3", "skylake",
-    # "znver3") -- validated against a conservative identifier charset
-    # since, like IF_OPT, it flows into a compiler command line.
-    # IF_NATIVE=1 remains as shorthand for IF_ARCH=native and is used
-    # when IF_ARCH isn't set. Prefer a specific IF_ARCH value over
-    # IF_NATIVE on a machine you don't control exclusively: blanket
-    # -march=native pulls in whatever the build host has, including
-    # AVX-512 on some Intel CPUs, which is known to trigger clock
-    # throttling under sustained heavy use and can make throughput
-    # *worse* than a conservative target like x86-64-v3 (AVX2, no
-    # AVX-512). Either way, the cached artefact under _Inline/ is then
-    # pinned to that instruction set, so leave both unset if the
-    # directory is shared across machines with different CPUs.
-    my $arch = $def_arch;
-    if ( defined $ENV{IF_ARCH} ) {
-        if ( $ENV{IF_ARCH} eq '' or $ENV{IF_ARCH} eq 'none' ) {
+		# -march=<value> lets the compiler target specific instruction-set
+		# extensions (AVX2 gather + FMA, etc.) for the oblique dot product
+		# and the fit-time min/max scan's `#pragma omp simd` loops.
+		#
+		# IF_ARCH=<value> sets it explicitly (e.g. "x86-64-v3", "skylake",
+		# "znver3") -- validated against a conservative identifier charset
+		# since, like IF_OPT, it flows into a compiler command line.
+		# IF_NATIVE=1 remains as shorthand for IF_ARCH=native and is used
+		# when IF_ARCH isn't set. Prefer a specific IF_ARCH value over
+		# IF_NATIVE on a machine you don't control exclusively: blanket
+		# -march=native pulls in whatever the build host has, including
+		# AVX-512 on some Intel CPUs, which is known to trigger clock
+		# throttling under sustained heavy use and can make throughput
+		# *worse* than a conservative target like x86-64-v3 (AVX2, no
+		# AVX-512). Either way, the cached artefact under _Inline/ is then
+		# pinned to that instruction set, so leave both unset if the
+		# directory is shared across machines with different CPUs.
+		my $arch = $def_arch;
+		if ( defined $ENV{IF_ARCH} ) {
+			if ( $ENV{IF_ARCH} eq '' or $ENV{IF_ARCH} eq 'none' ) {
 
-            # Explicit opt-out: overrides an arch recorded at configure
-            # time (there is no other way to request a plain build on
-            # an install configured with IF_ARCH).
-            $arch = '';
-        }
-        elsif ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
-            $arch = $ENV{IF_ARCH};
-        }
-        else {
-            warn "Algorithm::Classifier::IsolationForest: ignoring invalid "
-                . "IF_ARCH value '$ENV{IF_ARCH}'\n";
-        }
-    }
-    elsif ( $ENV{IF_NATIVE} ) {
-        $arch = 'native';
-    }
-    # -ffp-contract=off rides along with any -march: once the target
-    # has FMA (x86-64-v3, most -march=native hosts), the compiler may
-    # otherwise contract a*b+c expressions into fused multiply-adds
-    # whose different rounding breaks the documented guarantee that
-    # use_c => 1 and use_c => 0 build bit-identical trees (one ulp in a
-    # split value cascades into a structurally different tree).  The
-    # -march speedup comes from AVX2 vectorization, not contraction,
-    # so this costs little (verified against the fit-determinism and
-    # scoring-parity tests).
-    my $opt_level = $opt;
-    $opt_level .= " -march=$arch -ffp-contract=off" if length $arch;
+				# Explicit opt-out: overrides an arch recorded at configure
+				# time (there is no other way to request a plain build on
+				# an install configured with IF_ARCH).
+				$arch = '';
+			} elsif ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
+				$arch = $ENV{IF_ARCH};
+			} else {
+				warn "Algorithm::Classifier::IsolationForest: ignoring invalid " . "IF_ARCH value '$ENV{IF_ARCH}'\n";
+			}
+		} elsif ( $ENV{IF_NATIVE} ) {
+			$arch = 'native';
+		}
+		# -ffp-contract=off rides along with any -march: once the target
+		# has FMA (x86-64-v3, most -march=native hosts), the compiler may
+		# otherwise contract a*b+c expressions into fused multiply-adds
+		# whose different rounding breaks the documented guarantee that
+		# use_c => 1 and use_c => 0 build bit-identical trees (one ulp in a
+		# split value cascades into a structurally different tree).  The
+		# -march speedup comes from AVX2 vectorization, not contraction,
+		# so this costs little (verified against the fit-determinism and
+		# scoring-parity tests).
+		my $opt_level = $opt;
+		$opt_level .= " -march=$arch -ffp-contract=off" if length $arch;
 
-    # IF_NO_OPENMP=1 forces the serial C build: the OpenMP compile attempt
-    # is skipped, so the object has no libgomp linkage and never starts an
-    # OpenMP runtime in the process.  Distinct from OMP_NUM_THREADS=1,
-    # which runs the parallel code on a single thread but still loads
-    # libgomp.  An explicit IF_NO_OPENMP=0 re-enables OpenMP over a
-    # no-openmp configure-time default.
-    my $no_omp =
-        defined $ENV{IF_NO_OPENMP}
-        ? ( $ENV{IF_NO_OPENMP} ? 1 : 0 )
-        : $def_no_omp;
+		# IF_NO_OPENMP=1 forces the serial C build: the OpenMP compile attempt
+		# is skipped, so the object has no libgomp linkage and never starts an
+		# OpenMP runtime in the process.  Distinct from OMP_NUM_THREADS=1,
+		# which runs the parallel code on a single thread but still loads
+		# libgomp.  An explicit IF_NO_OPENMP=0 re-enables OpenMP over a
+		# no-openmp configure-time default.
+		my $no_omp
+			= defined $ENV{IF_NO_OPENMP}
+			? ( $ENV{IF_NO_OPENMP} ? 1 : 0 )
+			: $def_no_omp;
 
-    # The prebuilt object is only trusted when the effective flags match
-    # what it was compiled with; any difference -- or an explicit
-    # IF_RUNTIME_BUILD=1 -- falls through to the classic runtime Inline::C
-    # build below, which honours the requested flags via the MD5-keyed
-    # _Inline/ cache exactly as before prebuilt support existed.
-    # IF_INSTALL_BUILD is the `make` rule driving the install-time compile
-    # (see Makefile.PL); it must never short-circuit into loading an
-    # older object.
-    my $use_prebuilt =
-           $prebuilt
-        && !$ENV{IF_RUNTIME_BUILD}
-        && !$ENV{IF_INSTALL_BUILD}
-        && $opt eq $def_opt
-        && $arch eq $def_arch
-        && $no_omp == $def_no_omp;
+		# The prebuilt object is only trusted when the effective flags match
+		# what it was compiled with; any difference -- or an explicit
+		# IF_RUNTIME_BUILD=1 -- falls through to the classic runtime Inline::C
+		# build below, which honours the requested flags via the MD5-keyed
+		# _Inline/ cache exactly as before prebuilt support existed.
+		# IF_INSTALL_BUILD is the `make` rule driving the install-time compile
+		# (see Makefile.PL); it must never short-circuit into loading an
+		# older object.
+		my $use_prebuilt
+			= $prebuilt
+			&& !$ENV{IF_RUNTIME_BUILD}
+			&& !$ENV{IF_INSTALL_BUILD}
+			&& $opt eq $def_opt
+			&& $arch eq $def_arch
+			&& $no_omp == $def_no_omp;
 
-    # Inline::C hashes the C source to decide whether to rebuild but
-    # does NOT include CCFLAGS / OPTIMIZE in that hash.  Without the
-    # tag below, toggling IF_NATIVE/IF_ARCH/IF_OPT (or editing the
-    # optimisation flags here) would silently reuse a cached binary
-    # built with stale flags.  Embedding the active flags as a leading
-    # comment forces the hash to differ when they change.  The OpenMP
-    # and serial builds get distinct tags so they cache to separate
-    # artefacts.
-    my $omp_tag    = "/* if_build: openmp $opt_level */\n";
-    my $serial_tag = "/* if_build: serial $opt_level */\n";
+		# Inline::C hashes the C source to decide whether to rebuild but
+		# does NOT include CCFLAGS / OPTIMIZE in that hash.  Without the
+		# tag below, toggling IF_NATIVE/IF_ARCH/IF_OPT (or editing the
+		# optimisation flags here) would silently reuse a cached binary
+		# built with stale flags.  Embedding the active flags as a leading
+		# comment forces the hash to differ when they change.  The OpenMP
+		# and serial builds get distinct tags so they cache to separate
+		# artefacts.
+		my $omp_tag    = "/* if_build: openmp $opt_level */\n";
+		my $serial_tag = "/* if_build: serial $opt_level */\n";
 
-    if ( $ENV{IF_INSTALL_BUILD} ) {
+		if ( $ENV{IF_INSTALL_BUILD} ) {
 
-        # `make` is driving: the rule Makefile.PL appended runs this load
-        # with IF_INSTALL_BUILD=1 and @ARGV = (version, INST_ARCHLIB),
-        # which is where Inline's install mode reads them from.  _INSTALL_
-        # makes Inline compile the backend and place the shared object
-        # under blib/arch so `make install` ships it; NAME/VERSION give
-        # the object a fixed identity XSLoader can find at run time
-        # (Inline's install mode also requires both and checks VERSION
-        # against $ARGV[0]).  Same OpenMP-then-serial fallback as the
-        # runtime build below.
-        my @install = (
-            NAME      => __PACKAGE__,
-            VERSION   => $VERSION,
-            _INSTALL_ => 1,
-        );
-        unless ($no_omp) {
-            local $@;
-            eval {
-                require Inline;
-                Inline->import(
-                    C        => $omp_tag . $C_CODE,
-                    CCFLAGS  => '-fopenmp',
-                    OPTIMIZE => $opt_level,
-                    LIBS     => '-lm -lgomp',
-                    @install,
-                );
-                $HAS_C = 1;
-            };
-        }
-        unless ($HAS_C) {
-            local $@;
-            eval {
-                require Inline;
-                Inline->import(
-                    C        => $serial_tag . $C_CODE,
-                    OPTIMIZE => $opt_level,
-                    LIBS     => '-lm',
-                    @install,
-                );
-                $HAS_C = 1;
-            };
-        }
-        $C_SOURCE = 'prebuilt' if $HAS_C;
-    }
-    else {
+			# `make` is driving: the rule Makefile.PL appended runs this load
+			# with IF_INSTALL_BUILD=1 and @ARGV = (version, INST_ARCHLIB),
+			# which is where Inline's install mode reads them from.  _INSTALL_
+			# makes Inline compile the backend and place the shared object
+			# under blib/arch so `make install` ships it; NAME/VERSION give
+			# the object a fixed identity XSLoader can find at run time
+			# (Inline's install mode also requires both and checks VERSION
+			# against $ARGV[0]).  Same OpenMP-then-serial fallback as the
+			# runtime build below.
+			my @install = (
+				NAME      => __PACKAGE__,
+				VERSION   => $VERSION,
+				_INSTALL_ => 1,
+			);
+			unless ($no_omp) {
+				local $@;
+				eval {
+					require Inline;
+					Inline->import(
+						C        => $omp_tag . $C_CODE,
+						CCFLAGS  => '-fopenmp',
+						OPTIMIZE => $opt_level,
+						LIBS     => '-lm -lgomp',
+						@install,
+					);
+					$HAS_C = 1;
+				};
+			} ## end unless ($no_omp)
+			unless ($HAS_C) {
+				local $@;
+				eval {
+					require Inline;
+					Inline->import(
+						C        => $serial_tag . $C_CODE,
+						OPTIMIZE => $opt_level,
+						LIBS     => '-lm',
+						@install,
+					);
+					$HAS_C = 1;
+				};
+			} ## end unless ($HAS_C)
+			$C_SOURCE = 'prebuilt' if $HAS_C;
+		} else {
 
-        # Fast path: the object compiled at `make` time was installed
-        # under auto/ like any XS module, so plain XSLoader digs it out of
-        # @INC with no Inline involvement -- no compiler, no _Inline/
-        # directory, and a few ms instead of a first-run compile.  Any
-        # failure (object deleted, different perl, version mismatch after
-        # an upgrade, libgomp since removed) just falls through to the
-        # runtime build.
-        if ($use_prebuilt) {
-            local $@;
-            eval {
-                require XSLoader;
-                XSLoader::load( __PACKAGE__, $VERSION );
-                $HAS_C    = 1;
-                $C_SOURCE = 'prebuilt';
-            };
-        }
+			# Fast path: the object compiled at `make` time was installed
+			# under auto/ like any XS module, so plain XSLoader digs it out of
+			# @INC with no Inline involvement -- no compiler, no _Inline/
+			# directory, and a few ms instead of a first-run compile.  Any
+			# failure (object deleted, different perl, version mismatch after
+			# an upgrade, libgomp since removed) just falls through to the
+			# runtime build.
+			if ($use_prebuilt) {
+				local $@;
+				eval {
+					require XSLoader;
+					XSLoader::load( __PACKAGE__, $VERSION );
+					$HAS_C    = 1;
+					$C_SOURCE = 'prebuilt';
+				};
+			}
 
-        # Classic runtime Inline::C build, MD5-cached under _Inline/.
-        # Reached when there is no matching prebuilt object: a source
-        # checkout, IF_RUNTIME_BUILD=1, or IF_* values differing from the
-        # ones recorded at configure time.  Try compiling with OpenMP
-        # first; on any failure (compiler doesn't accept -fopenmp, libgomp
-        # missing, etc.) fall back to a serial build.
-        unless ( $HAS_C or $no_omp ) {
-            local $@;
-            eval {
-                require Inline;
-                Inline->import(
-                    C        => $omp_tag . $C_CODE,
-                    CCFLAGS  => '-fopenmp',
-                    OPTIMIZE => $opt_level,
-                    LIBS     => '-lm -lgomp',
-                );
-                $HAS_C    = 1;
-                $C_SOURCE = 'runtime';
-            };
-        }
-        unless ($HAS_C) {
-            local $@;
-            eval {
-                require Inline;
-                Inline->import(
-                    C        => $serial_tag . $C_CODE,
-                    OPTIMIZE => $opt_level,
-                    LIBS     => '-lm',
-                );
-                $HAS_C    = 1;
-                $C_SOURCE = 'runtime';
-            };
-        }
-    }
-    $OPT_LEVEL = $opt_level if $HAS_C;
+			# Classic runtime Inline::C build, MD5-cached under _Inline/.
+			# Reached when there is no matching prebuilt object: a source
+			# checkout, IF_RUNTIME_BUILD=1, or IF_* values differing from the
+			# ones recorded at configure time.  Try compiling with OpenMP
+			# first; on any failure (compiler doesn't accept -fopenmp, libgomp
+			# missing, etc.) fall back to a serial build.
+			unless ( $HAS_C or $no_omp ) {
+				local $@;
+				eval {
+					require Inline;
+					Inline->import(
+						C        => $omp_tag . $C_CODE,
+						CCFLAGS  => '-fopenmp',
+						OPTIMIZE => $opt_level,
+						LIBS     => '-lm -lgomp',
+					);
+					$HAS_C    = 1;
+					$C_SOURCE = 'runtime';
+				};
+			} ## end unless ( $HAS_C or $no_omp )
+			unless ($HAS_C) {
+				local $@;
+				eval {
+					require Inline;
+					Inline->import(
+						C        => $serial_tag . $C_CODE,
+						OPTIMIZE => $opt_level,
+						LIBS     => '-lm',
+					);
+					$HAS_C    = 1;
+					$C_SOURCE = 'runtime';
+				};
+			} ## end unless ($HAS_C)
+		} ## end else [ if ( $ENV{IF_INSTALL_BUILD} ) ]
+		$OPT_LEVEL = $opt_level if $HAS_C;
 
-    } ## end unless IF_NO_C
-    $HAS_OPENMP = ( $HAS_C && defined &has_openmp_xs && has_openmp_xs() )
-        ? 1 : 0;
-    $HAS_SIMD = ( $HAS_C && defined &has_simd_xs && has_simd_xs() )
-        ? 1 : 0;
+	} ## end unless ( $ENV{IF_NO_C} )
+	$HAS_OPENMP = ( $HAS_C && defined &has_openmp_xs && has_openmp_xs() ) ? 1 : 0;
+	$HAS_SIMD   = ( $HAS_C && defined &has_simd_xs   && has_simd_xs() )   ? 1 : 0;
 }
 
 =encoding UTF-8
@@ -1975,8 +1967,7 @@ sub new {
 	# Opt-in only (default 0, not $HAS_OPENMP): this path changes which
 	# trees fit() builds (see docs above), unlike use_c/use_openmp which
 	# only change speed.  Clamped the same way use_openmp is.
-	my $use_openmp_fit
-		= ( $args{use_openmp_fit} && $HAS_OPENMP && $use_c ) ? 1 : 0;
+	my $use_openmp_fit = ( $args{use_openmp_fit} && $HAS_OPENMP && $use_c ) ? 1 : 0;
 
 	my $self = {
 		n_trees         => $args{n_trees}     // 100,
@@ -1997,6 +1988,7 @@ sub new {
 		trees           => [],
 		c_psi           => undef,                     # c(psi), set during fit()
 		n_features      => undef,
+		feature_names   => $args{feature_names},      # optional arrayref of per-feature labels
 	};
 
 	croak "n_trees must be >= 1"     unless $self->{n_trees} >= 1;
@@ -2021,6 +2013,17 @@ set.
 =cut
 
 sub decision_threshold { return $_[0]->{threshold} }
+
+=head2 feature_names
+
+Returns the arrayref of feature name strings stored with the model, or undef
+if none were provided at fit time.
+
+    my $names = $iforest->feature_names;
+
+=cut
+
+sub feature_names { return $_[0]->{feature_names} }
 
 =head2 fit
 
@@ -2133,19 +2136,13 @@ sub fit {
 		&& $self->{n_trees} > 1
 		&& _fork_supported() )
 	{
-		$self->{trees}
-			= $self->_fit_trees_parallel( $train, $psi, $limit, $workers );
-	}
-	elsif ( $self->{_use_c} && $self->{_use_openmp_fit} ) {
-		$self->{trees}
-			= $self->_build_forest_openmp( $train, $psi, $limit,
-			$self->{n_trees} );
-	}
-	elsif ( $self->{_use_c} ) {
+		$self->{trees} = $self->_fit_trees_parallel( $train, $psi, $limit, $workers );
+	} elsif ( $self->{_use_c} && $self->{_use_openmp_fit} ) {
+		$self->{trees} = $self->_build_forest_openmp( $train, $psi, $limit, $self->{n_trees} );
+	} elsif ( $self->{_use_c} ) {
 		$self->{trees}
 			= $self->_build_forest_c( $train, $psi, $limit, $self->{n_trees} );
-	}
-	else {
+	} else {
 		my @trees;
 		for ( 1 .. $self->{n_trees} ) {
 			my $sample = _subsample( $train, $psi );
@@ -2232,14 +2229,15 @@ sub path_lengths {
 	if ( $self->{_use_c} && $self->{_c_nodes} ) {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes},
-			$self->{_c_coef_idx}, $self->{_c_coef_val},
-			$x_packed, $sums_packed, $n_pts, $nf, $t,
-			$self->{_use_openmp} );
+		score_all_xs(
+			$self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val},
+			$x_packed,         $sums_packed,         $n_pts,
+			$nf,               $t,                   $self->{_use_openmp}
+		);
 		my $result = [];
 		finalize_path_lengths_xs( $sums_packed, $n_pts, $t + 0.0, $result );
 		return $result;
-	}
+	} ## end if ( $self->{_use_c} && $self->{_c_nodes} )
 
 	$data = $self->_prepare_perl_input($data);
 	my $nan = $self->{missing} eq 'nan' ? 1 : 0;
@@ -2298,19 +2296,100 @@ sub predict {
 		my $c     = $self->{c_psi};
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes},
-			$self->{_c_coef_idx}, $self->{_c_coef_val},
-			$x_packed, $sums_packed, $n_pts, $nf, $t,
-			$self->{_use_openmp} );
+		score_all_xs(
+			$self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val},
+			$x_packed,         $sums_packed,         $n_pts,
+			$nf,               $t,                   $self->{_use_openmp}
+		);
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
 		my $result        = [];
 		predict_sums_xs( $sums_packed, $n_pts, $sum_threshold, $result );
 		return $result;
-	}
+	} ## end if ( $self->{_use_c} && $self->{_c_nodes} ...)
 
 	# Fallback: edge thresholds, c==0, or no C backend.
 	my $scores = $self->score_samples( $self->_to_arrayref($data) );
 	return [ map { $_ >= $threshold ? 1 : 0 } @$scores ];
+} ## end sub predict
+
+=head2 predict_tagged(\%row, $threshold)
+
+Predicts whether a single sample is an anomaly using a hashref of named
+feature values.  The model must have been fitted (or loaded from a model
+that was fitted) with feature names stored via C<feature_names>.
+
+C<$threshold> defaults the same way as in C<predict>.
+
+Returns a scalar 1 (anomaly) or 0 (normal).
+
+    my $label = $forest->predict_tagged(
+        { cpu => 0.9, mem => 0.4, disk => 0.1 },
+    );
+
+Croaks if the model has no stored feature names, if the hashref contains a
+key that is not a known feature name, or if a feature name is absent from the
+hashref.
+
+=cut
+
+=head2 tagged_row_to_array(\%row, $caller)
+
+Validates a hashref of named feature values against the model's stored
+C<feature_names> and returns a positional arrayref ready to pass to any
+of the scoring or prediction methods.
+
+C<$caller> is a string used in error messages to identify which method
+triggered the validation (pass the calling method's name).
+
+    my $vec = $forest->tagged_row_to_array(\%row, 'my_method');
+    # returns e.g. [0.9, 0.4, 0.1] ordered by feature_names
+
+Croaks if:
+
+=over 4
+
+=item * C<$row> is not a hashref
+
+=item * the model has no stored C<feature_names>
+
+=item * the hashref contains a key that is not a known feature name
+
+=item * a feature name is absent from the hashref
+
+=back
+
+=cut
+
+sub tagged_row_to_array {
+	my ( $self, $row, $caller ) = @_;
+	croak "$caller requires a hashref"
+		unless ref $row eq 'HASH';
+	croak "this model has no stored feature_names; " . "refit with -t tags or pass feature_names to new()"
+		unless defined $self->{feature_names}
+		&& ref $self->{feature_names} eq 'ARRAY'
+		&& @{ $self->{feature_names} };
+
+	my @names = @{ $self->{feature_names} };
+
+	my @unknown = grep {
+		my $k = $_;
+		!grep { $_ eq $k } @names
+	} keys %$row;
+	croak "unknown feature name(s) in hashref: " . join( ', ', sort @unknown )
+		if @unknown;
+
+	my @missing = grep { !exists $row->{$_} } @names;
+	croak "missing feature name(s) in hashref: " . join( ', ', @missing )
+		if @missing;
+
+	return [ map { $row->{$_} } @names ];
+} ## end sub tagged_row_to_array
+
+sub predict_tagged {
+	my ( $self, $row, $threshold ) = @_;
+	my $vec    = $self->tagged_row_to_array( $row, 'predict_tagged' );
+	my $result = $self->predict( [$vec], $threshold );
+	return $result->[0];
 }
 
 =head2 score_samples(\@data)
@@ -2346,10 +2425,11 @@ sub score_samples {
 	if ( $self->{_use_c} && $self->{_c_nodes} ) {
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes},
-			$self->{_c_coef_idx}, $self->{_c_coef_val},
-			$x_packed, $sums_packed, $n_pts, $nf, $t,
-			$self->{_use_openmp} );
+		score_all_xs(
+			$self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val},
+			$x_packed,         $sums_packed,         $n_pts,
+			$nf,               $t,                   $self->{_use_openmp}
+		);
 		if ( $c > 0 ) {
 			my $inv    = log(2) / ( $c * $t );
 			my $result = [];
@@ -2357,7 +2437,7 @@ sub score_samples {
 			return $result;
 		}
 		return [ (0.5) x $n_pts ];
-	}
+	} ## end if ( $self->{_use_c} && $self->{_c_nodes} )
 
 	$data = $self->_prepare_perl_input($data);
 	my $nan = $self->{missing} eq 'nan' ? 1 : 0;
@@ -2379,6 +2459,29 @@ sub score_samples {
 	}
 	return [ (0.5) x @sums ];
 } ## end sub score_samples
+
+=head2 score_sample_tagged(\%row)
+
+Scores a single sample supplied as a hashref of named feature values.
+The model must have stored feature names (set via C<feature_names> in
+C<new()> or the C<-t> CLI flag at fit time).
+
+Returns a scalar anomaly score in (0, 1].
+
+    my $score = $forest->score_sample_tagged({ cpu => 0.9, mem => 0.4 });
+
+Croaks if the model has no stored feature names, if the hashref contains a
+key that is not a known feature name, or if a feature name is absent from the
+hashref.
+
+=cut
+
+sub score_sample_tagged {
+	my ( $self, $row ) = @_;
+	my $vec    = $self->tagged_row_to_array( $row, 'score_sample_tagged' );
+	my $result = $self->score_samples( [$vec] );
+	return $result->[0];
+}
 
 =head2 score_predict_samples
 
@@ -2423,17 +2526,17 @@ sub score_predict_samples {
 		my $c     = $self->{c_psi};
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes},
-			$self->{_c_coef_idx}, $self->{_c_coef_val},
-			$x_packed, $sums_packed, $n_pts, $nf, $t,
-			$self->{_use_openmp} );
+		score_all_xs(
+			$self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val},
+			$x_packed,         $sums_packed,         $n_pts,
+			$nf,               $t,                   $self->{_use_openmp}
+		);
 		my $inv           = log(2) / ( $c * $t );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
 		my $result        = [];
-		score_predict_xs( $sums_packed, $n_pts, $inv, $sum_threshold,
-			$result );
+		score_predict_xs( $sums_packed, $n_pts, $inv, $sum_threshold, $result );
 		return $result;
-	}
+	} ## end if ( $self->{_use_c} && $self->{_c_nodes} ...)
 
 	# Fallback: edge thresholds, c==0, or no C backend.
 	my $scores = $self->score_samples( $self->_to_arrayref($data) );
@@ -2449,6 +2552,32 @@ sub score_predict_samples {
 
 	return \@to_return;
 } ## end sub score_predict_samples
+
+=head2 score_predict_sample_tagged(\%row, $threshold)
+
+Scores and classifies a single sample supplied as a hashref of named
+feature values.  The model must have stored feature names.
+
+C<$threshold> defaults the same way as in C<predict>.
+
+Returns a two-element arrayref C<[$score, $label]>, matching the per-row
+shape that C<score_predict_samples> returns for each row.
+
+    my $pair = $forest->score_predict_sample_tagged({ cpu => 0.9, mem => 0.4 });
+    printf "score %.4f  anomaly %d\n", $pair->[0], $pair->[1];
+
+Croaks if the model has no stored feature names, if the hashref contains a
+key that is not a known feature name, or if a feature name is absent from the
+hashref.
+
+=cut
+
+sub score_predict_sample_tagged {
+	my ( $self, $row, $threshold ) = @_;
+	my $vec    = $self->tagged_row_to_array( $row, 'score_predict_sample_tagged' );
+	my $result = $self->score_predict_samples( [$vec], $threshold );
+	return $result->[0];
+}
 
 =head2 score_predict_split(\@data, $threshold)
 
@@ -2493,24 +2622,24 @@ sub score_predict_split {
 		my $c     = $self->{c_psi};
 		my ( $n_pts, $nf, $x_packed ) = $self->_resolve_input($data);
 		my $sums_packed = "\0" x ( $n_pts * 8 );
-		score_all_xs( $self->{_c_nodes},
-			$self->{_c_coef_idx}, $self->{_c_coef_val},
-			$x_packed, $sums_packed, $n_pts, $nf, $t,
-			$self->{_use_openmp} );
+		score_all_xs(
+			$self->{_c_nodes}, $self->{_c_coef_idx}, $self->{_c_coef_val},
+			$x_packed,         $sums_packed,         $n_pts,
+			$nf,               $t,                   $self->{_use_openmp}
+		);
 		my $inv           = log(2) / ( $c * $t );
 		my $sum_threshold = -log($threshold) * $c * $t / log(2);
 		my $scores        = [];
 		my $labels        = [];
-		score_predict_split_xs( $sums_packed, $n_pts, $inv, $sum_threshold,
-			$scores, $labels );
+		score_predict_split_xs( $sums_packed, $n_pts, $inv, $sum_threshold, $scores, $labels );
 		return ( $scores, $labels );
-	}
+	} ## end if ( $self->{_use_c} && $self->{_c_nodes} ...)
 
 	# Fallback: derive from score_samples.
 	my $scores = $self->score_samples( $self->_to_arrayref($data) );
 	my @labels = map { $_ >= $threshold ? 1 : 0 } @$scores;
 	return ( $scores, \@labels );
-}
+} ## end sub score_predict_split
 
 =head1 MODEL SAVE/LOAD METHODS
 
@@ -2544,6 +2673,7 @@ sub to_json {
 			missing         => $self->{missing},
 			impute_with     => $self->{impute_with},
 			missing_fill    => $self->{missing_fill},
+			feature_names   => $self->{feature_names},
 		},
 		trees => $self->{trees},
 	};
@@ -2591,13 +2721,14 @@ sub from_json {
 		max_depth_used       => $p->{max_depth_used},
 		# Models saved before missing-value support lack these keys; default
 		# to 'zero', which reproduces the old undef -> 0 scoring behaviour.
-		missing              => $p->{missing} // 'zero',
-		impute_with          => $p->{impute_with} // 'mean',
-		missing_fill         => $p->{missing_fill},
-		trees                => $trees,
-		_use_c               => $HAS_C,
-		_use_openmp          => $HAS_OPENMP,
-		_use_openmp_fit      => 0,    # opt-in only; loaded models never re-fit implicitly
+		missing         => $p->{missing}     // 'zero',
+		impute_with     => $p->{impute_with} // 'mean',
+		missing_fill    => $p->{missing_fill},
+		feature_names   => $p->{feature_names},
+		trees           => $trees,
+		_use_c          => $HAS_C,
+		_use_openmp     => $HAS_OPENMP,
+		_use_openmp_fit => 0,                     # opt-in only; loaded models never re-fit implicitly
 	};
 	croak "model contains no trees" unless @{ $self->{trees} };
 
@@ -2734,8 +2865,7 @@ sub _build_tree {
 				$hi[$f] = $v if !defined $hi[$f] || $v > $hi[$f];
 			}
 		}
-	}
-	else {
+	} else {
 		for my $row (@$X) {
 			for my $f ( 0 .. $nf - 1 ) {
 				my $v = $row->[$f];
@@ -2789,8 +2919,7 @@ sub _axis_split {
 			if   ( defined($v) && $v < $split ) { push @left,  $row }
 			else                                { push @right, $row }
 		}
-	}
-	else {
+	} else {
 		for my $row (@$X) {
 			if   ( $row->[$attr] < $split ) { push @left,  $row }
 			else                            { push @right, $row }
@@ -2845,9 +2974,8 @@ sub _oblique_split {
 			}
 			if   ( !$missing && $dot <= $b ) { push @left,  $row }
 			else                             { push @right, $row }
-		}
-	}
-	else {
+		} ## end for my $row (@$X)
+	} else {
 		for my $row (@$X) {
 			my $dot = 0.0;
 			$dot += $coef[$_] * $row->[ $idx[$_] ] for 0 .. $#idx;
@@ -2877,17 +3005,15 @@ sub _oblique_split {
 # the time it reaches here, so the "// 0" is normally a no-op).
 sub _path_length {
 	my ( $x, $node, $depth, $nan ) = @_;
-	while ( $node->[0] ) {                       # false only for leaf (type 0)
-		if ( $node->[0] == _NODE_AXIS ) {        # [1, attr, split, left, right]
+	while ( $node->[0] ) {    # false only for leaf (type 0)
+		if ( $node->[0] == _NODE_AXIS ) {    # [1, attr, split, left, right]
 			if ($nan) {
 				my $v = $x->[ $node->[1] ];
-				$node = ( defined($v) && $v < $node->[2] )
-					? $node->[3] : $node->[4];
+				$node = ( defined($v) && $v < $node->[2] ) ? $node->[3] : $node->[4];
 			} else {
-				$node = ( $x->[ $node->[1] ] // 0 ) < $node->[2]
-					? $node->[3] : $node->[4];
+				$node = ( $x->[ $node->[1] ] // 0 ) < $node->[2] ? $node->[3] : $node->[4];
 			}
-		} else {                                 # [2, \@idx, \@coef, b, left, right]
+		} else {                             # [2, \@idx, \@coef, b, left, right]
 			my ( $idx, $coef, $b ) = ( $node->[1], $node->[2], $node->[3] );
 			if ($nan) {
 				my $dot     = 0.0;
@@ -2900,14 +3026,13 @@ sub _path_length {
 				$node = ( !$missing && $dot <= $b ) ? $node->[4] : $node->[5];
 			} else {
 				my $dot = 0.0;
-				$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 )
-					for 0 .. $#$idx;
+				$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 ) for 0 .. $#$idx;
 				$node = $dot <= $b ? $node->[4] : $node->[5];
 			}
-		}
+		} ## end else [ if ( $node->[0] == _NODE_AXIS ) ]
 		$depth++;
-	}
-	return $depth + _c( $node->[1] );            # leaf size at slot 1
+	} ## end while ( $node->[0] )
+	return $depth + _c( $node->[1] );    # leaf size at slot 1
 } ## end sub _path_length
 
 # Recursively convert a version-0 hash-based tree node to the version-1
@@ -2918,18 +3043,13 @@ sub _hash_node_to_array {
 		return [ _NODE_LEAF, $node->{size} ];
 	} elsif ( exists $node->{attr} ) {
 		return [
-			_NODE_AXIS,
-			$node->{attr},
-			$node->{split},
-			_hash_node_to_array( $node->{left} ),
+			_NODE_AXIS,     $node->{attr},
+			$node->{split}, _hash_node_to_array( $node->{left} ),
 			_hash_node_to_array( $node->{right} ),
 		];
 	} else {
 		return [
-			_NODE_OBLIQUE,
-			$node->{idx},
-			$node->{coef},
-			$node->{b},
+			_NODE_OBLIQUE, $node->{idx}, $node->{coef}, $node->{b},
 			_hash_node_to_array( $node->{left} ),
 			_hash_node_to_array( $node->{right} ),
 		];
@@ -2970,10 +3090,8 @@ sub _pack_tree {
 			# per point per tree at every leaf hit.  _c is the same
 			# function the pure-Perl scorer uses, so both backends keep
 			# producing bit-identical path lengths.
-			$node_data[$my_idx] =
-				[ 0.0, $node->[1] + 0.0, _c( $node->[1] ), 0.0, 0.0, 0.0 ];
-		}
-		elsif ( $node->[0] == _NODE_AXIS ) {
+			$node_data[$my_idx] = [ 0.0, $node->[1] + 0.0, _c( $node->[1] ), 0.0, 0.0, 0.0 ];
+		} elsif ( $node->[0] == _NODE_AXIS ) {
 			my $li = $assign->( $node->[3] );
 			my $ri = $assign->( $node->[4] );
 			$node_data[$my_idx] = [
@@ -2984,8 +3102,7 @@ sub _pack_tree {
 				$ri + 0.0,
 				0.0,
 			];
-		}
-		else {                       # _NODE_OBLIQUE
+		} else {    # _NODE_OBLIQUE
 			my ( $idx_arr, $coef_arr, $b ) = ( $node->[1], $node->[2], $node->[3] );
 			my $coef_off = scalar @coef_idx;
 			my $num      = scalar @$idx_arr;
@@ -2999,13 +3116,12 @@ sub _pack_tree {
 			# auto-vectorizes cleanly with FMA.
 			if ( defined $n_features && $num == $n_features ) {
 				my %coef_for;
-				@coef_for{ @$idx_arr } = @$coef_arr;
+				@coef_for{@$idx_arr} = @$coef_arr;
 				for my $k ( 0 .. $n_features - 1 ) {
 					push @coef_idx, $k;
 					push @coef_val, $coef_for{$k} + 0.0;
 				}
-			}
-			else {
+			} else {
 				for my $i ( 0 .. $num - 1 ) {
 					push @coef_idx, int( $idx_arr->[$i] );
 					push @coef_val, $coef_arr->[$i] + 0.0;
@@ -3014,22 +3130,15 @@ sub _pack_tree {
 
 			my $li = $assign->( $node->[4] );
 			my $ri = $assign->( $node->[5] );
-			$node_data[$my_idx] = [
-				2.0,
-				$coef_off + 0.0,
-				$num + 0.0,
-				$li + 0.0,
-				$ri + 0.0,
-				$b + 0.0,
-			];
-		}
+			$node_data[$my_idx] = [ 2.0, $coef_off + 0.0, $num + 0.0, $li + 0.0, $ri + 0.0, $b + 0.0, ];
+		} ## end else [ if ( $node->[0] == _NODE_LEAF ) ]
 		return $my_idx;
-	};
+	}; ## end $assign = sub
 	$assign->($root);
 
 	my $nodes_packed = pack( 'd*', map { @$_ } @node_data );
-	my $idx_packed   = @coef_idx ? pack( 'l*', @coef_idx ) : pack( 'l*' );
-	my $val_packed   = @coef_val ? pack( 'd*', @coef_val ) : pack( 'd*' );
+	my $idx_packed   = @coef_idx ? pack( 'l*', @coef_idx ) : pack('l*');
+	my $val_packed   = @coef_val ? pack( 'd*', @coef_val ) : pack('d*');
 	return ( $nodes_packed, $idx_packed, $val_packed );
 } ## end sub _pack_tree
 
@@ -3061,6 +3170,7 @@ sub _check_fitted {
 # without Cygwin; true on every Unix-like platform.
 {
 	my $cached;
+
 	sub _fork_supported {
 		return $cached if defined $cached;
 		require Config;
@@ -3132,8 +3242,7 @@ sub _fit_trees_parallel {
 			my $trees;
 			if ( $self->{_use_c} ) {
 				$trees = $self->_build_forest_c( $data, $psi, $limit, $share );
-			}
-			else {
+			} else {
 				my @t;
 				for ( 1 .. $share ) {
 					my $sample = _subsample( $data, $psi );
@@ -3145,12 +3254,12 @@ sub _fit_trees_parallel {
 			close $wh;
 			# _exit so we don't run parent END/DESTROY in the child.
 			POSIX::_exit(0);
-		}
+		} ## end if ( $pid == 0 )
 
 		close $wh;
 		binmode $rh;
 		push @procs, { pid => $pid, rh => $rh, share => $share };
-	}
+	} ## end for my $w ( 0 .. $workers - 1 )
 
 	# Collect from each pipe in worker order so the canonical tree
 	# ordering is deterministic (worker 0's trees first, then 1's, ...).
@@ -3170,10 +3279,10 @@ sub _fit_trees_parallel {
 		croak "parallel_fit worker $p->{pid} returned unparseable trees: $@"
 			if $@ || ref $trees ne 'ARRAY';
 		push @all_trees, @$trees;
-	}
+	} ## end for my $p (@procs)
 
 	return \@all_trees;
-}
+} ## end sub _fit_trees_parallel
 
 #-------------------------------------------------------------------------------
 # C-accelerated fit(): builds $n_trees trees against $data (a subset or
@@ -3187,8 +3296,8 @@ sub _fit_trees_parallel {
 #-------------------------------------------------------------------------------
 sub _build_forest_c {
 	my ( $self, $data, $psi, $limit, $n_trees ) = @_;
-	my $n  = scalar @$data;
-	my $nf = $self->{n_features};
+	my $n        = scalar @$data;
+	my $nf       = $self->{n_features};
 	my $x_packed = "\0" x ( $n * $nf * 8 );
 	my ( $mode, $fill ) = $self->_pack_args;
 	pack_input_xs( $data, $x_packed, $n, $nf, $mode, $fill );
@@ -3197,10 +3306,9 @@ sub _build_forest_c {
 	my $ext_level = $self->{extension_level_used} // 0;
 
 	my $trees = [];
-	build_forest_xs( $x_packed, $n, $nf, $n_trees, $psi, $limit,
-		$mode_flag, $ext_level, $trees );
+	build_forest_xs( $x_packed, $n, $nf, $n_trees, $psi, $limit, $mode_flag, $ext_level, $trees );
 	return $trees;
-}
+} ## end sub _build_forest_c
 
 #-------------------------------------------------------------------------------
 # OpenMP-parallel fit(): builds $n_trees trees across OpenMP threads (one
@@ -3229,8 +3337,8 @@ sub _build_forest_c {
 #-------------------------------------------------------------------------------
 sub _build_forest_openmp {
 	my ( $self, $data, $psi, $limit, $n_trees ) = @_;
-	my $n  = scalar @$data;
-	my $nf = $self->{n_features};
+	my $n        = scalar @$data;
+	my $nf       = $self->{n_features};
 	my $x_packed = "\0" x ( $n * $nf * 8 );
 	my ( $mode, $fill ) = $self->_pack_args;
 	pack_input_xs( $data, $x_packed, $n, $nf, $mode, $fill );
@@ -3243,7 +3351,7 @@ sub _build_forest_openmp {
 		$mode_flag, $ext_level, \@nodes, \@idx, \@val, 1 );
 
 	return _unpack_forest( \@nodes, \@idx, \@val );
-}
+} ## end sub _build_forest_openmp
 
 # Inverse of _pack_tree's SoA layout: given one tree's packed node
 # buffer plus the shared idx/val coefficient buffers, reconstructs the
@@ -3261,8 +3369,7 @@ sub _unpack_node {
 
 	if ( $type == 0 ) {
 		return [ _NODE_LEAF, int( $nodes->[ $off + 1 ] ) ];
-	}
-	elsif ( $type == 1 ) {
+	} elsif ( $type == 1 ) {
 		my ( $attr, $split, $li, $ri )
 			= @{$nodes}[ $off + 1 .. $off + 4 ];
 		return [
@@ -3270,8 +3377,7 @@ sub _unpack_node {
 			_unpack_node( $nodes, $idx, $val, int($li) ),
 			_unpack_node( $nodes, $idx, $val, int($ri) ),
 		];
-	}
-	else {
+	} else {
 		my ( $coff, $num, $li, $ri, $b ) = @{$nodes}[ $off + 1 .. $off + 5 ];
 		$coff = int($coff);
 		$num  = int($num);
@@ -3283,7 +3389,7 @@ sub _unpack_node {
 			_unpack_node( $nodes, $idx, $val, int($li) ),
 			_unpack_node( $nodes, $idx, $val, int($ri) ),
 		];
-	}
+	} ## end else [ if ( $type == 0 ) ]
 } ## end sub _unpack_node
 
 # Unpacks every tree in the three per-tree packed-buffer arrayrefs
@@ -3302,7 +3408,7 @@ sub _unpack_forest {
 		push @trees, _unpack_node( \@nodes, \@idx, \@val, $root );
 	}
 	return \@trees;
-}
+} ## end sub _unpack_forest
 
 #-------------------------------------------------------------------------------
 # Packed input wrapper.  pack_data() returns one of these so callers can
@@ -3329,8 +3435,9 @@ sub pack_data {
 		packed  => $x_packed,
 		n_pts   => $n_pts,
 		n_feats => $nf,
-	}, 'Algorithm::Classifier::IsolationForest::PackedData';
-}
+		},
+		'Algorithm::Classifier::IsolationForest::PackedData';
+} ## end sub pack_data
 
 # Internal helper: given $data that may be a raw arrayref OR a PackedData
 # instance, return the (n_pts, n_feats, x_packed) triple ready for
@@ -3338,8 +3445,7 @@ sub pack_data {
 sub _resolve_input {
 	my ( $self, $data ) = @_;
 	if ( ref $data eq 'Algorithm::Classifier::IsolationForest::PackedData' ) {
-		croak "PackedData has $data->{n_feats} features but model expects "
-			. $self->{n_features}
+		croak "PackedData has $data->{n_feats} features but model expects " . $self->{n_features}
 			unless $data->{n_feats} == $self->{n_features};
 		return ( $data->{n_pts}, $data->{n_feats}, $data->{packed} );
 	}
@@ -3349,7 +3455,7 @@ sub _resolve_input {
 	my ( $mode, $fill ) = $self->_pack_args;
 	pack_input_xs( $data, $x_packed, $n_pts, $nf, $mode, $fill );
 	return ( $n_pts, $nf, $x_packed );
-}
+} ## end sub _resolve_input
 
 # Helper used by the pure-Perl fallback paths: convert either form back
 # to an arrayref-of-arrayrefs.  Slow on PackedData -- the whole point of
@@ -3359,17 +3465,17 @@ sub _to_arrayref {
 	my ( $self, $data ) = @_;
 	return $data if ref $data eq 'ARRAY';
 	if ( ref $data eq 'Algorithm::Classifier::IsolationForest::PackedData' ) {
-		my $n_pts = $data->{n_pts};
-		my $nf    = $data->{n_feats};
+		my $n_pts   = $data->{n_pts};
+		my $nf      = $data->{n_feats};
 		my @doubles = unpack( 'd*', $data->{packed} );
 		my @rows;
 		for my $i ( 0 .. $n_pts - 1 ) {
 			push @rows, [ @doubles[ $i * $nf .. ( $i + 1 ) * $nf - 1 ] ];
 		}
 		return \@rows;
-	}
+	} ## end if ( ref $data eq 'Algorithm::Classifier::IsolationForest::PackedData')
 	croak "expected arrayref or PackedData, got " . ( ref($data) || 'scalar' );
-}
+} ## end sub _to_arrayref
 
 # ---------------------------------------------------------------------------
 # Missing-value handling.
@@ -3407,7 +3513,7 @@ sub _prepare_fit_data {
 			}
 		}
 		return $data;
-	}
+	} ## end if ( $m eq 'die' )
 
 	# nan: leave undef in place -- _build_tree / the split routers handle it.
 	return $data if $m eq 'nan';
@@ -3439,7 +3545,7 @@ sub _prepare_fit_data {
 
 	return $data if $self->{_use_c};
 	return _densify( $data, $fill );
-}
+} ## end sub _prepare_fit_data
 
 # Per-feature fill value (mean or median of the present values) for impute
 # mode.  Croaks if a feature has no present value to learn from.
@@ -3478,9 +3584,9 @@ sub _compute_impute_fill {
 			$sum += $_ for @vals;
 			$fill[$f] = $sum / scalar @vals;
 		}
-	}
+	} ## end for my $f ( 0 .. $nf - 1 )
 	return \@fill;
-}
+} ## end sub _compute_impute_fill
 
 # Return a dense copy of $data with every undef cell replaced by the
 # matching per-feature fill value.  Leaves present cells untouched.
@@ -3493,7 +3599,7 @@ sub _densify {
 			[ map { defined $r->[$_] ? $r->[$_] : $fill->[$_] } 0 .. $nf - 1 ]
 		} @$data
 	];
-}
+} ## end sub _densify
 
 # (miss_mode, fill_packed) pair for pack_input_xs, per the active strategy.
 # die/zero -> 0 (undef becomes 0.0); impute -> 1 (undef becomes fill[k]);
@@ -3510,7 +3616,7 @@ sub _pack_args {
 		return ( 1, $self->{_fill_packed} );
 	}
 	return ( 0, '' );    # die, zero
-}
+} ## end sub _pack_args
 
 # Pure-Perl fallback input prep: arrayref-ify, then fill for impute so the
 # tree walk sees dense rows.  zero/die rely on _path_length's "// 0"; nan
@@ -3525,11 +3631,12 @@ sub _prepare_perl_input {
 		$rows = _densify( $rows, $self->{missing_fill} );
 	}
 	return $rows;
-}
+} ## end sub _prepare_perl_input
 
 # Minimal PackedData package: opaque token returned by pack_data().
 # Exposes n_pts and n_feats accessors for users who want to introspect.
 {
+
 	package Algorithm::Classifier::IsolationForest::PackedData;
 	sub n_pts   { $_[0]->{n_pts} }
 	sub n_feats { $_[0]->{n_feats} }
