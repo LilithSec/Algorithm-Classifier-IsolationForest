@@ -49,7 +49,7 @@ CODE
 sub load_probe {
 	my (%env) = @_;
 	local %ENV = %ENV;
-	delete $ENV{$_} for grep {/^IF_/} keys %ENV;
+	delete $ENV{$_} for grep { /^IF_/ } keys %ENV;
 	$ENV{$_} = $env{$_} for keys %env;
 	open my $fh, '-|', $^X, @inc, '-e', $probe_code
 		or die "can't spawn $^X: $!";
@@ -57,7 +57,7 @@ sub load_probe {
 	close $fh;
 	chomp( $line //= '' );
 	return split /\|/, $line, -1;
-}
+} ## end sub load_probe
 
 my @baseline = load_probe();
 is( scalar @baseline, 5, 'baseline probe produced all fields' )
@@ -67,8 +67,7 @@ ok( $has_c == 0 || $has_c == 1, "baseline HAS_C is 0/1 (got '$has_c')" );
 if ($has_c) {
 	ok( $c_source eq 'prebuilt' || $c_source eq 'runtime',
 		"C_SOURCE is prebuilt/runtime when HAS_C (got '$c_source')" );
-}
-else {
+} else {
 	is( $c_source, '', 'C_SOURCE empty without C backend' );
 }
 diag("baseline: HAS_C=$has_c HAS_OPENMP=$has_openmp C_SOURCE=$c_source");
@@ -84,34 +83,25 @@ is( $no_omp[1], '0', 'IF_NO_OPENMP=1 yields a backend without OpenMP' );
 # so only then may we insist the serial build also compiles.  (A prebuilt-
 # only host without a compiler legitimately drops to pure Perl instead.)
 if ( $has_c && $c_source eq 'runtime' ) {
-	is( $no_omp[0], '1',
-		'IF_NO_OPENMP=1 still gets the serial C backend where runtime builds work'
-	);
+	is( $no_omp[0], '1', 'IF_NO_OPENMP=1 still gets the serial C backend where runtime builds work' );
 }
 
 my @runtime = load_probe( IF_RUNTIME_BUILD => 1 );
 if ( $runtime[0] ) {
-	is( $runtime[2], 'runtime',
-		'IF_RUNTIME_BUILD=1 never reports the prebuilt object' );
-}
-else {
+	is( $runtime[2], 'runtime', 'IF_RUNTIME_BUILD=1 never reports the prebuilt object' );
+} else {
 	pass('IF_RUNTIME_BUILD=1 fell back to pure Perl (no runtime toolchain)');
 }
 
 # Scoring parity: same seed, same data => same model, and all backends and
 # knob combinations must score it identically (within float noise).
-my @variants = (
-	[ 'IF_NO_C',          @no_c ],
-	[ 'IF_NO_OPENMP',     @no_omp ],
-	[ 'IF_RUNTIME_BUILD', @runtime ],
-);
+my @variants = ( [ 'IF_NO_C', @no_c ], [ 'IF_NO_OPENMP', @no_omp ], [ 'IF_RUNTIME_BUILD', @runtime ], );
 for my $v (@variants) {
 	my ( $name, @fields ) = @$v;
 	is( scalar @fields, 5, "$name probe produced all fields" ) or next;
 	for my $i ( 0, 1 ) {
 		my ( $got, $want ) = ( $fields[ 3 + $i ], $baseline[ 3 + $i ] );
-		ok( abs( $got - $want ) < 1e-9,
-			"$name score $i matches baseline ($got vs $want)" );
+		ok( abs( $got - $want ) < 1e-9, "$name score $i matches baseline ($got vs $want)" );
 	}
 }
 

@@ -9,7 +9,8 @@ sub opt_spec { () }
 
 sub abstract { 'Report which (if any) native acceleration backend is active' }
 
-sub description { 'Initialises Algorithm::Classifier::IsolationForest, fits
+sub description {
+	'Initialises Algorithm::Classifier::IsolationForest, fits
 a tiny synthetic dataset to exercise the optional native code path, then
 reports which acceleration (if any) is wired up:
 
@@ -38,7 +39,8 @@ Build flags are tunable via environment variables set before first load
 See "NATIVE ACCELERATION" in perldoc Algorithm::Classifier::IsolationForest
 for details and tradeoffs (in particular, why IF_NATIVE is not always a
 safe default choice).
-' }
+';
+} ## end sub description
 
 sub validate { 1 }
 
@@ -72,12 +74,9 @@ sub execute {
 	$ext->fit( \@data );
 	$ext->score_samples( [ [ 0.5, 0.5, 0.5 ] ] );
 
-	my $has_c
-		= $Algorithm::Classifier::IsolationForest::HAS_C ? 1 : 0;
-	my $has_openmp
-		= $Algorithm::Classifier::IsolationForest::HAS_OPENMP ? 1 : 0;
-	my $has_simd
-		= $Algorithm::Classifier::IsolationForest::HAS_SIMD ? 1 : 0;
+	my $has_c      = $Algorithm::Classifier::IsolationForest::HAS_C      ? 1 : 0;
+	my $has_openmp = $Algorithm::Classifier::IsolationForest::HAS_OPENMP ? 1 : 0;
+	my $has_simd   = $Algorithm::Classifier::IsolationForest::HAS_SIMD   ? 1 : 0;
 
 	my $c_source = $Algorithm::Classifier::IsolationForest::C_SOURCE;
 
@@ -93,8 +92,8 @@ sub execute {
 		$prebuilt_installed = 1 if ref $bf eq 'HASH' && $bf->{prebuilt};
 	}
 
-	my $source_desc =
-		  $c_source eq 'prebuilt' ? 'prebuilt at install time'
+	my $source_desc
+		= $c_source eq 'prebuilt' ? 'prebuilt at install time'
 		: $c_source eq 'runtime'  ? 'compiled at run time (cached under _Inline/)'
 		:                           'none (pure-Perl fallback)';
 
@@ -107,19 +106,17 @@ sub execute {
 		my @why;
 		push @why, 'IF_RUNTIME_BUILD' if $ENV{IF_RUNTIME_BUILD};
 		push @why, 'IF_NO_C'          if $ENV{IF_NO_C};
-		push @why, grep { defined $ENV{$_} }
-			qw(IF_OPT IF_ARCH IF_NATIVE IF_NO_OPENMP);
+		push @why, grep { defined $ENV{$_} } qw(IF_OPT IF_ARCH IF_NATIVE IF_NO_OPENMP);
 		print "              (a prebuilt object is installed but was not used",
 			(
-			@why
-			? '; runtime overrides active: ' . join( ', ', @why )
-			: '; it failed to load'
+				@why
+				? '; runtime overrides active: ' . join( ', ', @why )
+				: '; it failed to load'
 			),
 			")\n";
-	}
+	} ## end if ( $c_source ne 'prebuilt' && $prebuilt_installed)
 	if ($has_c) {
-		printf "  Build flags: %s\n",
-			$Algorithm::Classifier::IsolationForest::OPT_LEVEL;
+		printf "  Build flags: %s\n", $Algorithm::Classifier::IsolationForest::OPT_LEVEL;
 	}
 	print "\n";
 
@@ -129,23 +126,20 @@ sub execute {
 	push @features, 'OpenMP' if $has_openmp;
 	push @features, 'SIMD'   if $has_simd;
 
-	my $suffix =
-		  $c_source eq 'prebuilt' ? ' -- prebuilt at install time'
+	my $suffix
+		= $c_source eq 'prebuilt' ? ' -- prebuilt at install time'
 		: $c_source eq 'runtime'  ? ' -- compiled at run time'
 		:                           '';
 
 	if ( $has_c && @features ) {
-		printf "Active backend: Inline::C with %s%s\n",
-			join( ' + ', @features ), $suffix;
-	}
-	elsif ($has_c) {
+		printf "Active backend: Inline::C with %s%s\n", join( ' + ', @features ), $suffix;
+	} elsif ($has_c) {
 		print "Active backend: Inline::C (serial, scalar)$suffix\n";
-	}
-	else {
+	} else {
 		print "Active backend: pure Perl (no native acceleration)\n";
 	}
 
 	return 1;
-}
+} ## end sub execute
 
 return 1;
