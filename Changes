@@ -1,6 +1,6 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
-0.5.0   2026-07-03/23:55
+0.5.0   2026-07-04/14:30
         - Wide-NV perls (-Duselongdouble / -Dusequadmath(maybe? does this
           even exist? but possibly some idiot on github... but would fix
           it in this case as well): the pure-Perl tree builder now rounds
