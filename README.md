@@ -10,6 +10,19 @@ In extended mode the module implements the Extended Isolation Forest variant. Ea
 is a random hyperplane instead of an axis-aligned cut, which removes the rectangular,
 axis-aligned bias in the score field and tends to help on elongated or multi-modal data.
 
+With `voting => 'majority'` the module implements the Majority Voting Isolation
+Forest (MVIForest, Chabchoub, Togbe, Boly & Chiky 2022): each tree votes a
+sample anomalous or normal against the decision threshold on its own score,
+`predict` labels the sample by the majority of the votes and stops walking
+trees as soon as the outcome is decided, and `score_samples` returns the
+anomaly vote fraction. Trees are built identically either way, so majority
+voting composes with both axis and extended mode, and an existing model can be
+flipped between the two modes without refitting — with the `set_voting` method
+in Perl or the `iforest set_voting` command on a saved model. A
+contamination-learned threshold does not carry across modes (it is a quantile
+of a different per-point quantity in each), so switching relearns it for the
+target mode and therefore needs the original training data.
+
 ```perl
 use Algorithm::Classifier::IsolationForest;
 
@@ -33,6 +46,16 @@ my $reloaded = Algorithm::Classifier::IsolationForest->load('model.json');
 # Extended Isolation Forest (oblique hyperplane splits)
 my $eif = IsolationForest->new(mode => 'extended', seed => 42);
 $eif->fit(\@data);
+
+# Majority Voting Isolation Forest (per-tree votes, majority label)
+my $mv = IsolationForest->new(voting => 'majority', seed => 42);
+$mv->fit(\@data);
+my $labels = $mv->predict(\@data, 0.6);   # threshold is the per-tree cutoff here
+
+# Switch an existing model's aggregation without refitting. No data needed
+# unless it was fit with contamination, in which case pass the training set
+# so the decision threshold is recalibrated for the target mode.
+$iforest->set_voting('majority', \@data);  # ->set_voting('mean') if no contamination
 ```
 
 # Performance options
