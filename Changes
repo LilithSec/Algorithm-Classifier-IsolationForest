@@ -1,9 +1,11 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
-0.4.0   2026-07-03
+0.4.0   2026-07-03/22:45
+        - Implement named features and methods for testing single rows using
+          tagged data.
         - The C backend can be built and installed at install time, meaning
-		  nothing needs built unless changing the opts. See the docs for
-		  more details.
+          nothing needs built unless changing the opts. See the docs for
+          more details.
         - new IF_NO_OPENMP=1 selects/builds the serial C backend: no
           libgomp linkage and no OpenMP runtime in the process at all
           (unlike OMP_NUM_THREADS=1, which just caps the thread count);
@@ -40,7 +42,7 @@ Revision history for Algorithm-Classifier-IsolationForest
 
 0.3.0   2026-07-02/23:00
         - lots of POD fixes/cleanup
-		- various further C optmizations
+        - various further C optmizations
         - fit() can now handle training data with missing (undef) feature
           cells, selectable via the new `missing =>` constructor option:
             die    :: croak on undef in the training data (default)
