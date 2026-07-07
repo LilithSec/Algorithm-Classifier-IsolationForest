@@ -26,8 +26,7 @@ my $if_opt = '-O3';
 if ( defined $ENV{IF_OPT} ) {
 	if ( $ENV{IF_OPT} =~ /\A-O[0123sgz]\z/ ) {
 		$if_opt = $ENV{IF_OPT};
-	}
-	else {
+	} else {
 		warn "Makefile.PL: ignoring invalid IF_OPT value '$ENV{IF_OPT}' "
 			. "(expected one of -O0 -O1 -O2 -O3 -Os -Og -Oz); using $if_opt\n";
 	}
@@ -36,15 +35,12 @@ my $if_arch = '';
 if ( defined $ENV{IF_ARCH} ) {
 	if ( $ENV{IF_ARCH} eq '' or $ENV{IF_ARCH} eq 'none' ) {
 		$if_arch = '';    # explicit opt-out, same as the module's handling
-	}
-	elsif ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
+	} elsif ( $ENV{IF_ARCH} =~ /\A[A-Za-z0-9_.+=-]+\z/ ) {
 		$if_arch = $ENV{IF_ARCH};
-	}
-	else {
+	} else {
 		warn "Makefile.PL: ignoring invalid IF_ARCH value '$ENV{IF_ARCH}'\n";
 	}
-}
-elsif ( $ENV{IF_NATIVE} ) {
+} elsif ( $ENV{IF_NATIVE} ) {
 	$if_arch = 'native';
 }
 my $if_no_openmp = $ENV{IF_NO_OPENMP} ? 1 : 0;
@@ -53,11 +49,10 @@ my $if_no_openmp = $ENV{IF_NO_OPENMP} ? 1 : 0;
 # syntax (env assignment prefixing the command) that nmake doesn't grok;
 # without it the module simply keeps its historic behaviour of compiling
 # at first load when Inline::C is present then.
-my $prebuilt = (
-	       !$ENV{IF_NO_C}
-		&& $^O ne 'MSWin32'
-		&& eval { require Inline; Inline->VERSION('0.44'); require Inline::C; 1 }
-) ? 1 : 0;
+my $prebuilt
+	= ( !$ENV{IF_NO_C} && $^O ne 'MSWin32' && eval { require Inline; Inline->VERSION('0.44'); require Inline::C; 1 } )
+	? 1
+	: 0;
 
 # Record the captured configuration where the module can read it at load
 # time.  Generated before WriteMakefile so ExtUtils::MakeMaker's lib/ scan
@@ -132,7 +127,7 @@ Algorithm-Classifier-IsolationForest.inl : pm_to_blib
 dynamic :: Algorithm-Classifier-IsolationForest.inl
 
 POSTAMBLE
-}
+} ## end sub MY::postamble
 
 my %WriteMakefileArgs = (
 	NAME               => 'Algorithm::Classifier::IsolationForest',
@@ -165,8 +160,8 @@ my %WriteMakefileArgs = (
 		'Scalar::Util' => '0',
 		'Storable'     => '0',
 	},
-	dist       => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
-	clean      => {
+	dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
+	clean => {
 		FILES => 'Algorithm-Classifier-IsolationForest-* *.inl '
 			. 'lib/Algorithm/Classifier/IsolationForest/BuildFlags.pm'
 	},
