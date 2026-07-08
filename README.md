@@ -71,14 +71,17 @@ counts and bounding boxes; leaves split by simulating points inside
 their box, and forgetting collapses under-populated subtrees back into
 leaves.
 
-Learning is pure Perl (the trees mutate on every point), but batch
-scoring runs through the same Inline::C/OpenMP backend the batch class
-uses: the mutable trees are lazily packed into the batch scorer's node
-layout and any `learn` invalidates the snapshot. Scoring results are
-identical with the accelerator on or off; only speed differs (measured
-~60x single-threaded and 250x+ with OpenMP on 100 trees x 1000+ query
-points; `score_learn` stays pure Perl since it mutates the model after
-every point).
+Learning and scoring both run through the same Inline::C/OpenMP backend
+the batch class uses. Learning executes the per-tree insert/forget walks
+in C against the live trees, consuming the RNG in the same order as the
+pure-Perl path — same seed, same trees, bit-identical, whether `use_c`
+is on or off (measured ~9-10x: a default 100-tree model goes from ~290
+to ~2,600 learned points/second, and the prequential `score_learn` loop
+from ~270 to ~2,800 pts/s). Batch scoring lazily packs the mutable trees
+into the batch scorer's node layout, and any `learn` invalidates the
+snapshot (measured ~60x single-threaded and 250x+ with OpenMP on 100
+trees x 1000+ query points). Results are identical with the accelerator
+on or off; only speed differs.
 
 ```perl
 use Algorithm::Classifier::IsolationForest::Online;

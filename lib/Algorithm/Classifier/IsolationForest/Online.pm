@@ -42,14 +42,30 @@ use constant _NT_LEAF => 0;
 use constant _NT_AXIS => 1;
 
 # Trees are binary (the reference implementation's branching_factor == 2),
-# which fixes the depth-budget log base at log(2 * 2).
-use constant _LOG4 => log(4);
+# which fixes the depth-budget log base at log(2 * 2).  Spelled as the
+# exact-double literal rather than log(4) so it is bit-identical to the
+# OL_LOG4 literal the C learn path uses regardless of the platform's
+# libm rounding -- a one-ulp disagreement would flip `depth < limit`
+# split decisions exactly when a tree's count is eta * 4**k (the same
+# TWO_PI trick the parent uses for _randn parity).
+use constant _LOG4 => unpack( 'd', pack 'd', 1.3862943611198906 );
 use constant _LOG2 => log(2);
 
 # DBL_EPSILON, added to the normalisation factor before dividing so a
 # just-started model (normaliser 0) yields well-defined scores instead of
 # a division by zero -- the same guard the reference implementation uses.
 use constant _EPS => 2.220446049250313e-16;
+
+# The online learn/unlearn/score-row XS functions were added to the C
+# backend after the batch-scoring ones, so a prebuilt object installed
+# from an older release can back $HAS_C while lacking them (the parent
+# trusts a flag-matched prebuilt object without inspecting its symbol
+# set).  Probe once at load: without them, use_c still accelerates the
+# packed-snapshot batch scoring -- those functions have been in the
+# object all along -- and learning quietly stays pure Perl instead of
+# crashing on an undefined XS sub.  Rebuilding/reinstalling (or
+# IF_RUNTIME_BUILD=1) restores the full set.
+use constant _HAS_ONLINE_XS => defined &Algorithm::Classifier::IsolationForest::online_learn_row_xs ? 1 : 0;
 
 =head1 NAME
 
@@ -109,20 +125,35 @@ batch model's C<c(psi)>.  Scores are in (0, 1] with high values
 anomalous, directly comparable in spirit (though not numerically) to the
 parent class's scores.
 
-Learning is pure Perl (the trees mutate on every point, which the
-parent's packed-buffer machinery cannot follow), but batch scoring is
-accelerated through the parent class's Inline::C backend when it is
-available: the mutable trees are lazily flattened into the same packed
+Both learning and scoring are accelerated through the parent class's
+Inline::C backend when it is available; C<use_c> covers them together.
+
+Learning (and the per-row walks inside C<score_learn>) runs in C
+directly against the live trees, drawing randomness through the same
+generator in the same order as the pure-Perl path -- so, like the
+parent's C<fit()>, a C<learn()> with a given seed produces bit-identical
+trees whether C<use_c> is on or off (on C<nvsize == 8> perls; wide-NV
+perls keep extra low bits in the pure-Perl path).  The knob changes
+speed, never results.
+
+Batch scoring lazily flattens the mutable trees into the same packed
 node layout the batch scorer walks -- online trees are axis-only, and
 the online per-leaf depth adjustment rides in the slot the batch packer
 uses for its own leaf adjustment -- so C<score_samples>, C<predict>,
 C<path_lengths>, C<score_predict_samples>, and C<score_predict_split>
 all run through the same C (and OpenMP, when linked) tree walk the
 parent uses, with identical results to the pure-Perl fallback.  Any
-C<learn> invalidates the packed snapshot; the next scoring call repacks
-once.  C<score_learn> always scores in pure Perl: it mutates the trees
-after every single point, so a packed snapshot could never be reused
-and repacking per point would cost more than the walk it replaced.  See
+C<learn> invalidates the packed snapshot; the next batch-scoring call
+repacks once.  C<score_learn> never touches the snapshot: it mutates
+the trees after every single point, so its rows are scored by walking
+the live trees in C instead.
+
+One deployment caveat: the online learn accelerators were added to the
+C backend in 0.6.0, and the parent will happily load a prebuilt object
+compiled from an older release.  When that happens this class detects
+the missing functions at load time and quietly keeps learning in pure
+Perl (batch scoring stays accelerated); rebuilding/reinstalling the
+module -- or C<IF_RUNTIME_BUILD=1> -- restores the full set.  See
 C<use_c>/C<use_openmp> under L</new(%args)>.
 
 A model needs to have seen at least C<max_leaf_samples> points before
@@ -199,11 +230,12 @@ Inits the object.
       default :: undef
 
   - use_c :: boolean, override whether the parent class's Inline::C
-          backend is used for batch scoring (see DESCRIPTION; learning
-          and score_learn are pure Perl regardless).  When false the
-          instance scores in pure Perl even if the C backend compiled.
-          Scoring results are identical either way -- only speed
-          differs.
+          backend is used, for learning and scoring both (see
+          DESCRIPTION).  When false the instance runs pure Perl even if
+          the C backend compiled.  Results are identical either way --
+          learn() builds bit-identical trees for the same seed (on
+          nvsize == 8 perls) and scoring matches exactly -- so only
+          speed differs.
       default :: $Algorithm::Classifier::IsolationForest::HAS_C
 
   - use_openmp :: boolean, override whether OpenMP parallel scoring is
@@ -925,15 +957,30 @@ sub _score_inv {
 # beyond the window is forgotten.  This is the single choke point through
 # which every tree mutation flows, so it is also where the packed C
 # scoring snapshot gets invalidated.
+#
+# With use_c the per-tree learn and eviction loops run inside the
+# parent's C backend (online_learn_row_xs / online_unlearn_row_xs),
+# mutating the same live trees this file's Perl recursion would.  Random
+# draws go through the same generator in the same order, so the trees
+# built are bit-identical either way (on nvsize == 8 perls) -- use_c
+# only changes speed, matching fit()'s guarantee.
 sub _learn_row {
 	my ( $self, $r ) = @_;
 	my $sub = $self->{subsample};
 
 	$self->_invalidate_c_trees;
 
-	for my $tree ( @{ $self->{trees} } ) {
-		next if $sub < 1 && rand() >= $sub;
-		$self->_tree_learn( $tree, $r );
+	if ( _HAS_ONLINE_XS && $self->{_use_c} ) {
+		Algorithm::Classifier::IsolationForest::online_learn_row_xs(
+			$self->{trees}, $r, $self->{n_features},
+			$self->{max_leaf_samples},
+			( $self->{growth} eq 'adaptive' ? 1 : 0 ), $sub
+		);
+	} else {
+		for my $tree ( @{ $self->{trees} } ) {
+			next if $sub < 1 && rand() >= $sub;
+			$self->_tree_learn( $tree, $r );
+		}
 	}
 	$self->{seen}++;
 
@@ -941,11 +988,19 @@ sub _learn_row {
 		push @{ $self->{window} }, $r;
 		if ( @{ $self->{window} } > $self->{window_size} ) {
 			my $old = shift @{ $self->{window} };
-			for my $tree ( @{ $self->{trees} } ) {
-				next if $sub < 1 && rand() >= $sub;
-				$self->_tree_unlearn( $tree, $old );
+			if ( _HAS_ONLINE_XS && $self->{_use_c} ) {
+				Algorithm::Classifier::IsolationForest::online_unlearn_row_xs(
+					$self->{trees}, $old, $self->{n_features},
+					$self->{max_leaf_samples},
+					( $self->{growth} eq 'adaptive' ? 1 : 0 ), $sub
+				);
+			} else {
+				for my $tree ( @{ $self->{trees} } ) {
+					next if $sub < 1 && rand() >= $sub;
+					$self->_tree_unlearn( $tree, $old );
+				}
 			}
-		}
+		} ## end if ( @{ $self->{window} } > $self->{window_size...})
 	} ## end if ( $self->{window_size} )
 	return;
 } ## end sub _learn_row
@@ -1164,12 +1219,21 @@ sub _depth_sums {
 # learned and so must be recomputed per row.
 sub _score_row {
 	my ( $self, $r ) = @_;
+	if ( _HAS_ONLINE_XS && $self->{_use_c} ) {
+
+		# Walks the live trees in C -- no packed snapshot involved, so
+		# this stays fast even though score_learn mutates the trees
+		# between rows.
+		my $sum = Algorithm::Classifier::IsolationForest::online_score_row_xs( $self->{trees}, $r,
+			$self->{n_features}, $self->{max_leaf_samples} );
+		return exp( -$sum * $self->_score_inv );
+	}
 	my $sum = 0;
 	for my $tree ( @{ $self->{trees} } ) {
 		$sum += $self->_depth_of( $r, $tree->{root} ) if defined $tree->{root};
 	}
 	return exp( -$sum * $self->_score_inv );
-}
+} ## end sub _score_row
 
 #-------------------------------------------------------------------------------
 # C-accelerated scoring.

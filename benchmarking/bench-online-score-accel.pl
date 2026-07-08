@@ -9,14 +9,19 @@
 #
 # The online class scores through the parent's C backend by lazily packing
 # its mutable trees into the parent's node layout; learning invalidates the
-# packed snapshot and the next scoring call repacks once.  Sections 1 and 2
-# measure steady-state scoring (snapshot reused across calls); section 3
-# interleaves a learned point before every scoring call, so each call pays
-# the repack -- the worst case for the C path.
+# packed snapshot and the next scoring call repacks once.  Learning itself
+# (and the per-row walks inside score_learn) runs in C directly against the
+# live trees.  Sections 1 and 2 measure steady-state batch scoring (snapshot
+# reused across calls); section 3 interleaves a learned point before every
+# scoring call, so each call pays the repack -- the worst case for the C
+# path; sections 4 and 5 measure the prequential score_learn /
+# score_learn_tagged stream loop, where the mutable-tree C walks are what
+# matters.
 #
 # Reference numbers (2026-07-08, 8-core dev box, 100 trees, window 2048,
-# 5 features, 20k query points): pure Perl ~3.6 s/call, C serial ~58 ms,
-# C+OpenMP ~9 ms.
+# 5 features): batch scoring of 20k query points -- pure Perl ~3.6 s/call,
+# C serial ~58 ms, C+OpenMP ~9 ms; score_learn stream -- pure Perl ~270
+# pts/s, C ~2,400 pts/s.
 #
 # Run with:
 #   perl -Ilib benchmarking/bench-online-score-accel.pl
@@ -49,8 +54,10 @@ sub make_data {
 my $HAS_C      = $Algorithm::Classifier::IsolationForest::HAS_C;
 my $HAS_OPENMP = $Algorithm::Classifier::IsolationForest::HAS_OPENMP;
 
-# One model per accel config, sharing seed and stream so the trees are
-# identical -- learning is pure Perl on all three, only scoring differs.
+# One model per accel config.  Each learn is reseeded so every model
+# sees the identical draw sequence; with the C/Perl learn parity
+# guarantee that makes the trees identical across configs, so the
+# scoring sections compare equal work.
 sub build_models {
 	my ( $stream, %opts ) = @_;
 	my %m;
@@ -59,7 +66,10 @@ sub build_models {
 		if $HAS_C;
 	$m{c_openmp} = Algorithm::Classifier::IsolationForest::Online->new( %opts, use_c => 1, use_openmp => 1 )
 		if $HAS_C && $HAS_OPENMP;
-	$_->learn($stream) for values %m;
+	for my $name ( sort keys %m ) {
+		srand(1);
+		$m{$name}->learn($stream);
+	}
 	return \%m;
 } ## end sub build_models
 
@@ -67,8 +77,13 @@ print "=" x 70, "\n";
 print " online (streaming) scoring accel benchmarks\n";
 print " Algorithm::Classifier::IsolationForest::Online\n";
 print "=" x 70, "\n";
-printf "Backend availability: HAS_C=%d  HAS_OPENMP=%d\n", $HAS_C, $HAS_OPENMP;
+printf "Backend availability: HAS_C=%d  HAS_OPENMP=%d  online_learn_xs=%d\n",
+	$HAS_C, $HAS_OPENMP,
+	Algorithm::Classifier::IsolationForest::Online::_HAS_ONLINE_XS;
 print "(rates shown as calls/second wall-clock; higher is faster)\n";
+print "(online_learn_xs=0 means the loaded C object predates the online\n"
+	. " learn accelerators -- rebuild or rerun with IF_RUNTIME_BUILD=1)\n"
+	unless Algorithm::Classifier::IsolationForest::Online::_HAS_ONLINE_XS;
 
 srand(42);
 my $stream = make_data( 3000, 5 );
@@ -133,5 +148,52 @@ for my $name ( keys %$models ) {
 	};
 }
 wall_cmpthese( 1, \%v );
+
+# -----------------------------------------------------------------------
+# 4. score_learn  -- the prequential stream loop (per-point mutation)
+# -----------------------------------------------------------------------
+print "\n--- score_learn, 200-row chunks  (multiply rate by 200 for pts/s) ---\n";
+srand(46);
+my $feed = make_data( 20000, 5 );
+my $pos  = 0;
+my %v_sl;
+for my $name ( keys %$models ) {
+	my $m = $models->{$name};
+	$v_sl{$name} = sub {
+		$pos = 0 if $pos + 200 > @$feed;
+		my $s = $m->score_learn( [ @{$feed}[ $pos .. $pos + 199 ] ] );
+		$pos += 200;
+		1;
+	};
+}
+wall_cmpthese( 1, \%v_sl );
+
+# -----------------------------------------------------------------------
+# 5. score_learn_tagged  -- single named-feature rows (rate = points/s)
+# -----------------------------------------------------------------------
+print "\n--- score_learn_tagged, one hashref row per call ---\n";
+srand(47);
+my @tag_names     = qw(f0 f1 f2 f3 f4);
+my $tagged_models = build_models(
+	$stream,
+	n_trees          => 100,
+	window_size      => 2048,
+	max_leaf_samples => 32,
+	seed             => 1,
+	feature_names    => \@tag_names,
+);
+my $tpos = 0;
+my %v_slt;
+for my $name ( keys %$tagged_models ) {
+	my $m = $tagged_models->{$name};
+	$v_slt{$name} = sub {
+		$tpos = 0 if $tpos >= @$feed;
+		my %row;
+		@row{@tag_names} = @{ $feed->[ $tpos++ ] };
+		my $s = $m->score_learn_tagged( \%row );
+		1;
+	};
+} ## end for my $name ( keys %$tagged_models )
+wall_cmpthese( 1, \%v_slt );
 
 print "\ndone\n";

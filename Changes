@@ -25,10 +25,26 @@ Revision history for Algorithm-Classifier-IsolationForest
           use_openmp knobs match the parent's semantics). Measured ~60x
           single-threaded and 250x+ with OpenMP at 100 trees x 1000+
           query points; ~17x even when every scoring call follows a
-          learned point and pays the repack. Learning and score_learn
-          remain pure Perl (the trees mutate per point, so a per-point
-          snapshot could never be reused). New benchmark script
+          learned point and pays the repack. New benchmark script
           benchmarking/bench-online-score-accel.pl.
+        - Online learning is C-accelerated too: online_learn_row_xs /
+          online_unlearn_row_xs run the per-tree insert/forget walks
+          (count/box bookkeeping, box-sampled leaf splits, subtree
+          collapse) directly against the live Perl tree structures, and
+          online_score_row_xs walks them for score_learn's per-row
+          scoring. Random draws go through Drand01() in exactly the
+          order the pure-Perl path calls rand(), so learn() with a
+          given seed builds BIT-IDENTICAL trees whether use_c is on or
+          off (nvsize == 8 perls; the depth-budget log base is pinned
+          to an exact-double literal on both sides so platform libm
+          rounding cannot flip a split decision). Measured ~9-10x: a
+          default 100-tree model learns ~2,600 pts/s vs ~290 pure Perl,
+          and score_learn / score_learn_tagged stream at ~2,800 pts/s
+          vs ~270. A prebuilt C object from an older release lacks the
+          new functions; the online class detects that at load and
+          keeps learning in pure Perl (batch scoring stays accelerated)
+          until the module is rebuilt. The accel benchmark script grew
+          score_learn and score_learn_tagged sections.
         - New `iforest stream` subcommand: creates or resumes an online
           model, streams CSV rows through it (prequential by default,
           --learn-only / --score-only variants), and saves the updated

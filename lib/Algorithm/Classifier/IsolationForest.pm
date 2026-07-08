@@ -1475,6 +1475,519 @@ void impute_fill_xs(SV* data_sv, int n_pts, int n_feats, int how,
     }
     free(cols);
 }
+
+/* ---------------------------------------------------------------------
+ * Online Isolation Forest (Algorithm::Classifier::IsolationForest::
+ * Online) learn / unlearn / score-row accelerators.
+ *
+ * Unlike everything above, these operate directly on LIVE Perl
+ * arrayref trees: online trees mutate on every learned point, so there
+ * is no immutable packed form to walk during learning.  Node layout
+ * (Online.pm's _N_* constants):
+ *
+ *   leaf:     [0, count, \@lo, \@hi]
+ *   internal: [1, count, \@lo, \@hi, attr, split, left, right]
+ *
+ * and a tree record is a hashref { root, count, depth_limit }; root is
+ * undef until the tree learns its first point, and a leaf built from an
+ * empty synthetic partition has undef lo/hi until a real point reaches
+ * it.
+ *
+ * Random draws go through Drand01() in EXACTLY the order the pure-Perl
+ * learn path calls rand(): an optional per-tree subsample gate (drawn
+ * only when subsample < 1), and -- only when a leaf splits --
+ * count * nf box-sample draws that SKIP zero-width features (the Perl
+ * _sample_box never draws for those), then per synthetic internal node
+ * one draw for the split feature and one for the split value, recursing
+ * left before right.  A learn() with a given seed therefore produces
+ * BIT-IDENTICAL trees whether use_c is on or off (on nvsize == 8 perls;
+ * wide-NV perls keep extra low bits in the pure-Perl path, as with
+ * fit()), which is what lets the online class reuse the existing use_c
+ * knob for learning instead of growing a new one.
+ * ------------------------------------------------------------------ */
+
+#define OL_TYPE  0
+#define OL_COUNT 1
+#define OL_LO    2
+#define OL_HI    3
+#define OL_ATTR  4
+#define OL_SPLIT 5
+#define OL_LEFT  6
+#define OL_RIGHT 7
+
+/* ln(4) as the exact double Perl's compile-time log(4) produces --
+ * spelled as a literal (like TWO_PI on the Perl side) so a compiler
+ * that constant-folds log(4.0) differently from libm cannot introduce
+ * a one-ulp parity break in the depth budget. */
+#define OL_LOG4 1.3862943611198906
+
+/* Depth budget for n points -- the C image of Online.pm's _rpl(). */
+static double _ol_rpl(double n, int eta) {
+    if (n < (double)eta) return 0.0;
+    return log(n / (double)eta) / OL_LOG4;
+}
+
+/* Points a node at `depth` needs before it may split (below which, on
+ * forgetting, it collapses back into a leaf) -- _split_threshold().
+ * ldexp keeps the adaptive 2**depth factor exact, matching Perl's
+ * NV exponentiation. */
+static double _ol_split_threshold(int eta, int adaptive, int depth) {
+    return (double)eta * (adaptive ? ldexp(1.0, depth) : 1.0);
+}
+
+/* Fresh [v0 .. v(nf-1)] arrayref (a bounding-box side). */
+static SV* _ol_mk_box(pTHX_ const double* v, int nf) {
+    AV* av = newAV();
+    int k;
+    av_extend(av, nf - 1);
+    for (k = 0; k < nf; k++) AvARRAY(av)[k] = newSVnv(v[k]);
+    AvFILLp(av) = nf - 1;
+    return newRV_noinc((SV*)av);
+}
+
+/* lo_rv/hi_rv may be NULL => undef box (leaf from an empty synthetic
+ * partition).  Takes ownership of non-NULL refs. */
+static SV* _ol_mk_leaf(pTHX_ IV count, SV* lo_rv, SV* hi_rv) {
+    AV* av = newAV();
+    av_extend(av, 3);
+    AvARRAY(av)[0] = newSViv(0);
+    AvARRAY(av)[1] = newSViv(count);
+    AvARRAY(av)[2] = lo_rv ? lo_rv : &PL_sv_undef;
+    AvARRAY(av)[3] = hi_rv ? hi_rv : &PL_sv_undef;
+    AvFILLp(av)    = 3;
+    return newRV_noinc((SV*)av);
+}
+
+static SV* _ol_mk_axis(pTHX_ IV count, SV* lo_rv, SV* hi_rv, int attr,
+                       double split, SV* left, SV* right) {
+    AV* av = newAV();
+    av_extend(av, 7);
+    AvARRAY(av)[0] = newSViv(1);
+    AvARRAY(av)[1] = newSViv(count);
+    AvARRAY(av)[2] = lo_rv;
+    AvARRAY(av)[3] = hi_rv;
+    AvARRAY(av)[4] = newSViv(attr);
+    AvARRAY(av)[5] = newSVnv(split);
+    AvARRAY(av)[6] = left;
+    AvARRAY(av)[7] = right;
+    AvFILLp(av)    = 7;
+    return newRV_noinc((SV*)av);
+}
+
+/* Recursively build a subtree over synthetic points (row indices into
+ * pts, a rows x nf buffer) -- the C image of _build_from_points(), in
+ * the same draw order: split feature, split value, left subtree, right
+ * subtree.  The partition is stable, matching the Perl push loop. */
+static SV* _ol_build(pTHX_ const double* pts, const int* idx, int n, int nf,
+                     int depth, double limit, int eta, int adaptive) {
+    SV *lo_rv = NULL, *hi_rv = NULL;
+    int i, f;
+
+    if (n > 0) {
+        double* lo = (double*)malloc(nf * sizeof(double));
+        double* hi = (double*)malloc(nf * sizeof(double));
+        const double* p0 = pts + (size_t)idx[0] * (size_t)nf;
+        for (f = 0; f < nf; f++) { lo[f] = p0[f]; hi[f] = p0[f]; }
+        for (i = 0; i < n; i++) {
+            const double* p = pts + (size_t)idx[i] * (size_t)nf;
+            for (f = 0; f < nf; f++) {
+                if (p[f] < lo[f]) lo[f] = p[f];
+                if (p[f] > hi[f]) hi[f] = p[f];
+            }
+        }
+        lo_rv = _ol_mk_box(aTHX_ lo, nf);
+        hi_rv = _ol_mk_box(aTHX_ hi, nf);
+        free(lo);
+        free(hi);
+    }
+
+    if ((double)n < _ol_split_threshold(eta, adaptive, depth) ||
+        (double)depth >= limit) {
+        return _ol_mk_leaf(aTHX_ (IV)n, lo_rv, hi_rv);
+    }
+
+    {
+        int attr    = (int)(Drand01() * nf);
+        double pmin = pts[(size_t)idx[0] * (size_t)nf + attr];
+        double pmax = pmin;
+        double split;
+        int *l, *r, ln = 0, rn = 0;
+        SV *left, *right;
+
+        for (i = 0; i < n; i++) {
+            double v = pts[(size_t)idx[i] * (size_t)nf + attr];
+            if (v < pmin) pmin = v;
+            if (v > pmax) pmax = v;
+        }
+        split = pmin + Drand01() * (pmax - pmin);
+
+        l = (int*)malloc(n * sizeof(int));
+        r = (int*)malloc(n * sizeof(int));
+        for (i = 0; i < n; i++) {
+            if (pts[(size_t)idx[i] * (size_t)nf + attr] < split) l[ln++] = idx[i];
+            else                                                 r[rn++] = idx[i];
+        }
+        left  = _ol_build(aTHX_ pts, l, ln, nf, depth + 1, limit, eta, adaptive);
+        right = _ol_build(aTHX_ pts, r, rn, nf, depth + 1, limit, eta, adaptive);
+        free(l);
+        free(r);
+        return _ol_mk_axis(aTHX_ (IV)n, lo_rv, hi_rv, attr, split, left, right);
+    }
+}
+
+/* Route one point down, growing counts and boxes -- _node_learn().
+ * Returns the (possibly replaced) node ref; a changed return is stored
+ * back by the caller, exactly like the Perl recursion's assignment.
+ * When a leaf is replaced by a freshly built subtree the return value
+ * is a new ref with refcount 1 and the caller's store drops the old
+ * leaf's reference. */
+static SV* _ol_node_learn(pTHX_ SV* node_rv, const double* x, int nf,
+                          int depth, double limit, int eta, int adaptive) {
+    AV* node   = (AV*)SvRV(node_rv);
+    SV** slots = AvARRAY(node);
+    IV count   = SvIV(slots[OL_COUNT]) + 1;
+    int f;
+
+    sv_setiv(slots[OL_COUNT], count);
+
+    if (!SvOK(slots[OL_LO])) {
+        /* Leaf born from an empty synthetic partition: the first real
+         * point initialises the box. */
+        av_store(node, OL_LO, _ol_mk_box(aTHX_ x, nf));
+        av_store(node, OL_HI, _ol_mk_box(aTHX_ x, nf));
+        slots = AvARRAY(node);
+    } else {
+        AV* lo = (AV*)SvRV(slots[OL_LO]);
+        AV* hi = (AV*)SvRV(slots[OL_HI]);
+        for (f = 0; f < nf; f++) {
+            SV** lv = av_fetch(lo, f, 1);
+            SV** hv = av_fetch(hi, f, 1);
+            if (x[f] < SvNV(*lv)) sv_setnv(*lv, x[f]);
+            if (x[f] > SvNV(*hv)) sv_setnv(*hv, x[f]);
+        }
+    }
+
+    if (SvIV(slots[OL_TYPE]) == 0) {    /* leaf */
+        if ((double)count >= _ol_split_threshold(eta, adaptive, depth) &&
+            (double)depth < limit) {
+            AV* lo      = (AV*)SvRV(AvARRAY(node)[OL_LO]);
+            AV* hi      = (AV*)SvRV(AvARRAY(node)[OL_HI]);
+            double* lod = (double*)malloc(nf * sizeof(double));
+            double* hid = (double*)malloc(nf * sizeof(double));
+            double* pts = (double*)malloc((size_t)count * (size_t)nf * sizeof(double));
+            int* idx    = (int*)malloc((size_t)count * sizeof(int));
+            SV* subtree;
+            int i;
+
+            for (f = 0; f < nf; f++) {
+                SV** lv = av_fetch(lo, f, 0);
+                SV** hv = av_fetch(hi, f, 0);
+                lod[f] = (lv && *lv && SvOK(*lv)) ? SvNV(*lv) : 0.0;
+                hid[f] = (hv && *hv && SvOK(*hv)) ? SvNV(*hv) : 0.0;
+            }
+            /* Synthetic points, point-major, one draw per feature with
+             * width > 0 -- _sample_box's exact draw order. */
+            for (i = 0; i < (int)count; i++) {
+                for (f = 0; f < nf; f++) {
+                    double w = hid[f] - lod[f];
+                    pts[(size_t)i * (size_t)nf + f]
+                        = (w > 0) ? lod[f] + Drand01() * w : lod[f];
+                }
+                idx[i] = i;
+            }
+            subtree = _ol_build(aTHX_ pts, idx, (int)count, nf, depth, limit,
+                                eta, adaptive);
+            free(lod);
+            free(hid);
+            free(pts);
+            free(idx);
+            return subtree;
+        }
+        return node_rv;
+    }
+
+    {
+        int attr     = (int)SvIV(slots[OL_ATTR]);
+        double split = SvNV(slots[OL_SPLIT]);
+        int ci       = (x[attr] < split) ? OL_LEFT : OL_RIGHT;
+        SV* child    = AvARRAY(node)[ci];
+        SV* nc = _ol_node_learn(aTHX_ child, x, nf, depth + 1, limit, eta,
+                                adaptive);
+        if (nc != child) av_store(node, ci, nc);
+        return node_rv;
+    }
+}
+
+/* Union of two nodes' boxes into caller-provided arrays, matching
+ * _box_union(): nodes without a box are skipped, the first boxed node
+ * is copied and the second folded in.  Returns 0 when neither node has
+ * a box. */
+static int _ol_box_union(pTHX_ SV* a_rv, SV* b_rv, int nf,
+                         double* lo, double* hi) {
+    SV* boxed[2];
+    int nb = 0, bi, f;
+
+    if (SvOK(AvARRAY((AV*)SvRV(a_rv))[OL_LO])) boxed[nb++] = a_rv;
+    if (SvOK(AvARRAY((AV*)SvRV(b_rv))[OL_LO])) boxed[nb++] = b_rv;
+    if (nb == 0) return 0;
+
+    for (bi = 0; bi < nb; bi++) {
+        AV* node = (AV*)SvRV(boxed[bi]);
+        AV* blo  = (AV*)SvRV(AvARRAY(node)[OL_LO]);
+        AV* bhi  = (AV*)SvRV(AvARRAY(node)[OL_HI]);
+        for (f = 0; f < nf; f++) {
+            SV** lv  = av_fetch(blo, f, 0);
+            SV** hv  = av_fetch(bhi, f, 0);
+            double l = (lv && *lv && SvOK(*lv)) ? SvNV(*lv) : 0.0;
+            double h = (hv && *hv && SvOK(*hv)) ? SvNV(*hv) : 0.0;
+            if (bi == 0) {
+                lo[f] = l;
+                hi[f] = h;
+            } else {
+                if (l < lo[f]) lo[f] = l;
+                if (h > hi[f]) hi[f] = h;
+            }
+        }
+    }
+    return 1;
+}
+
+/* Aggregate a subtree back into one leaf -- _collapse().  Children are
+ * collapsed first so their boxes can be unioned; intermediate leaves
+ * built while collapsing internal children are temporaries and dropped
+ * here.  Returns a NEW leaf ref (refcount 1) for internal nodes, or the
+ * node itself when it is already a leaf. */
+static SV* _ol_collapse(pTHX_ SV* node_rv, int nf) {
+    AV* node = (AV*)SvRV(node_rv);
+    SV *l_rv, *r_rv, *cl, *cr, *leaf;
+    SV *lo_rv = NULL, *hi_rv = NULL;
+    double *lo, *hi;
+
+    if (SvIV(AvARRAY(node)[OL_TYPE]) == 0) return node_rv;
+
+    l_rv = AvARRAY(node)[OL_LEFT];
+    r_rv = AvARRAY(node)[OL_RIGHT];
+    cl   = _ol_collapse(aTHX_ l_rv, nf);
+    cr   = _ol_collapse(aTHX_ r_rv, nf);
+
+    lo = (double*)malloc(nf * sizeof(double));
+    hi = (double*)malloc(nf * sizeof(double));
+    if (_ol_box_union(aTHX_ cl, cr, nf, lo, hi)) {
+        lo_rv = _ol_mk_box(aTHX_ lo, nf);
+        hi_rv = _ol_mk_box(aTHX_ hi, nf);
+    } else if (SvOK(AvARRAY(node)[OL_LO])) {
+        /* Both children boxless: keep the node's own box (the Perl code
+         * moves the same arrayrefs into the new leaf). */
+        lo_rv = SvREFCNT_inc(AvARRAY(node)[OL_LO]);
+        hi_rv = SvREFCNT_inc(AvARRAY(node)[OL_HI]);
+    }
+    free(lo);
+    free(hi);
+
+    leaf = _ol_mk_leaf(aTHX_ SvIV(AvARRAY(node)[OL_COUNT]), lo_rv, hi_rv);
+    if (cl != l_rv) SvREFCNT_dec(cl);
+    if (cr != r_rv) SvREFCNT_dec(cr);
+    return leaf;
+}
+
+/* Route the forgotten point down, decrementing counts -- _node_unlearn().
+ * An internal node whose count no longer justifies its split collapses;
+ * otherwise its box is refreshed to the union of its children's. */
+static SV* _ol_node_unlearn(pTHX_ SV* node_rv, const double* x, int nf,
+                            int depth, int eta, int adaptive) {
+    AV* node   = (AV*)SvRV(node_rv);
+    SV** slots = AvARRAY(node);
+    IV count   = SvIV(slots[OL_COUNT]) - 1;
+
+    sv_setiv(slots[OL_COUNT], count);
+
+    if (SvIV(slots[OL_TYPE]) == 0) return node_rv;
+    if ((double)count < _ol_split_threshold(eta, adaptive, depth)) {
+        return _ol_collapse(aTHX_ node_rv, nf);
+    }
+
+    {
+        int attr     = (int)SvIV(slots[OL_ATTR]);
+        double split = SvNV(slots[OL_SPLIT]);
+        int ci       = (x[attr] < split) ? OL_LEFT : OL_RIGHT;
+        SV* child    = AvARRAY(node)[ci];
+        double *lo, *hi;
+        SV* nc = _ol_node_unlearn(aTHX_ child, x, nf, depth + 1, eta,
+                                  adaptive);
+        if (nc != child) av_store(node, ci, nc);
+
+        lo = (double*)malloc(nf * sizeof(double));
+        hi = (double*)malloc(nf * sizeof(double));
+        if (_ol_box_union(aTHX_ AvARRAY(node)[OL_LEFT],
+                          AvARRAY(node)[OL_RIGHT], nf, lo, hi)) {
+            av_store(node, OL_LO, _ol_mk_box(aTHX_ lo, nf));
+            av_store(node, OL_HI, _ol_mk_box(aTHX_ hi, nf));
+        }
+        free(lo);
+        free(hi);
+        return node_rv;
+    }
+}
+
+/* Read one sample row (arrayref) into a dense double buffer; undef -> 0,
+ * matching the pure-Perl paths (learn rows are pre-densified anyway). */
+static void _ol_read_row(pTHX_ SV* row_sv, double* x, int nf) {
+    AV* row;
+    int f;
+    if (!SvROK(row_sv) || SvTYPE(SvRV(row_sv)) != SVt_PVAV)
+        croak("online row must be an arrayref");
+    row = (AV*)SvRV(row_sv);
+    for (f = 0; f < nf; f++) {
+        SV** v = av_fetch(row, f, 0);
+        x[f] = (v && *v && SvOK(*v)) ? SvNV(*v) : 0.0;
+    }
+}
+
+/* Fetch tree t of the trees arrayref as its underlying HV. */
+static HV* _ol_tree_hv(pTHX_ AV* trees, int t) {
+    SV** tp = av_fetch(trees, t, 0);
+    if (!tp || !*tp || !SvROK(*tp) || SvTYPE(SvRV(*tp)) != SVt_PVHV)
+        croak("online tree %d is not a hashref", t);
+    return (HV*)SvRV(*tp);
+}
+
+/* online_learn_row_xs(trees_av, row_av, nf, eta, adaptive, subsample)
+ *
+ * The C image of _learn_row's per-tree loop: every tree (subject to the
+ * subsample gate) learns the row, with count / depth_limit bookkeeping
+ * on the tree hash.  Mutates the live trees in place. */
+void online_learn_row_xs(SV* trees_av_sv, SV* row_sv, int nf, int eta,
+                         int adaptive, double subsample) {
+    dTHX;
+    AV* trees;
+    double* x;
+    int t, n_trees;
+
+    if (!SvROK(trees_av_sv) || SvTYPE(SvRV(trees_av_sv)) != SVt_PVAV)
+        croak("online_learn_row_xs: trees must be an arrayref");
+    trees   = (AV*)SvRV(trees_av_sv);
+    n_trees = (int)av_len(trees) + 1;
+
+    x = (double*)malloc(nf * sizeof(double));
+    _ol_read_row(aTHX_ row_sv, x, nf);
+
+    for (t = 0; t < n_trees; t++) {
+        HV* tree;
+        SV **csv, **dsv, **rsv;
+        IV count;
+        double limit;
+
+        if (subsample < 1.0 && Drand01() >= subsample) continue;
+        tree = _ol_tree_hv(aTHX_ trees, t);
+
+        csv   = hv_fetch(tree, "count", 5, 1);
+        count = (SvOK(*csv) ? SvIV(*csv) : 0) + 1;
+        sv_setiv(*csv, count);
+        limit = _ol_rpl((double)count, eta);
+        dsv   = hv_fetch(tree, "depth_limit", 11, 1);
+        sv_setnv(*dsv, limit);
+
+        rsv = hv_fetch(tree, "root", 4, 1);
+        if (!SvOK(*rsv)) {
+            (void)hv_store(tree, "root", 4,
+                _ol_mk_leaf(aTHX_ 1, _ol_mk_box(aTHX_ x, nf),
+                            _ol_mk_box(aTHX_ x, nf)), 0);
+        } else {
+            SV* root = *rsv;
+            SV* nr = _ol_node_learn(aTHX_ root, x, nf, 0, limit, eta,
+                                    adaptive);
+            if (nr != root) (void)hv_store(tree, "root", 4, nr, 0);
+        }
+    }
+    free(x);
+}
+
+/* online_unlearn_row_xs(trees_av, row_av, nf, eta, adaptive, subsample)
+ *
+ * The C image of _learn_row's eviction loop (_tree_unlearn per tree,
+ * behind the same independent subsample gate). */
+void online_unlearn_row_xs(SV* trees_av_sv, SV* row_sv, int nf, int eta,
+                           int adaptive, double subsample) {
+    dTHX;
+    AV* trees;
+    double* x;
+    int t, n_trees;
+
+    if (!SvROK(trees_av_sv) || SvTYPE(SvRV(trees_av_sv)) != SVt_PVAV)
+        croak("online_unlearn_row_xs: trees must be an arrayref");
+    trees   = (AV*)SvRV(trees_av_sv);
+    n_trees = (int)av_len(trees) + 1;
+
+    x = (double*)malloc(nf * sizeof(double));
+    _ol_read_row(aTHX_ row_sv, x, nf);
+
+    for (t = 0; t < n_trees; t++) {
+        HV* tree;
+        SV **csv, **dsv, **rsv;
+        IV count;
+
+        if (subsample < 1.0 && Drand01() >= subsample) continue;
+        tree = _ol_tree_hv(aTHX_ trees, t);
+
+        csv   = hv_fetch(tree, "count", 5, 1);
+        count = (SvOK(*csv) ? SvIV(*csv) : 0) - 1;
+        sv_setiv(*csv, count);
+        dsv = hv_fetch(tree, "depth_limit", 11, 1);
+        sv_setnv(*dsv, _ol_rpl((double)count, eta));
+
+        rsv = hv_fetch(tree, "root", 4, 0);
+        if (rsv && *rsv && SvOK(*rsv)) {
+            SV* root = *rsv;
+            SV* nr = _ol_node_unlearn(aTHX_ root, x, nf, 0, eta, adaptive);
+            if (nr != root) (void)hv_store(tree, "root", 4, nr, 0);
+        }
+    }
+    free(x);
+}
+
+/* online_score_row_xs(trees_av, row_av, nf, eta)
+ *
+ * Depth sum of one row across the live trees (walk + per-leaf _rpl
+ * adjustment) -- the C image of _score_row's loop, used by the
+ * prequential score_learn path where trees mutate between rows and the
+ * packed-snapshot scorer can never amortise.  Draws nothing. */
+double online_score_row_xs(SV* trees_av_sv, SV* row_sv, int nf, int eta) {
+    dTHX;
+    AV* trees;
+    double* x;
+    double sum = 0.0;
+    int t, n_trees;
+
+    if (!SvROK(trees_av_sv) || SvTYPE(SvRV(trees_av_sv)) != SVt_PVAV)
+        croak("online_score_row_xs: trees must be an arrayref");
+    trees   = (AV*)SvRV(trees_av_sv);
+    n_trees = (int)av_len(trees) + 1;
+
+    x = (double*)malloc(nf * sizeof(double));
+    _ol_read_row(aTHX_ row_sv, x, nf);
+
+    for (t = 0; t < n_trees; t++) {
+        HV* tree = _ol_tree_hv(aTHX_ trees, t);
+        SV** rsv = hv_fetch(tree, "root", 4, 0);
+        AV* node;
+        SV** slots;
+        int depth = 0;
+
+        if (!rsv || !*rsv || !SvOK(*rsv)) continue;
+        node  = (AV*)SvRV(*rsv);
+        slots = AvARRAY(node);
+        while (SvIV(slots[OL_TYPE]) != 0) {
+            int attr     = (int)SvIV(slots[OL_ATTR]);
+            double split = SvNV(slots[OL_SPLIT]);
+            node  = (AV*)SvRV(slots[(x[attr] < split) ? OL_LEFT : OL_RIGHT]);
+            slots = AvARRAY(node);
+            depth++;
+        }
+        sum += (double)depth + _ol_rpl((double)SvIV(slots[OL_COUNT]), eta);
+    }
+    free(x);
+    return sum;
+}
 __INLINE_C__
 
 	# IF_NO_C=1 skips even attempting to set up the C backend -- useful for
