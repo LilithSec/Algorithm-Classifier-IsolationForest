@@ -58,6 +58,57 @@ my $labels = $mv->predict(\@data, 0.6);   # threshold is the per-tree cutoff her
 $iforest->set_voting('majority', \@data);  # ->set_voting('mean') if no contamination
 ```
 
+# Online (streaming) Isolation Forest
+
+For data that arrives as a stream and may drift over time, the companion
+class `Algorithm::Classifier::IsolationForest::Online` implements Online
+Isolation Forest (Leveni, Weigert Cassales, Pfahringer, Bifet & Boracchi
+2024). There is no `fit`: the model `learn`s points as they arrive and,
+once more than `window_size` points have been seen, forgets the oldest
+point for every new one, so the model always reflects the most recent
+part of the stream. Trees never store data points — nodes keep only
+counts and bounding boxes; leaves split by simulating points inside
+their box, and forgetting collapses under-populated subtrees back into
+leaves. Pure Perl (the Inline::C accelerator assumes immutable trees and
+does not apply).
+
+```perl
+use Algorithm::Classifier::IsolationForest::Online;
+
+my $oif = Algorithm::Classifier::IsolationForest::Online->new(
+    n_trees          => 100,
+    window_size      => 2048,   # points the model reflects; 0 = never forget
+    max_leaf_samples => 32,     # points a leaf accumulates before splitting
+    contamination    => 0.05,   # optional: learn the label cutoff from the window
+    seed             => 42,
+);
+
+$oif->learn(\@warmup_rows);                 # warm-up / plain learning
+my $scores = $oif->score_learn(\@rows);     # prequential: score, then learn, per row
+my $flags  = $oif->predict(\@query_rows);   # score without learning
+
+# After the stream drifts, refresh the contamination cutoff:
+$oif->relearn_threshold;
+
+# Persistence keeps the sliding window, so a reloaded model resumes the
+# stream where it left off. load() on the parent class dispatches on the
+# stored format tag, so either model type loads through either class.
+$oif->save('oiforest_model.json');
+my $resumed = Algorithm::Classifier::IsolationForest->load('oiforest_model.json');
+```
+
+On the command line the `iforest stream` subcommand runs the same loop
+over a CSV: it creates or resumes the model at `-m`, scores + learns each
+row (prequentially), prints `score,label` lines, and saves the updated
+state back — so repeated invocations continue the stream.
+
+```shell
+iforest stream -i batch1.csv -m om.json -n 100 --window 2048 --eta 32 -c 0.05
+iforest stream -i batch2.csv -m om.json               # resumes om.json
+iforest stream -i suspect.csv -m om.json --score-only # score without learning
+iforest info -m om.json                               # online-aware model info
+```
+
 # Performance options
 
 A handful of constructor / method-level knobs unlock measurable speedups

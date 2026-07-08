@@ -1,5 +1,26 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
+0.6.0   2026-07-08/02:00
+        - Implement Online Isolation Forest (Leveni, Weigert Cassales,
+          Pfahringer, Bifet & Boracchi 2024, ICML, PMLR 235) as the new
+          companion class Algorithm::Classifier::IsolationForest::Online.
+          Streaming operation instead of fit(): points are learned as
+          they arrive and forgotten once they age out of a sliding
+          window, so the model tracks drift. Trees store counts and
+          bounding boxes rather than points; leaves split by simulating
+          points inside their box and forgetting collapses
+          under-populated subtrees. Supports prequential score_learn,
+          contamination thresholds relearnable from the window, tagged
+          rows, and JSON persistence that keeps the window so a reloaded
+          model resumes the stream. Pure Perl (the C accelerator assumes
+          immutable trees and does not apply).
+        - New `iforest stream` subcommand: creates or resumes an online
+          model, streams CSV rows through it (prequential by default,
+          --learn-only / --score-only variants), and saves the updated
+          state back.
+        - `iforest info` and the parent class's load()/from_json()
+          recognise online models via their stored format tag.
+
 0.5.0   2026-07-04/14:30
         - Wide-NV perls (-Duselongdouble / -Dusequadmath(maybe? does this
           even exist? but possibly some idiot on github... but would fix

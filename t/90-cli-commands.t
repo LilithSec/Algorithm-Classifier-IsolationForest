@@ -184,6 +184,84 @@ SKIP: {
 	};
 } ## end SKIP:
 
+# --- online model workflow: stream + info -------------------------------
+{
+	my $stream_csv = "$tmp/stream.csv";
+	my $omodel     = "$tmp/online_model.json";
+	my $oscores    = "$tmp/stream_scores.csv";
+
+	{
+		open my $fh, '>', $stream_csv or die $!;
+		srand(3);
+		for ( 1 .. 120 ) {
+			print $fh join( ',', map { sprintf( '%.4f', rand() - 0.5 ) } 1 .. 3 ), "\n";
+		}
+		print $fh "9,9,9\n";
+		close $fh;
+	}
+
+	subtest 'stream creates an online model and emits prequential scores' => sub {
+		my $out = `$^X -Ilib $bin stream -i $stream_csv -m $omodel -n 20 --window 64 --eta 16 -s 42 2>&1`;
+		is( $?, 0, 'stream exits 0' );
+		ok( -s $omodel, 'online model was written' );
+		my @lines = split /\n/, $out;
+		is( scalar @lines, 121, 'one output row per input row' );
+		like( $lines[-1], qr/^[\d.eE+-]+,[01]$/, 'rows match "score,label"' );
+	};
+
+	subtest 'stream resumes a saved model' => sub {
+		my $out = `$^X -Ilib $bin stream -i $stream_csv -m $omodel 2>&1`;
+		is( $?, 0, 'stream (resume) exits 0' );
+		my @lines = split /\n/, $out;
+		is( scalar @lines, 121, 'one output row per input row on resume' );
+	};
+
+	subtest 'stream --score-only does not advance the model' => sub {
+		my $before = do { local ( @ARGV, $/ ) = ($omodel); <> };
+		my $out    = `$^X -Ilib $bin stream --score-only -i $stream_csv -m $omodel -o $oscores 2>&1`;
+		is( $?, 0, 'stream --score-only exits 0' );
+		ok( -s $oscores, 'score output file written' );
+		my $after = do { local ( @ARGV, $/ ) = ($omodel); <> };
+		is( $after, $before, 'model file unchanged by --score-only' );
+	};
+
+	subtest 'stream --learn-only emits nothing but updates the model' => sub {
+		my $before = do { local ( @ARGV, $/ ) = ($omodel); <> };
+		my $out    = `$^X -Ilib $bin stream --learn-only -i $stream_csv -m $omodel 2>&1`;
+		is( $?,   0,  'stream --learn-only exits 0' );
+		is( $out, '', 'no score output' );
+		my $after = do { local ( @ARGV, $/ ) = ($omodel); <> };
+		isnt( $after, $before, 'model file advanced by --learn-only' );
+	};
+
+	subtest 'info recognises an online model' => sub {
+		my $out = `$^X -Ilib $bin info -m $omodel 2>&1`;
+		is( $?, 0, 'info exits 0 on an online model' );
+		like( $out, qr/type\s+online/,          'info reports type=online' );
+		like( $out, qr/window_size\s+64/,       'info reports window_size' );
+		like( $out, qr/max_leaf_samples\s+16/,  'info reports max_leaf_samples' );
+		like( $out, qr/tree_total_nodes\s+\d+/, 'info reports tree stats' );
+	};
+
+	subtest 'info --json on an online model parses' => sub {
+		my $out = `$^X -Ilib $bin info -m $omodel --json 2>&1`;
+		is( $?, 0, 'info --json exits 0' );
+		require JSON::PP;
+		my $obj = eval { JSON::PP->new->decode($out) };
+		ok( !$@, 'output parses as JSON' ) or diag("error: $@");
+		if ($obj) {
+			is( $obj->{type},    'online', 'JSON type matches' );
+			is( $obj->{n_trees}, 20,       'JSON n_trees matches' );
+		}
+	}; ## end 'info --json on an online model parses' => sub
+
+	subtest 'stream refuses a batch model' => sub {
+		my $out = `$^X -Ilib $bin stream -i $stream_csv -m $model 2>&1`;
+		isnt( $?, 0, 'stream exits non-zero on a batch model' );
+		like( $out, qr/not an online model/, 'error explains the mismatch' );
+	};
+}
+
 # Ensure the module's HAS_C flag was probed before any SKIP block.
 BEGIN { require Algorithm::Classifier::IsolationForest; }
 

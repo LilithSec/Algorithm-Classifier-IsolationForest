@@ -9,7 +9,7 @@ use POSIX       qw(ceil);
 use JSON::PP    ();
 use File::Slurp qw(read_file write_file);
 
-our $VERSION = '0.5.0';
+our $VERSION = '0.6.0';
 
 use constant EULER => 0.5772156649015329;
 
@@ -1791,6 +1791,13 @@ both axis and extended mode, and an existing model can be flipped between
 the two modes with L</set_voting> without refitting; see C<voting> under
 L</new(%args)>.
 
+For data that arrives as a stream and may drift over time, the companion
+class L<Algorithm::Classifier::IsolationForest::Online> implements Online
+Isolation Forest (Leveni et al. 2024): no C<fit()>, instead points are
+learned as they arrive and forgotten once they age out of a sliding
+window.  Models saved by either class can be loaded through L</load>,
+which dispatches on the stored format tag.
+
 psi referenced below is ψ or the pitchfork math symbol referenced in the paper,
 Liu, Fei Tony & Ting, Kai & Zhou, Zhi-Hua. (2008). Isolation Forest. 413 - 422. 10.1109/ICDM.2008.17.
 
@@ -3152,8 +3159,18 @@ sub from_json {
 	my $payload = JSON::PP->new->decode($text);
 	croak "not an IsolationForest model"
 		unless ref $payload eq 'HASH'
-		&& defined $payload->{format}
-		&& $payload->{format} eq 'Algorithm::Classifier::IsolationForest';
+		&& defined $payload->{format};
+
+	# Online models carry their own format tag; hand them to the class
+	# that knows their shape so callers can load either model type
+	# through this one entry point.
+	if ( $payload->{format} eq 'Algorithm::Classifier::IsolationForest::Online' ) {
+		require Algorithm::Classifier::IsolationForest::Online;
+		return Algorithm::Classifier::IsolationForest::Online->from_json($text);
+	}
+
+	croak "not an IsolationForest model"
+		unless $payload->{format} eq 'Algorithm::Classifier::IsolationForest';
 
 	my $p = $payload->{params} || {};
 
@@ -3246,6 +3263,10 @@ L<https://ieeexplore.ieee.org/document/8888179>
 Yousra Chabchoub, Maurras Ulbricht Togbe, Aliou Boly, Raja Chiky (2022). An In-Depth Study and Improvement of Isolation Forest. IEEE Access, vol. 10, 10219 - 10237. 10.1109/ACCESS.2022.3144425 (the Majority Voting Isolation Forest implemented by C<< voting => 'majority' >>)
 
 L<https://ieeexplore.ieee.org/document/9684896>
+
+Filippo Leveni, Guilherme Weigert Cassales, Bernhard Pfahringer, Albert Bifet, Giacomo Boracchi (2024). Online Isolation Forest. Proceedings of the 41st International Conference on Machine Learning (ICML), PMLR 235. (the streaming variant implemented by L<Algorithm::Classifier::IsolationForest::Online>)
+
+L<https://proceedings.mlr.press/v235/leveni24a.html>
 
 =cut
 
