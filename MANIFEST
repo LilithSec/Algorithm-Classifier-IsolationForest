@@ -35,6 +35,7 @@ t/31-undef-column-no-warnings.t
 t/32-pack-data.t
 t/33-parallel-fit.t
 t/34-missing-values.t
+t/35-online-accel.t
 t/36-tagged-methods.t
 t/37-majority-voting.t
 t/38-online-basic.t
@@ -63,3 +64,4 @@ benchmarking/bench-extended-predict-accel.pl
 benchmarking/bench-axis-predict-accel.pl
 benchmarking/BenchAccel.pm
 benchmarking/bench-voting.pl
+benchmarking/bench-online-score-accel.pl

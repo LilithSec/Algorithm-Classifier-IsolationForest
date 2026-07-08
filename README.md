@@ -69,8 +69,16 @@ point for every new one, so the model always reflects the most recent
 part of the stream. Trees never store data points — nodes keep only
 counts and bounding boxes; leaves split by simulating points inside
 their box, and forgetting collapses under-populated subtrees back into
-leaves. Pure Perl (the Inline::C accelerator assumes immutable trees and
-does not apply).
+leaves.
+
+Learning is pure Perl (the trees mutate on every point), but batch
+scoring runs through the same Inline::C/OpenMP backend the batch class
+uses: the mutable trees are lazily packed into the batch scorer's node
+layout and any `learn` invalidates the snapshot. Scoring results are
+identical with the accelerator on or off; only speed differs (measured
+~60x single-threaded and 250x+ with OpenMP on 100 trees x 1000+ query
+points; `score_learn` stays pure Perl since it mutates the model after
+every point).
 
 ```perl
 use Algorithm::Classifier::IsolationForest::Online;

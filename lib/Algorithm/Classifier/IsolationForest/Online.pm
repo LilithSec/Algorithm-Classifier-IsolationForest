@@ -109,10 +109,21 @@ batch model's C<c(psi)>.  Scores are in (0, 1] with high values
 anomalous, directly comparable in spirit (though not numerically) to the
 parent class's scores.
 
-This class is pure Perl; the parent's Inline::C accelerator does not
-apply, as its packed-buffer scoring assumes immutable trees.  The
-per-point cost is one root-to-leaf walk per tree, which is cheap at
-typical stream rates.
+Learning is pure Perl (the trees mutate on every point, which the
+parent's packed-buffer machinery cannot follow), but batch scoring is
+accelerated through the parent class's Inline::C backend when it is
+available: the mutable trees are lazily flattened into the same packed
+node layout the batch scorer walks -- online trees are axis-only, and
+the online per-leaf depth adjustment rides in the slot the batch packer
+uses for its own leaf adjustment -- so C<score_samples>, C<predict>,
+C<path_lengths>, C<score_predict_samples>, and C<score_predict_split>
+all run through the same C (and OpenMP, when linked) tree walk the
+parent uses, with identical results to the pure-Perl fallback.  Any
+C<learn> invalidates the packed snapshot; the next scoring call repacks
+once.  C<score_learn> always scores in pure Perl: it mutates the trees
+after every single point, so a packed snapshot could never be reused
+and repacking per point would cost more than the walk it replaced.  See
+C<use_c>/C<use_openmp> under L</new(%args)>.
 
 A model needs to have seen at least C<max_leaf_samples> points before
 tree structure exists at all; until then every point scores 1.0.  Give
@@ -187,6 +198,18 @@ Inits the object.
           *_tagged methods.
       default :: undef
 
+  - use_c :: boolean, override whether the parent class's Inline::C
+          backend is used for batch scoring (see DESCRIPTION; learning
+          and score_learn are pure Perl regardless).  When false the
+          instance scores in pure Perl even if the C backend compiled.
+          Scoring results are identical either way -- only speed
+          differs.
+      default :: $Algorithm::Classifier::IsolationForest::HAS_C
+
+  - use_openmp :: boolean, override whether OpenMP parallel scoring is
+          used inside the C tree walk.  Ignored when use_c is false.
+      default :: $Algorithm::Classifier::IsolationForest::HAS_OPENMP
+
 =cut
 
 sub new {
@@ -208,6 +231,20 @@ sub new {
 	# normalise to 0 so the rest of the code has one falsy spelling.
 	my $window_size = exists $args{window_size} ? ( $args{window_size} // 0 ) : 2048;
 
+	# Clamp the accel knobs against what the parent's build actually has,
+	# exactly as the parent's new() does: use_c => 1 without a compiled
+	# backend would otherwise call undefined XS subs at first scoring, and
+	# OpenMP is meaningless without the C tree walk.
+	my $use_c
+		= defined $args{use_c}
+		? ( $args{use_c} && $Algorithm::Classifier::IsolationForest::HAS_C ? 1 : 0 )
+		: $Algorithm::Classifier::IsolationForest::HAS_C;
+	my $use_openmp
+		= defined $args{use_openmp}
+		? ( $args{use_openmp} && $Algorithm::Classifier::IsolationForest::HAS_OPENMP ? 1 : 0 )
+		: $Algorithm::Classifier::IsolationForest::HAS_OPENMP;
+	$use_openmp = 0 unless $use_c;
+
 	my $self = {
 		n_trees          => $args{n_trees} // 100,
 		window_size      => $window_size,
@@ -223,6 +260,8 @@ sub new {
 		seen             => 0,                               # total points learned over the model's lifetime
 		window           => [],                              # the retained rows, oldest first
 		trees            => [],
+		_use_c           => $use_c,
+		_use_openmp      => $use_openmp,
 	};
 
 	croak "n_trees must be >= 1"          unless $self->{n_trees} >= 1;
@@ -348,10 +387,24 @@ sub score_samples {
 	$self->_check_learned;
 	croak "score_samples() expects an arrayref of samples"
 		unless ref $data eq 'ARRAY';
+
+	if ( $self->_ensure_c_trees ) {
+		my ( $n_pts, $x_packed ) = $self->_pack_input($data);
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		Algorithm::Classifier::IsolationForest::score_all_xs(
+			$self->{_c_nodes},   $self->{_c_coef_idx},       $self->{_c_coef_val},
+			$x_packed,           $sums_packed,               $n_pts,
+			$self->{n_features}, scalar @{ $self->{trees} }, $self->{_use_openmp}
+		);
+		my $result = [];
+		Algorithm::Classifier::IsolationForest::finalize_scores_xs( $sums_packed, $n_pts, $self->_score_inv, $result );
+		return $result;
+	} ## end if ( $self->_ensure_c_trees )
+
 	my $sums = $self->_depth_sums($data);
 	my $inv  = $self->_score_inv;
 	return [ map { exp( -$_ * $inv ) } @$sums ];
-}
+} ## end sub score_samples
 
 =head2 score_sample_tagged(\%row)
 
@@ -386,10 +439,24 @@ sub path_lengths {
 	$self->_check_learned;
 	croak "path_lengths() expects an arrayref of samples"
 		unless ref $data eq 'ARRAY';
+	my $t = scalar @{ $self->{trees} };
+
+	if ( $self->_ensure_c_trees ) {
+		my ( $n_pts, $x_packed ) = $self->_pack_input($data);
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		Algorithm::Classifier::IsolationForest::score_all_xs(
+			$self->{_c_nodes},   $self->{_c_coef_idx}, $self->{_c_coef_val},
+			$x_packed,           $sums_packed,         $n_pts,
+			$self->{n_features}, $t,                   $self->{_use_openmp}
+		);
+		my $result = [];
+		Algorithm::Classifier::IsolationForest::finalize_path_lengths_xs( $sums_packed, $n_pts, $t + 0.0, $result );
+		return $result;
+	} ## end if ( $self->_ensure_c_trees )
+
 	my $sums = $self->_depth_sums($data);
-	my $t    = $self->{n_trees};
 	return [ map { $_ / $t } @$sums ];
-}
+} ## end sub path_lengths
 
 =head2 predict(\@data, $threshold)
 
@@ -418,6 +485,24 @@ sub predict {
 		= defined $threshold         ? $threshold
 		: defined $self->{threshold} ? $self->{threshold}
 		:                              0.5;
+
+	# Fast path: threshold the raw depth sums directly, skipping the
+	# per-point exp() -- score >= T iff sum <= -log(T)/inv.  Only valid
+	# for a normal threshold in (0, 1), like the parent's gate.
+	if ( $threshold > 0 && $threshold < 1 && $self->_ensure_c_trees ) {
+		my ( $n_pts, $x_packed ) = $self->_pack_input($data);
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		Algorithm::Classifier::IsolationForest::score_all_xs(
+			$self->{_c_nodes},   $self->{_c_coef_idx},       $self->{_c_coef_val},
+			$x_packed,           $sums_packed,               $n_pts,
+			$self->{n_features}, scalar @{ $self->{trees} }, $self->{_use_openmp}
+		);
+		my $sum_threshold = -log($threshold) / $self->_score_inv;
+		my $result        = [];
+		Algorithm::Classifier::IsolationForest::predict_sums_xs( $sums_packed, $n_pts, $sum_threshold, $result );
+		return $result;
+	} ## end if ( $threshold > 0 && $threshold < 1 && $self...)
+
 	my $scores = $self->score_samples($data);
 	return [ map { $_ >= $threshold ? 1 : 0 } @$scores ];
 } ## end sub predict
@@ -458,6 +543,24 @@ sub score_predict_samples {
 		= defined $threshold         ? $threshold
 		: defined $self->{threshold} ? $self->{threshold}
 		:                              0.5;
+
+	# Fast path: [score, label] pairs built straight from the sum buffer
+	# in one C call; gated identically to predict().
+	if ( $threshold > 0 && $threshold < 1 && $self->_ensure_c_trees ) {
+		my ( $n_pts, $x_packed ) = $self->_pack_input($data);
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		Algorithm::Classifier::IsolationForest::score_all_xs(
+			$self->{_c_nodes},   $self->{_c_coef_idx},       $self->{_c_coef_val},
+			$x_packed,           $sums_packed,               $n_pts,
+			$self->{n_features}, scalar @{ $self->{trees} }, $self->{_use_openmp}
+		);
+		my $inv           = $self->_score_inv;
+		my $sum_threshold = -log($threshold) / $inv;
+		my $result        = [];
+		Algorithm::Classifier::IsolationForest::score_predict_xs( $sums_packed, $n_pts, $inv, $sum_threshold, $result );
+		return $result;
+	} ## end if ( $threshold > 0 && $threshold < 1 && $self...)
+
 	my $scores = $self->score_samples($data);
 	return [ map { [ $_, ( $_ >= $threshold ? 1 : 0 ) ] } @$scores ];
 } ## end sub score_predict_samples
@@ -498,6 +601,26 @@ sub score_predict_split {
 		= defined $threshold         ? $threshold
 		: defined $self->{threshold} ? $self->{threshold}
 		:                              0.5;
+
+	# Fast path: two flat arrayrefs straight from the sum buffer; gated
+	# identically to predict().
+	if ( $threshold > 0 && $threshold < 1 && $self->_ensure_c_trees ) {
+		my ( $n_pts, $x_packed ) = $self->_pack_input($data);
+		my $sums_packed = "\0" x ( $n_pts * 8 );
+		Algorithm::Classifier::IsolationForest::score_all_xs(
+			$self->{_c_nodes},   $self->{_c_coef_idx},       $self->{_c_coef_val},
+			$x_packed,           $sums_packed,               $n_pts,
+			$self->{n_features}, scalar @{ $self->{trees} }, $self->{_use_openmp}
+		);
+		my $inv           = $self->_score_inv;
+		my $sum_threshold = -log($threshold) / $inv;
+		my $scores        = [];
+		my $labels        = [];
+		Algorithm::Classifier::IsolationForest::score_predict_split_xs( $sums_packed, $n_pts, $inv,
+			$sum_threshold, $scores, $labels );
+		return ( $scores, $labels );
+	} ## end if ( $threshold > 0 && $threshold < 1 && $self...)
+
 	my $scores = $self->score_samples($data);
 	my @labels = map { $_ >= $threshold ? 1 : 0 } @$scores;
 	return ( $scores, \@labels );
@@ -663,6 +786,8 @@ sub from_json {
 		seen             => $p->{seen}         // 0,
 		window           => $payload->{window} // [],
 		trees            => [],
+		_use_c           => $Algorithm::Classifier::IsolationForest::HAS_C,
+		_use_openmp      => $Algorithm::Classifier::IsolationForest::HAS_OPENMP,
 	};
 
 	my $trees = $payload->{trees};
@@ -797,10 +922,14 @@ sub _score_inv {
 
 # Advance the stream by one (already prepped) row: every tree learns it
 # (subject to subsampling), it enters the window, and the oldest point
-# beyond the window is forgotten.
+# beyond the window is forgotten.  This is the single choke point through
+# which every tree mutation flows, so it is also where the packed C
+# scoring snapshot gets invalidated.
 sub _learn_row {
 	my ( $self, $r ) = @_;
 	my $sub = $self->{subsample};
+
+	$self->_invalidate_c_trees;
 
 	for my $tree ( @{ $self->{trees} } ) {
 		next if $sub < 1 && rand() >= $sub;
@@ -1040,6 +1169,104 @@ sub _score_row {
 		$sum += $self->_depth_of( $r, $tree->{root} ) if defined $tree->{root};
 	}
 	return exp( -$sum * $self->_score_inv );
+}
+
+#-------------------------------------------------------------------------------
+# C-accelerated scoring.
+#
+# The parent class's Inline::C scorer walks immutable packed node buffers;
+# online trees mutate on every learned point.  The bridge is a lazily
+# built snapshot: the first scoring call after any mutation flattens the
+# live trees into the parent's packed node layout (below) and every
+# scoring call until the next mutation reuses it.  _learn_row -- the one
+# choke point all mutations flow through -- drops the snapshot.
+#
+# Online trees are axis-only, so they map onto the parent's 6-double node
+# records directly:
+#
+#   leaf:  [0, count, _rpl(count), 0, 0, 0]
+#   axis:  [1, attr,  split,       li, ri, 0]
+#
+# The parent packs c(leaf size) into slot 2 and its C walker returns
+# depth + slot2 at a leaf; packing the online depth-budget adjustment
+# _rpl(count) there instead makes score_all_xs compute exactly the
+# pure-Perl _depth_of value, so every downstream C helper (finalize_*,
+# predict_sums_xs, score_predict_*) applies unchanged.  The per-tree
+# coefficient buffers are empty -- there are no oblique nodes -- and only
+# exist because score_all_xs expects them.
+#
+# score_learn deliberately never uses this path: it mutates the trees
+# after every single point, so the snapshot could never be reused and
+# repacking per point would cost more than the walks it replaces.
+#-------------------------------------------------------------------------------
+
+# Drop the packed snapshot; called on every mutation.
+sub _invalidate_c_trees {
+	delete @{ $_[0] }{qw(_c_nodes _c_coef_idx _c_coef_val)};
+	return;
+}
+
+# Build (or reuse) the packed snapshot.  Returns true when the C scoring
+# path may be taken, false when the caller must use the pure-Perl walk.
+sub _ensure_c_trees {
+	my ($self) = @_;
+	return 0 unless $self->{_use_c};
+	return 1 if $self->{_c_nodes};
+
+	my ( @c_nodes, @c_coef_idx, @c_coef_val );
+	my $empty_idx = pack('l*');
+	my $empty_val = pack('d*');
+	for my $tree ( @{ $self->{trees} } ) {
+		push @c_nodes,    $self->_pack_online_tree( $tree->{root} );
+		push @c_coef_idx, $empty_idx;
+		push @c_coef_val, $empty_val;
+	}
+	$self->{_c_nodes}    = \@c_nodes;
+	$self->{_c_coef_idx} = \@c_coef_idx;
+	$self->{_c_coef_val} = \@c_coef_val;
+	return 1;
+} ## end sub _ensure_c_trees
+
+# Flatten one live tree into the parent's packed node buffer (DFS
+# pre-order, root at index 0 -- the origin score_all_xs walks from).
+sub _pack_online_tree {
+	my ( $self, $root ) = @_;
+
+	# A tree that has not learned anything walks as depth 0 with a zero
+	# adjustment: one empty leaf record.
+	return pack( 'd*', 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ) unless defined $root;
+
+	my @node_data;
+	my $assign;
+	$assign = sub {
+		my ($node) = @_;
+		my $my_idx = scalar @node_data;
+		push @node_data, undef;    # reserve slot; filled in after children
+		if ( $node->[_N_TYPE] == _NT_LEAF ) {
+			$node_data[$my_idx]
+				= [ 0.0, $node->[_N_COUNT] + 0.0, $self->_rpl( $node->[_N_COUNT] ) + 0.0, 0.0, 0.0, 0.0 ];
+		} else {
+			my $li = $assign->( $node->[_N_LEFT] );
+			my $ri = $assign->( $node->[_N_RIGHT] );
+			$node_data[$my_idx]
+				= [ 1.0, $node->[_N_ATTR] + 0.0, $node->[_N_SPLIT] + 0.0, $li + 0.0, $ri + 0.0, 0.0 ];
+		}
+		return $my_idx;
+	}; ## end $assign = sub
+	$assign->($root);
+	return pack( 'd*', map { @$_ } @node_data );
+} ## end sub _pack_online_tree
+
+# Pack the query rows into the row-major double buffer score_all_xs
+# reads, via the parent's C row walker.  miss_mode 0 maps an undef cell
+# to 0.0, matching the pure-Perl walk's "// 0".
+sub _pack_input {
+	my ( $self, $data ) = @_;
+	my $n_pts    = scalar @$data;
+	my $nf       = $self->{n_features};
+	my $x_packed = "\0" x ( $n_pts * $nf * 8 );
+	Algorithm::Classifier::IsolationForest::pack_input_xs( $data, $x_packed, $n_pts, $nf, 0, '' );
+	return ( $n_pts, $x_packed );
 }
 
 # Lazily learn the contamination threshold from the current window the

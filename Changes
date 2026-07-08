@@ -12,8 +12,23 @@ Revision history for Algorithm-Classifier-IsolationForest
           under-populated subtrees. Supports prequential score_learn,
           contamination thresholds relearnable from the window, tagged
           rows, and JSON persistence that keeps the window so a reloaded
-          model resumes the stream. Pure Perl (the C accelerator assumes
-          immutable trees and does not apply).
+          model resumes the stream.
+        - Online batch scoring (score_samples, predict, path_lengths,
+          score_predict_samples, score_predict_split, and the
+          contamination threshold relearning built on them) runs through
+          the existing Inline::C/OpenMP backend: online trees are
+          axis-only, so they pack into the batch scorer's node layout
+          with the online depth-budget adjustment riding in the leaf
+          slot the batch packer uses for c(size) -- no new C code. The
+          packed snapshot is built lazily and dropped on any learn;
+          results are bit-identical to the pure-Perl fallback (use_c /
+          use_openmp knobs match the parent's semantics). Measured ~60x
+          single-threaded and 250x+ with OpenMP at 100 trees x 1000+
+          query points; ~17x even when every scoring call follows a
+          learned point and pays the repack. Learning and score_learn
+          remain pure Perl (the trees mutate per point, so a per-point
+          snapshot could never be reused). New benchmark script
+          benchmarking/bench-online-score-accel.pl.
         - New `iforest stream` subcommand: creates or resumes an online
           model, streams CSV rows through it (prequential by default,
           --learn-only / --score-only variants), and saves the updated
