@@ -20,6 +20,16 @@ Revision history for Algorithm-Classifier-IsolationForest
           state back.
         - `iforest info` and the parent class's load()/from_json()
           recognise online models via their stored format tag.
+        - New cross-language test t/80-sklearn-comparison-online.t
+          (skipped without Python/scikit-learn): streams datasets of 2
+          to 20 features through the online model and verifies its
+          scores approach and match sklearn's batch IsolationForest --
+          anomaly top-8 agreement and score-gap checks at every
+          dimensionality, plus Spearman rank-correlation convergence
+          checkpoints where the algorithm's box-sampling resolution
+          permits (the achievable full-ranking correlation ceiling
+          falls with n_features by design; measured calibration tables
+          are in the test's header comment).
 
 0.5.0   2026-07-04/14:30
         - Wide-NV perls (-Duselongdouble / -Dusequadmath(maybe? does this

@@ -29,6 +29,7 @@ t/50-contamination.t
 t/60-extended-mode.t
 t/70-persistence.t
 t/80-sklearn-comparison-undef.t
+t/80-sklearn-comparison-online.t
 t/80-sklearn-comparison.t
 t/31-undef-column-no-warnings.t
 t/32-pack-data.t
