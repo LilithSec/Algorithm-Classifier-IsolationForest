@@ -226,7 +226,36 @@ Inits the object.
       default :: die
 
   - feature_names :: optional arrayref of per-feature labels enabling the
-          *_tagged methods.
+          *_tagged methods (and required by mungers below).
+      default :: undef
+
+  - mungers :: optional hashref of declarative L<Algorithm::ToNumberMunger>
+          specs; every tagged row (learn_tagged, score_learn_tagged, the
+          scoring *_tagged methods, tagged_row_to_array) is munged from
+          raw values into numbers through the compiled plan, and
+          munge_rows() applies the scalar mungers to positional rows.
+          Requires feature_names; spec errors croak here.  The spec is
+          saved with the model.  Identical semantics to the parent
+          class's knob -- see MUNGERS in
+          L<Algorithm::Classifier::IsolationForest> for details and
+          caveats.
+      default :: undef
+
+  - schema_version :: optional opaque string identifying the revision of
+          the variable schema this model was built against.  Never
+          parsed; saved with the model.  Usually set via a prototype --
+          see PROTOTYPES in L<Algorithm::Classifier::IsolationForest>
+          (whose new_from_prototype creates online models too).
+      default :: undef
+
+  - schema_description :: optional opaque free-text description of what
+          the variable schema is.  Same handling as schema_version.
+      default :: undef
+
+  - feature_descriptions :: optional hashref of 'feature name => free
+          text' describing individual features.  Requires feature_names;
+          every key must name an entry there or new() croaks.  Partial
+          coverage is fine.  Saved with the model.
       default :: undef
 
   - use_c :: boolean, override whether the parent class's Inline::C
@@ -278,23 +307,51 @@ sub new {
 	$use_openmp = 0 unless $use_c;
 
 	my $self = {
-		n_trees          => $args{n_trees} // 100,
-		window_size      => $window_size,
-		max_leaf_samples => $args{max_leaf_samples} // 32,
-		growth           => $growth,
-		subsample        => $args{subsample} // 1.0,
-		seed             => $args{seed},
-		contamination    => $args{contamination},
-		missing          => $missing,
-		feature_names    => $args{feature_names},
-		threshold        => undef,                           # learned lazily if contamination set
-		n_features       => undef,                           # learned from the first row
-		seen             => 0,                               # total points learned over the model's lifetime
-		window           => [],                              # the retained rows, oldest first
-		trees            => [],
-		_use_c           => $use_c,
-		_use_openmp      => $use_openmp,
+		n_trees              => $args{n_trees} // 100,
+		window_size          => $window_size,
+		max_leaf_samples     => $args{max_leaf_samples} // 32,
+		growth               => $growth,
+		subsample            => $args{subsample} // 1.0,
+		seed                 => $args{seed},
+		contamination        => $args{contamination},
+		missing              => $missing,
+		feature_names        => $args{feature_names},
+		threshold            => undef,                           # learned lazily if contamination set
+		n_features           => undef,                           # learned from the first row
+		seen                 => 0,                               # total points learned over the model's lifetime
+		window               => [],                              # the retained rows, oldest first
+		trees                => [],
+		mungers              => undef,                           # optional Algorithm::ToNumberMunger spec hash
+																 # Opaque schema metadata, usually set via the parent class's
+																 # new_from_prototype and persisted with the model.
+		schema_version       => $args{schema_version},
+		schema_description   => $args{schema_description},
+		feature_descriptions => $args{feature_descriptions},
+		_use_c               => $use_c,
+		_use_openmp          => $use_openmp,
 	};
+
+	for my $doc (qw(schema_version schema_description)) {
+		croak "$doc must be a plain string"
+			if defined $self->{$doc} && ref $self->{$doc};
+	}
+	Algorithm::Classifier::IsolationForest::_validate_feature_descriptions( $self->{feature_names},
+		$self->{feature_descriptions} )
+		if defined $self->{feature_descriptions};
+
+	# Optional Algorithm::ToNumberMunger integration, identical to the
+	# parent's: compiled eagerly so spec errors surface here; the module
+	# is only required when a spec is actually given.
+	if ( defined $args{mungers} ) {
+		croak "mungers must be a hashref of 'tag => munger spec'"
+			unless ref $args{mungers} eq 'HASH';
+		croak "mungers requires feature_names (the munger plan compiles against them)"
+			unless ref $self->{feature_names} eq 'ARRAY' && @{ $self->{feature_names} };
+		$self->{mungers} = $args{mungers};
+		$self->{_munger_plan}
+			= Algorithm::Classifier::IsolationForest::_compile_mungers( $self->{feature_names}, $self->{mungers} );
+		$self->{munger_module_version} = $Algorithm::ToNumberMunger::VERSION;
+	} ## end if ( defined $args{mungers} )
 
 	croak "n_trees must be >= 1"          unless $self->{n_trees} >= 1;
 	croak "max_leaf_samples must be >= 1" unless $self->{max_leaf_samples} >= 1;
@@ -343,20 +400,34 @@ sub learn {
 
 =head2 learn_tagged(\%row)
 
-Learns a single sample supplied as a hashref of named feature values.
-The model must have C<feature_names> set.  Returns C<$self>.
+=head2 learn_tagged(\@rows)
+
+Learns one sample supplied as a hashref of named feature values, or a
+whole batch supplied as an arrayref of such hashrefs, in stream order.
+The model must have C<feature_names> set.  Rows go through
+L</tagged_row_to_array> (and therefore through the munger plan when
+C<mungers> is configured).  Returns C<$self>.
 
     $oif->learn_tagged({ cpu => 0.9, mem => 0.4, disk => 0.1 });
+    $oif->learn_tagged(\@hashref_rows);
 
-Croaks under the same conditions as L</tagged_row_to_array>.
+Croaks under the same conditions as L</tagged_row_to_array>, naming the
+offending row by index in the batch form.
 
 =cut
 
 sub learn_tagged {
 	my ( $self, $row ) = @_;
+	if ( ref $row eq 'ARRAY' ) {
+		my @rows;
+		for my $i ( 0 .. $#$row ) {
+			push @rows, $self->tagged_row_to_array( $row->[$i], "learn_tagged (row $i)" );
+		}
+		return $self->learn( \@rows );
+	}
 	my $vec = $self->tagged_row_to_array( $row, 'learn_tagged' );
 	return $self->learn( [$vec] );
-}
+} ## end sub learn_tagged
 
 =head2 score_learn(\@data)
 
@@ -712,6 +783,36 @@ undef if none were provided.
 
 sub feature_names { return $_[0]->{feature_names} }
 
+=head2 schema_version
+
+Returns the user-owned schema version string stored with the model
+(usually via a prototype -- see PROTOTYPES in
+L<Algorithm::Classifier::IsolationForest>), or undef if none was
+recorded.
+
+=cut
+
+sub schema_version { return $_[0]->{schema_version} }
+
+=head2 schema_description
+
+Returns the free-text description of the variable schema stored with the
+model, or undef if none was recorded.
+
+=cut
+
+sub schema_description { return $_[0]->{schema_description} }
+
+=head2 feature_descriptions
+
+Returns the hashref of per-feature description strings stored with the
+model, or undef if none were recorded.  Keys are feature names; coverage
+may be partial.
+
+=cut
+
+sub feature_descriptions { return $_[0]->{feature_descriptions} }
+
 =head2 window_count
 
 Returns how many points the model currently retains in its sliding
@@ -744,6 +845,19 @@ sub tagged_row_to_array {
 	return Algorithm::Classifier::IsolationForest::tagged_row_to_array( $self, @_ );
 }
 
+=head2 munge_rows(\@rows)
+
+Applies the model's scalar mungers to positional rows, exactly as the
+parent class's method of the same name (to which it delegates); a model
+without C<mungers> returns the input unchanged.
+
+=cut
+
+sub munge_rows {
+	my $self = shift;
+	return Algorithm::Classifier::IsolationForest::munge_rows( $self, @_ );
+}
+
 =head1 MODEL SAVE/LOAD METHODS
 
 Persistence keeps the sliding window alongside the trees, so a reloaded
@@ -767,17 +881,22 @@ sub to_json {
 		format  => 'Algorithm::Classifier::IsolationForest::Online',
 		version => 1,
 		params  => {
-			n_trees          => $self->{n_trees},
-			window_size      => $self->{window_size},
-			max_leaf_samples => $self->{max_leaf_samples},
-			growth           => $self->{growth},
-			subsample        => $self->{subsample},
-			contamination    => $self->{contamination},
-			threshold        => $self->{threshold},
-			n_features       => $self->{n_features},
-			missing          => $self->{missing},
-			feature_names    => $self->{feature_names},
-			seen             => $self->{seen},
+			n_trees               => $self->{n_trees},
+			window_size           => $self->{window_size},
+			max_leaf_samples      => $self->{max_leaf_samples},
+			growth                => $self->{growth},
+			subsample             => $self->{subsample},
+			contamination         => $self->{contamination},
+			threshold             => $self->{threshold},
+			n_features            => $self->{n_features},
+			missing               => $self->{missing},
+			feature_names         => $self->{feature_names},
+			seen                  => $self->{seen},
+			mungers               => $self->{mungers},
+			munger_module_version => $self->{munger_module_version},
+			schema_version        => $self->{schema_version},
+			schema_description    => $self->{schema_description},
+			feature_descriptions  => $self->{feature_descriptions},
 		},
 		trees  => [ map { { count => $_->{count}, root => $_->{root} } } @{ $self->{trees} } ],
 		window => $self->{window},
@@ -815,11 +934,19 @@ sub from_json {
 		n_features       => $p->{n_features},
 		missing          => $p->{missing} // 'die',
 		feature_names    => $p->{feature_names},
-		seen             => $p->{seen}         // 0,
-		window           => $payload->{window} // [],
-		trees            => [],
-		_use_c           => $Algorithm::Classifier::IsolationForest::HAS_C,
-		_use_openmp      => $Algorithm::Classifier::IsolationForest::HAS_OPENMP,
+		# Recompiled lazily on first tagged use, like the parent.
+		mungers               => $p->{mungers},
+		munger_module_version => $p->{munger_module_version},
+		# Opaque schema metadata; absent in models saved before prototype
+		# support, which just means "none recorded".
+		schema_version       => $p->{schema_version},
+		schema_description   => $p->{schema_description},
+		feature_descriptions => $p->{feature_descriptions},
+		seen                 => $p->{seen}         // 0,
+		window               => $payload->{window} // [],
+		trees                => [],
+		_use_c               => $Algorithm::Classifier::IsolationForest::HAS_C,
+		_use_openmp          => $Algorithm::Classifier::IsolationForest::HAS_OPENMP,
 	};
 
 	my $trees = $payload->{trees};
@@ -861,6 +988,57 @@ sub load {
 	my $raw_model = read_file($path);
 	return $class->from_json($raw_model);
 }
+
+=head2 to_prototype
+
+Returns a prototype JSON string extracted from this model: its variable
+schema (feature_names, feature_descriptions, mungers, missing policy)
+plus its current tuning knobs, with C<"class": "online">.  Identical
+semantics to the parent class's method -- see PROTOTYPES in
+L<Algorithm::Classifier::IsolationForest> for the file format and the
+croak/placeholder rules.  C<seed> is not emitted; pass it as an override
+when creating from the prototype.
+
+    my $proto_json = $oif->to_prototype;
+
+=cut
+
+sub to_prototype {
+	my ($self) = @_;
+	croak "to_prototype: this model has no feature_names; a prototype's variable " . "schema needs named features"
+		unless ref $self->{feature_names} eq 'ARRAY' && @{ $self->{feature_names} };
+
+	my $schema = {
+		feature_names => $self->{feature_names},
+		missing       => $self->{missing},
+	};
+	$schema->{feature_descriptions} = $self->{feature_descriptions}
+		if ref $self->{feature_descriptions} eq 'HASH' && %{ $self->{feature_descriptions} };
+	$schema->{mungers} = $self->{mungers}
+		if ref $self->{mungers} eq 'HASH' && %{ $self->{mungers} };
+
+	my $params = {
+		n_trees          => $self->{n_trees},
+		window_size      => $self->{window_size},
+		max_leaf_samples => $self->{max_leaf_samples},
+		growth           => $self->{growth},
+		subsample        => $self->{subsample},
+	};
+	$params->{contamination} = $self->{contamination} if defined $self->{contamination};
+
+	return JSON::PP->new->canonical(1)->encode(
+		{
+			format             => 'Algorithm::Classifier::IsolationForest::Prototype',
+			version            => 1,
+			class              => 'online',
+			schema_version     => $self->{schema_version} // '0',
+			schema_description => $self->{schema_description}
+				// '(none recorded; describe this schema and bump schema_version)',
+			schema => $schema,
+			params => $params,
+		}
+	);
+} ## end sub to_prototype
 
 =head1 REFERENCES
 

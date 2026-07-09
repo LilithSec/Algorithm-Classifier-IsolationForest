@@ -49,6 +49,21 @@ sub opt_spec {
 			't=s@',
 			'Feature name tag. Pass once per feature (e.g. -t cpu -t mem -t disk); the count must match the number of CSV columns or the command will die (new models only).'
 		],
+		[
+			'mungers=s',
+			'JSON file of Algorithm::ToNumberMunger specs, keyed by feature tag (new models only; requires -t). '
+				. 'Munged CSV columns may hold raw values; rows are munged before streaming and the spec is '
+				. 'saved with the model, so resumed runs munge identically. Scalar mungers only for CSV input.',
+			{ 'completion' => 'files' }
+		],
+		[
+			'prototype=s',
+			'JSON prototype file to create the model from (new models only): the variable schema and '
+				. 'schema_version/schema_description come from it, and its params supply knob defaults that the '
+				. 'creation switches override. May not be combined with -t or --mungers. See PROTOTYPES in the '
+				. 'module POD.',
+			{ 'completion' => 'files' }
+		],
 	);
 } ## end sub opt_spec
 
@@ -65,8 +80,11 @@ next invocation resumes the stream where this one left off.  --learn-only
 skips the scoring (warm-up) and --score-only skips the learning.
 
 If -m does not exist yet a new model is created using the creation knobs
-(-n, --window, --eta, --growth, --subsample, -s, -c, -t); when it does
-exist those knobs are ignored.
+(-n, --window, --eta, --growth, --subsample, -s, -c, -t, --mungers,
+--prototype); when it does exist those knobs are ignored.  With
+--prototype the schema and schema_version/schema_description come from
+the prototype file, its params supply knob defaults, and the other
+creation switches override those params.
 
 The input format matches `iforest fit`: CSV, all columns numeric
 features, one sample per row.
@@ -123,11 +141,86 @@ sub validate {
 		$self->usage_error( '--growth, "' . $opt->{'growth'} . '", must be either adaptive or fixed' );
 	}
 
+	if ( defined( $opt->{'mungers'} ) ) {
+		if ( !-f $opt->{'mungers'} ) {
+			$self->usage_error( '--mungers, "' . $opt->{'mungers'} . '", is not a file or does not exist' );
+		} elsif ( !-r $opt->{'mungers'} ) {
+			$self->usage_error( '--mungers, "' . $opt->{'mungers'} . '", is not readable' );
+		} elsif ( !defined( $opt->{'t'} ) ) {
+			$self->usage_error('--mungers requires feature tags (-t) to compile against');
+		}
+	}
+
+	if ( defined( $opt->{'prototype'} ) ) {
+		if ( !-f $opt->{'prototype'} ) {
+			$self->usage_error( '--prototype, "' . $opt->{'prototype'} . '", is not a file or does not exist' );
+		} elsif ( !-r $opt->{'prototype'} ) {
+			$self->usage_error( '--prototype, "' . $opt->{'prototype'} . '", is not readable' );
+		}
+		if ( defined( $opt->{'t'} ) || defined( $opt->{'mungers'} ) ) {
+			$self->usage_error(
+				'--prototype may not be combined with -t or --mungers; the schema comes only from the prototype');
+		}
+	} ## end if ( defined( $opt->{'prototype'} ) )
+
 	return 1;
 } ## end sub validate
 
 sub execute {
 	my ( $self, $opt, $args ) = @_;
+
+	# --- resume an existing model first ------------------------------------
+	# Loaded before the CSV is read because a munger-bearing model changes
+	# how the CSV is validated (munged columns hold raw values).
+	my $oif;
+	if ( -f $opt->{'m'} ) {
+		$oif = Algorithm::Classifier::IsolationForest->load( $opt->{'m'} );
+		die( '-m, "' . $opt->{'m'} . '", is not an online model; stream only works on those' . "\n" )
+			unless ref $oif eq 'Algorithm::Classifier::IsolationForest::Online';
+	}
+
+	# Prototype creation, new models only like the other creation knobs.
+	# Done before the CSV is read for the same reason resuming is: a
+	# munger-bearing prototype changes how the CSV is validated.  The
+	# explicit creation switches override the prototype's params.
+	my $from_proto = 0;
+	if ( !$oif && defined( $opt->{'prototype'} ) ) {
+		my $proto = eval {
+			Algorithm::Classifier::IsolationForest->validate_prototype( scalar read_file( $opt->{'prototype'} ) );
+		};
+		die( '--prototype, "' . $opt->{'prototype'} . '", is not a valid prototype: ' . $@ ) if $@;
+		die( '--prototype, "' . $opt->{'prototype'} . '", is for a batch model; use `iforest fit`' . "\n" )
+			unless $proto->{class} eq 'online';
+
+		my %overrides;
+		$overrides{'n_trees'}          = $opt->{'n'}         if defined $opt->{'n'};
+		$overrides{'window_size'}      = $opt->{'window'}    if defined $opt->{'window'};
+		$overrides{'max_leaf_samples'} = $opt->{'eta'}       if defined $opt->{'eta'};
+		$overrides{'growth'}           = $opt->{'growth'}    if defined $opt->{'growth'};
+		$overrides{'subsample'}        = $opt->{'subsample'} if defined $opt->{'subsample'};
+		$overrides{'seed'}             = $opt->{'s'}         if defined $opt->{'s'};
+		$overrides{'contamination'}    = $opt->{'c'}         if defined $opt->{'c'};
+
+		$oif = eval { Algorithm::Classifier::IsolationForest->new_from_prototype( $proto, %overrides ) };
+		die( '--prototype, "' . $opt->{'prototype'} . '", failed to create a model: ' . $@ ) if $@;
+		$from_proto = 1;
+	} ## end if ( !$oif && defined( $opt->{'prototype'}...))
+
+	# Munger spec for a NEW model (an existing model carries its own; the
+	# creation knob is ignored then, like the rest of them).
+	my $mungers;
+	if ( !$oif && defined( $opt->{'mungers'} ) ) {
+		require JSON::PP;
+		$mungers = eval { JSON::PP->new->decode( scalar read_file( $opt->{'mungers'} ) ) };
+		die( '--mungers, "' . $opt->{'mungers'} . '", did not parse as JSON: ' . $@ ) if $@;
+		die( '--mungers, "' . $opt->{'mungers'} . '", must be a JSON object of tag => spec' )
+			unless ref $mungers eq 'HASH';
+	}
+
+	my $has_mungers
+		= $oif
+		? ( ref $oif->{mungers} eq 'HASH' && %{ $oif->{mungers} } ? 1 : 0 )
+		: ( $mungers                                              ? 1 : 0 );
 
 	# --- read the CSV, exactly like `iforest fit` does -------------------
 	my @data;
@@ -154,31 +247,41 @@ sub execute {
 					. $expected_cols );
 		}
 
-		my $col_int = 1;
-		for my $field (@fields) {
-			die(      'Line '
-					. $line_int . ' of "'
-					. $opt->{'i'}
-					. '" value for column '
-					. $col_int . ',"'
-					. $field
-					. '", does not appear to be a number' )
-				unless looks_like_number($field);
-			$col_int++;
-		} ## end for my $field (@fields)
+		if ( !$has_mungers ) {
+			my $col_int = 1;
+			for my $field (@fields) {
+				die(      'Line '
+						. $line_int . ' of "'
+						. $opt->{'i'}
+						. '" value for column '
+						. $col_int . ',"'
+						. $field
+						. '", does not appear to be a number' )
+					unless looks_like_number($field);
+				$col_int++;
+			} ## end for my $field (@fields)
+		} ## end if ( !$has_mungers )
 
 		push @data, \@fields;
 
 		$line_int++;
 	} ## end foreach my $line ( read_file( $opt->{'i'} ) )
 
-	# --- load or create the model ----------------------------------------
-	my $oif;
-	if ( -f $opt->{'m'} ) {
-		$oif = Algorithm::Classifier::IsolationForest->load( $opt->{'m'} );
-		die( '-m, "' . $opt->{'m'} . '", is not an online model; stream only works on those' . "\n" )
-			unless ref $oif eq 'Algorithm::Classifier::IsolationForest::Online';
-	} else {
+	# A prototype-created model already carries its tags; hold them to the
+	# same CSV-width check the -t path gets.
+	if ($from_proto) {
+		my $n_tags     = scalar @{ $oif->feature_names };
+		my $n_features = defined($expected_cols) ? $expected_cols : 0;
+		die(      'Number of prototype feature_names ('
+				. $n_tags
+				. ') does not match number of CSV columns ('
+				. $n_features
+				. ')' )
+			unless $n_tags == $n_features;
+	} ## end if ($from_proto)
+
+	# --- create the model when not resuming --------------------------------
+	if ( !$oif ) {
 		if ( defined( $opt->{'t'} ) ) {
 			my $n_tags     = scalar @{ $opt->{'t'} };
 			my $n_features = defined($expected_cols) ? $expected_cols : 0;
@@ -194,19 +297,41 @@ sub execute {
 			'seed'             => $opt->{'s'},
 			'contamination'    => $opt->{'c'},
 			'feature_names'    => $opt->{'t'},
+			'mungers'          => $mungers,
 		);
-	} ## end else [ if ( -f $opt->{'m'} ) ]
+	} ## end if ( !$oif )
+
+	# Munge the raw rows into numbers, then run the numeric validation
+	# that was skipped at read time.  Munged into a separate structure so
+	# -d still prints the raw input columns as given.
+	my $stream_rows = \@data;
+	if ($has_mungers) {
+		my $munged = $oif->munge_rows( \@data );
+		for my $i ( 0 .. $#$munged ) {
+			for my $col ( 0 .. $#{ $munged->[$i] } ) {
+				die(      'Line '
+						. ( $i + 1 ) . ' of "'
+						. $opt->{'i'}
+						. '" value for column '
+						. ( $col + 1 ) . ',"'
+						. ( defined $munged->[$i][$col] ? $munged->[$i][$col] : 'undef' )
+						. '", is not a number after munging' )
+					unless looks_like_number( $munged->[$i][$col] );
+			} ## end for my $col ( 0 .. $#{ $munged->[$i] } )
+		} ## end for my $i ( 0 .. $#$munged )
+		$stream_rows = $munged;
+	} ## end if ($has_mungers)
 
 	# --- stream ------------------------------------------------------------
 	my $results_string = '';
 	if ( $opt->{'learn_only'} ) {
-		$oif->learn( \@data );
+		$oif->learn($stream_rows);
 	} else {
 		my $scores;
 		if ( $opt->{'score_only'} ) {
-			$scores = $oif->score_samples( \@data );
+			$scores = $oif->score_samples($stream_rows);
 		} else {
-			$scores = $oif->score_learn( \@data );
+			$scores = $oif->score_learn($stream_rows);
 		}
 
 		my $threshold

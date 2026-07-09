@@ -148,17 +148,22 @@ my %WriteMakefileArgs = (
 		'List::Util' => '0',
 	},
 	PREREQ_PM => {
-		'App::Cmd'     => '0',
-		'Carp'         => '0',
-		'Config'       => '0',
-		'File::Slurp'  => '0',
-		'File::Spec'   => '0',
-		'File::Temp'   => '0',
-		'JSON::PP'     => '0',
-		'List::Util'   => '0',
-		'POSIX'        => '0',
-		'Scalar::Util' => '0',
-		'Storable'     => '0',
+		'App::Cmd'    => '0',
+		'Carp'        => '0',
+		'Config'      => '0',
+		'File::Slurp' => '0',
+		'File::Spec'  => '0',
+		'File::Temp'  => '0',
+		'JSON::PP'    => '0',
+
+		# iforest streamd's wire protocol; XS-backed JSON when available,
+		# pure-Perl JSON::PP fallback otherwise, so it is safe as a hard
+		# prereq (streamd itself also degrades to a clear error without it).
+		'JSON::MaybeXS' => '0',
+		'List::Util'    => '0',
+		'POSIX'         => '0',
+		'Scalar::Util'  => '0',
+		'Storable'      => '0',
 	},
 	dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
 	clean => {
@@ -177,6 +182,11 @@ my %WriteMakefileArgs = (
 				recommends => {
 					'Inline'    => '0',
 					'Inline::C' => '0',
+
+					# Unlocks the mungers knob: declarative raw-value ->
+					# number munging for tagged data, with the spec saved
+					# in the model.  Everything else works without it.
+					'Algorithm::ToNumberMunger' => '0.01',
 				},
 			},
 		},

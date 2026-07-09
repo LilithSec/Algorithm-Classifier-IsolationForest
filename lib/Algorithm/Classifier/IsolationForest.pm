@@ -2686,6 +2686,47 @@ Inits the object.
           linked in.
         default :: 0
 
+    - feature_names :: optional arrayref of per-feature labels enabling the
+          *_tagged methods (and required by mungers below).
+        default :: undef
+
+    - mungers :: optional hashref of declarative L<Algorithm::ToNumberMunger>
+          specs, keyed as that module's compile() expects (scalar mungers by
+          their output tag, expanding mungers by any label with an 'into'
+          list, combining mungers by their output tag with a 'from' list).
+          When set, every tagged row -- the *_tagged methods, fit_tagged,
+          and tagged_row_to_array -- is munged from raw values (strings,
+          timestamps, status codes, ...) into numbers through the compiled
+          plan, and munge_rows() applies the scalar mungers to positional
+          rows.  Requires feature_names; the plan compiles against them, so
+          any spec error croaks here in new().  Algorithm::ToNumberMunger is
+          an optional dependency, required only when a spec is given (or a
+          loaded model carrying one is used with tagged data).  The spec is
+          saved with the model, so a loaded model munges scoring input
+          exactly as it did training input.  See L</MUNGERS> for details
+          and caveats.
+        default :: undef
+
+    - schema_version :: optional opaque string identifying the revision of
+          the variable schema this model was built against.  Never parsed
+          or compared numerically; saved with the model and shown by
+          `iforest info`.  Usually set from a prototype (see
+          L</PROTOTYPES>) rather than passed directly.
+        default :: undef
+
+    - schema_description :: optional opaque free-text description of what
+          the variable schema is.  Same handling as schema_version.
+        default :: undef
+
+    - feature_descriptions :: optional hashref of 'feature name => free
+          text' describing individual features.  Requires feature_names;
+          every key must name an entry there (a description for a feature
+          that does not exist croaks -- it is either a typo or a stale
+          leftover from a schema change).  Partial coverage is fine.
+          Saved with the model and shown beside each tag by
+          `iforest info`.
+        default :: undef
+
 Note: log2 under Perl is as below...
 
     log($psi) / log(2)
@@ -2754,27 +2795,56 @@ sub new {
 	my $use_openmp_fit = ( $args{use_openmp_fit} && $HAS_OPENMP && $use_c ) ? 1 : 0;
 
 	my $self = {
-		n_trees         => $args{n_trees}     // 100,
-		sample_size     => $args{sample_size} // 256,
-		max_depth       => $args{max_depth},          # undef => auto
-		seed            => $args{seed},               # undef => non-deterministic
-		mode            => $mode,
-		extension_level => $args{extension_level},    # undef => max, resolved in fit()
-		contamination   => $args{contamination},      # undef => no learned threshold
-		parallel_fit    => $args{parallel_fit},       # undef/0/1 => serial; N>1 => fork
-		missing         => $missing,                  # die|zero|impute|nan
-		impute_with     => $impute_with,              # mean|median (impute mode only)
-		voting          => $voting,                   # mean|majority (scoring-time aggregation)
-		missing_fill    => undef,                     # per-feature fill, learned in fit() if impute
-		_use_c          => $use_c,
-		_use_openmp     => $use_openmp,
-		_use_openmp_fit => $use_openmp_fit,
-		threshold       => undef,                     # learned in fit() if contamination set
-		trees           => [],
-		c_psi           => undef,                     # c(psi), set during fit()
-		n_features      => undef,
-		feature_names   => $args{feature_names},      # optional arrayref of per-feature labels
+		n_trees              => $args{n_trees}     // 100,
+		sample_size          => $args{sample_size} // 256,
+		max_depth            => $args{max_depth},              # undef => auto
+		seed                 => $args{seed},                   # undef => non-deterministic
+		mode                 => $mode,
+		extension_level      => $args{extension_level},        # undef => max, resolved in fit()
+		contamination        => $args{contamination},          # undef => no learned threshold
+		parallel_fit         => $args{parallel_fit},           # undef/0/1 => serial; N>1 => fork
+		missing              => $missing,                      # die|zero|impute|nan
+		impute_with          => $impute_with,                  # mean|median (impute mode only)
+		voting               => $voting,                       # mean|majority (scoring-time aggregation)
+		missing_fill         => undef,                         # per-feature fill, learned in fit() if impute
+		_use_c               => $use_c,
+		_use_openmp          => $use_openmp,
+		_use_openmp_fit      => $use_openmp_fit,
+		threshold            => undef,                         # learned in fit() if contamination set
+		trees                => [],
+		c_psi                => undef,                         # c(psi), set during fit()
+		n_features           => undef,
+		feature_names        => $args{feature_names},          # optional arrayref of per-feature labels
+		mungers              => undef,                         # optional Algorithm::ToNumberMunger spec hash
+															   # Opaque schema metadata, usually set via new_from_prototype and
+															   # persisted with the model.  Never parsed -- documentation that
+															   # travels with the model file.
+		schema_version       => $args{schema_version},
+		schema_description   => $args{schema_description},
+		feature_descriptions => $args{feature_descriptions},
 	};
+
+	for my $doc (qw(schema_version schema_description)) {
+		croak "$doc must be a plain string"
+			if defined $self->{$doc} && ref $self->{$doc};
+	}
+	_validate_feature_descriptions( $self->{feature_names}, $self->{feature_descriptions} )
+		if defined $self->{feature_descriptions};
+
+	# Optional Algorithm::ToNumberMunger integration: a declarative spec
+	# hash compiled into a plan that turns raw tagged values into numbers.
+	# Compiled eagerly so every spec error surfaces here rather than at
+	# first scoring; the module itself is only required when a spec is
+	# actually given, keeping it an optional dependency.
+	if ( defined $args{mungers} ) {
+		croak "mungers must be a hashref of 'tag => munger spec'"
+			unless ref $args{mungers} eq 'HASH';
+		croak "mungers requires feature_names (the munger plan compiles against them)"
+			unless ref $self->{feature_names} eq 'ARRAY' && @{ $self->{feature_names} };
+		$self->{mungers}               = $args{mungers};
+		$self->{_munger_plan}          = _compile_mungers( $self->{feature_names}, $self->{mungers} );
+		$self->{munger_module_version} = $Algorithm::ToNumberMunger::VERSION;
+	}
 
 	croak "n_trees must be >= 1"     unless $self->{n_trees} >= 1;
 	croak "sample_size must be >= 1" unless $self->{sample_size} >= 1;
@@ -2863,6 +2933,37 @@ if none were provided at fit time.
 =cut
 
 sub feature_names { return $_[0]->{feature_names} }
+
+=head2 schema_version
+
+Returns the user-owned schema version string stored with the model
+(usually via a prototype -- see L</PROTOTYPES>), or undef if none was
+recorded.
+
+    my $sv = $iforest->schema_version;
+
+=cut
+
+sub schema_version { return $_[0]->{schema_version} }
+
+=head2 schema_description
+
+Returns the free-text description of the variable schema stored with the
+model, or undef if none was recorded.
+
+=cut
+
+sub schema_description { return $_[0]->{schema_description} }
+
+=head2 feature_descriptions
+
+Returns the hashref of per-feature description strings stored with the
+model, or undef if none were recorded.  Keys are feature names; coverage
+may be partial.
+
+=cut
+
+sub feature_descriptions { return $_[0]->{feature_descriptions} }
 
 =head2 fit
 
@@ -3017,6 +3118,37 @@ sub fit {
 	$self->_rebuild_c_trees() if $self->{_use_c};
 	return $self;
 } ## end sub fit
+
+=head2 fit_tagged(\@rows)
+
+Trains the model on an arrayref of hashrefs of named feature values --
+the tagged counterpart of L</fit>.  Each row goes through
+L</tagged_row_to_array> (and therefore through the munger plan when
+C<mungers> is configured, which is the point: training data and scoring
+data are munged by the identical plan), then the positional rows are
+handed to C<fit>.
+
+    $iforest->fit_tagged([
+        { cpu => 0.9, mem => 0.4, disk => 0.1 },
+        { cpu => 0.2, mem => 0.3, disk => 0.2 },
+        ...
+    ]);
+
+Requires stored C<feature_names>.  Croaks under the same conditions as
+L</tagged_row_to_array>, naming the offending row by index.
+
+=cut
+
+sub fit_tagged {
+	my ( $self, $data ) = @_;
+	croak "fit_tagged() expects a non-empty arrayref of hashref samples"
+		unless ref $data eq 'ARRAY' && @$data;
+	my @rows;
+	for my $i ( 0 .. $#$data ) {
+		push @rows, $self->tagged_row_to_array( $data->[$i], "fit_tagged (row $i)" );
+	}
+	return $self->fit( \@rows );
+} ## end sub fit_tagged
 
 =head2 pack_data(\@data)
 
@@ -3247,6 +3379,18 @@ sub tagged_row_to_array {
 	my ( $self, $row, $caller ) = @_;
 	croak "$caller requires a hashref"
 		unless ref $row eq 'HASH';
+
+	# With mungers configured the compiled plan owns the row assembly:
+	# it knows the real input fields (munger 'from' sources included,
+	# which need not be tags at all) and croaks on a missing one.  Extra
+	# keys are ignored -- with expanders and combiners in play, "the
+	# exact key set" is the plan's knowledge, not feature_names'.
+	if ( my $plan = _plan($self) ) {
+		my $vec = eval { $plan->apply_named($row) };
+		croak "$caller: $@" if $@;
+		return $vec;
+	}
+
 	croak "this model has no stored feature_names; " . "refit with -t tags or pass feature_names to new()"
 		unless defined $self->{feature_names}
 		&& ref $self->{feature_names} eq 'ARRAY'
@@ -3274,6 +3418,36 @@ sub predict_tagged {
 	my $result = $self->predict( [$vec], $threshold );
 	return $result->[0];
 }
+
+=head2 munge_rows(\@rows)
+
+Applies the model's scalar mungers to positional rows (arrayrefs in
+C<feature_names> order), returning a new arrayref of munged rows.  A
+model without C<mungers> returns the input unchanged, so callers such
+as the CLI can pass every dataset through unconditionally.
+
+Croaks if the munger set contains expanding or combining mungers --
+their inputs are named source fields that positional rows cannot
+express; use the tagged methods (or L</fit_tagged>) for those.
+
+    my $numeric = $iforest->munge_rows(\@raw_rows);
+
+=cut
+
+sub munge_rows {
+	my ( $self, $rows ) = @_;
+	croak "munge_rows() expects an arrayref of rows"
+		unless ref $rows eq 'ARRAY';
+	my $plan = _plan($self);
+	return $rows unless $plan;
+	my @out;
+	for my $i ( 0 .. $#$rows ) {
+		my $munged = eval { $plan->apply_positional( $rows->[$i] ) };
+		croak "munge_rows (row $i): $@" if $@;
+		push @out, $munged;
+	}
+	return \@out;
+} ## end sub munge_rows
 
 =head2 score_samples(\@data)
 
@@ -3619,6 +3793,68 @@ sub score_predict_split {
 	return ( $scores, \@labels );
 } ## end sub score_predict_split
 
+=head1 MUNGERS
+
+With the optional L<Algorithm::ToNumberMunger> module, a model can carry
+a declarative munger spec (see C<mungers> under L</new(%args)>) that
+turns raw tagged values -- strings, timestamps, status codes, IPs --
+into the numbers the forest needs, so callers hand the model the data
+they actually have:
+
+    my $forest = Algorithm::Classifier::IsolationForest->new(
+        feature_names => [ 'method', 'bytes_log', 'host_entropy' ],
+        mungers       => {
+            method       => { munger => 'http_method_enum', default => -1 },
+            bytes_log    => { munger => 'log', offset => 1, from => 'bytes' },
+            host_entropy => { munger => 'entropy', from => 'host' },
+        },
+    );
+    $forest->fit_tagged(\@raw_rows);
+    my $score = $forest->score_sample_tagged(
+        { method => 'POST', bytes => 51234, host => 'kq3xv9z2.example' } );
+
+The spec is pure data and is B<saved with the model>, so a loaded model
+munges scoring input exactly as it did training input -- the
+consistency that makes munging part of the model rather than an
+upstream preprocessing step.  Points worth knowing:
+
+=over 4
+
+=item * Only tagged input is munged.  Positional rows passed to C<fit>
+or the scoring methods are taken as already numeric; L</munge_rows>
+applies the scalar mungers to positional rows for callers (like the
+CLI) that want the same transformation there.  Packed datasets
+(L</pack_data(\@data)>) are never munged.
+
+=item * Under a munger plan, tagged-row validation is the plan's: a
+missing input field croaks (including munger C<from> sources, which
+need not be tags), while unknown extra keys are ignored rather than
+rejected.
+
+=item * Loading a model that carries mungers does not require
+Algorithm::ToNumberMunger -- inspection and positional scoring work
+without it; the first tagged call croaks with an install hint.  A
+munger name unknown to an older installed Algorithm::ToNumberMunger
+croaks naming it; the model records C<munger_module_version> (the
+version that authored the spec) to make that diagnosable.
+
+=item * Munging happens before the C<missing> strategy: for munged
+columns the strategy sees the munger's output, and most mungers define
+their own undef handling (C<length> counts undef as 0, C<enum> takes a
+C<default>, ...).  Raw columns behave exactly as without mungers.
+
+=item * Caveats inherited from the munger set: the C<eps> munger talks
+to an external service, so a saved model using it needs that service
+reachable wherever the model runs; C<frozen_freq_map>/C<ngram> count
+tables are part of the spec and therefore of the model file.
+
+=back
+
+The munger spec composes with everything else -- modes, voting,
+contamination, the C backend (munging is input-side; accelerated paths
+are unchanged) -- and works identically on
+L<Algorithm::Classifier::IsolationForest::Online>.
+
 =head1 MODEL SAVE/LOAD METHODS
 
 =head2 to_json
@@ -3638,21 +3874,26 @@ sub to_json {
 		format  => 'Algorithm::Classifier::IsolationForest',
 		version => 1,
 		params  => {
-			n_trees         => $self->{n_trees},
-			sample_size     => $self->{sample_size},
-			mode            => $self->{mode},
-			extension_level => $self->{extension_level_used},
-			contamination   => $self->{contamination},
-			threshold       => $self->{threshold},
-			n_features      => $self->{n_features},
-			psi_used        => $self->{psi_used},
-			c_psi           => $self->{c_psi},
-			max_depth_used  => $self->{max_depth_used},
-			missing         => $self->{missing},
-			impute_with     => $self->{impute_with},
-			missing_fill    => $self->{missing_fill},
-			feature_names   => $self->{feature_names},
-			voting          => $self->{voting},
+			n_trees               => $self->{n_trees},
+			sample_size           => $self->{sample_size},
+			mode                  => $self->{mode},
+			extension_level       => $self->{extension_level_used},
+			contamination         => $self->{contamination},
+			threshold             => $self->{threshold},
+			n_features            => $self->{n_features},
+			psi_used              => $self->{psi_used},
+			c_psi                 => $self->{c_psi},
+			max_depth_used        => $self->{max_depth_used},
+			missing               => $self->{missing},
+			impute_with           => $self->{impute_with},
+			missing_fill          => $self->{missing_fill},
+			feature_names         => $self->{feature_names},
+			voting                => $self->{voting},
+			mungers               => $self->{mungers},
+			munger_module_version => $self->{munger_module_version},
+			schema_version        => $self->{schema_version},
+			schema_description    => $self->{schema_description},
+			feature_descriptions  => $self->{feature_descriptions},
 		},
 		trees => $self->{trees},
 	};
@@ -3714,6 +3955,16 @@ sub from_json {
 		impute_with   => $p->{impute_with} // 'mean',
 		missing_fill  => $p->{missing_fill},
 		feature_names => $p->{feature_names},
+		# The munger plan is recompiled lazily on first tagged use, so a
+		# munger-bearing model still loads (and scores positional data)
+		# where Algorithm::ToNumberMunger is not installed.
+		mungers               => $p->{mungers},
+		munger_module_version => $p->{munger_module_version},
+		# Opaque schema metadata; absent in models saved before prototype
+		# support, which just means "none recorded".
+		schema_version       => $p->{schema_version},
+		schema_description   => $p->{schema_description},
+		feature_descriptions => $p->{feature_descriptions},
 		# Models saved before majority-voting support lack the key; 'mean'
 		# reproduces their behaviour exactly.
 		voting          => $p->{voting} // 'mean',
@@ -3760,6 +4011,317 @@ sub load {
 	my $raw_model = read_file($path);
 	return $class->from_json($raw_model);
 }
+
+=head1 PROTOTYPES
+
+A prototype is a small JSON document that describes what a model should
+be before any data exists: the variable schema (feature names in column
+order, plus their munger specs, per-feature descriptions, and missing
+policy), a user-owned C<schema_version> string, a human-readable
+C<schema_description>, and optionally the tuning knobs.  Creating a
+model from one -- L</new_from_prototype($proto, %overrides)> here, or
+C<--prototype> on C<iforest fit> / C<iforest stream> -- stamps the
+schema metadata into the model JSON, so every downstream consumer
+(C<iforest info>, resumed streams, your own tooling) can tell which
+revision of the input schema a model was built against.
+
+    {
+      "format": "Algorithm::Classifier::IsolationForest::Prototype",
+      "version": 1,
+      "class": "online",
+      "schema_version": "2026.07.08-1",
+      "schema_description": "HTTP request stream: method enum, path length, host entropy, raw byte count",
+      "schema": {
+        "feature_names": ["method", "path_len", "host_entropy", "bytes"],
+        "feature_descriptions": {
+          "method":       "HTTP request method, mapped via http_method_enum (-1 = unknown)",
+          "path_len":     "character length of the request path",
+          "host_entropy": "Shannon entropy of the Host header",
+          "bytes":        "raw response byte count, passed through unmunged"
+        },
+        "mungers": {
+          "method":       { "munger": "http_method_enum", "default": -1 },
+          "path_len":     { "munger": "length",  "from": "path" },
+          "host_entropy": { "munger": "entropy", "from": "host" }
+        },
+        "missing": "zero"
+      },
+      "params": {
+        "n_trees": 150,
+        "window_size": 4096,
+        "max_leaf_samples": 32,
+        "contamination": 0.02
+      }
+    }
+
+The fields, top to bottom...
+
+  - format :: required, always the string
+        'Algorithm::Classifier::IsolationForest::Prototype'.  A prototype
+        handed to load() (or a model handed to the prototype methods)
+        dies with a clear message instead of half-working.
+
+  - version :: the prototype format version; this release reads version 1.
+      default :: 1
+
+  - class :: required, 'batch' (this class) or 'online'
+        (L<Algorithm::Classifier::IsolationForest::Online>).  Prototypes
+        are self-describing; `iforest fit` refuses an online prototype
+        and `iforest stream` refuses a batch one.  Two model types with
+        the same variables means two prototype files.
+
+  - schema_version :: required opaque string, never parsed or compared
+        numerically.  User-owned: bump it when the variable schema
+        changes.
+
+  - schema_description :: required opaque free-text string describing
+        what this variable schema is, so a model file explains itself
+        months later.
+
+  - schema :: required object holding the variable schema.
+        feature_names is required (order = CSV column order); the
+        optional keys are feature_descriptions ('feature name => free
+        text', every key must name an entry in feature_names, partial
+        coverage fine), mungers (see L</MUNGERS>), missing, and -- batch
+        prototypes only -- impute_with.  Unknown keys croak.
+
+  - params :: optional object of tuning knobs, whitelisted per class.
+        Batch: n_trees, sample_size, max_depth, mode, extension_level,
+        contamination, voting, seed.  Online: n_trees, window_size,
+        max_leaf_samples, growth, subsample, contamination, seed.
+        Unknown keys croak -- a typo'd knob silently falling back to its
+        default is exactly the failure mode a prototype exists to
+        prevent.  Machine-local knobs (use_c, use_openmp, use_openmp_fit,
+        parallel_fit) are rejected: they describe the box the model runs
+        on, not the model.
+
+=cut
+
+# Per-class whitelists for a prototype's params block (and
+# new_from_prototype's %overrides) and its schema block.  Machine-local
+# knobs are deliberately absent from the params lists.
+my %PROTO_PARAM_KEYS = (
+	batch  => { map { $_ => 1 } qw(n_trees sample_size max_depth mode extension_level contamination voting seed) },
+	online => { map { $_ => 1 } qw(n_trees window_size max_leaf_samples growth subsample contamination seed) },
+);
+my %PROTO_SCHEMA_KEYS = (
+	batch  => { map { $_ => 1 } qw(feature_names feature_descriptions mungers missing impute_with) },
+	online => { map { $_ => 1 } qw(feature_names feature_descriptions mungers missing) },
+);
+
+=head2 validate_prototype($proto)
+
+Structurally validates a prototype -- a hashref or a JSON string -- and
+returns the decoded hashref; croaks describing the first problem found.
+Validation is structural only (no munger compilation), so it does not
+require Algorithm::ToNumberMunger even for a munger-bearing prototype.
+
+    my $proto = Algorithm::Classifier::IsolationForest->validate_prototype($json);
+
+=cut
+
+sub validate_prototype {
+	my ( $class, $proto ) = @_;
+
+	if ( !ref $proto ) {
+		my $decoded = eval { JSON::PP->new->decode($proto) };
+		croak "prototype did not parse as JSON: $@" if $@;
+		$proto = $decoded;
+	}
+	croak "not an IsolationForest prototype (expected a JSON object)"
+		unless ref $proto eq 'HASH';
+	croak "not an IsolationForest prototype (format is not " . "'Algorithm::Classifier::IsolationForest::Prototype')"
+		unless defined $proto->{format}
+		&& !ref $proto->{format}
+		&& $proto->{format} eq 'Algorithm::Classifier::IsolationForest::Prototype';
+
+	my $version = $proto->{version} // 1;
+	croak "prototype format version '$version' is newer than this module understands (max 1)"
+		if !ref $version && $version =~ /^\d+$/ && $version > 1;
+
+	for my $k ( sort keys %$proto ) {
+		croak "prototype has unknown top-level key '$k'"
+			unless $k =~ /\A(?:format|version|class|schema_version|schema_description|schema|params)\z/;
+	}
+
+	my $which = $proto->{class};
+	croak "prototype needs a class of 'batch' or 'online'"
+		unless defined $which && !ref $which && $which =~ /\A(?:batch|online)\z/;
+
+	for my $req (qw(schema_version schema_description)) {
+		croak "prototype needs a non-empty $req string"
+			unless defined $proto->{$req} && !ref $proto->{$req} && length $proto->{$req};
+	}
+
+	my $schema = $proto->{schema};
+	croak "prototype needs a schema object" unless ref $schema eq 'HASH';
+	for my $k ( sort keys %$schema ) {
+		croak "prototype schema has unknown key '$k' for a $which prototype (allowed: "
+			. join( ', ', sort keys %{ $PROTO_SCHEMA_KEYS{$which} } ) . ')'
+			unless $PROTO_SCHEMA_KEYS{$which}{$k};
+	}
+	my $tags = $schema->{feature_names};
+	croak "prototype schema needs a non-empty feature_names array"
+		unless ref $tags eq 'ARRAY' && @$tags;
+	for my $t (@$tags) {
+		croak "prototype feature_names entries must be non-empty strings"
+			unless defined $t && !ref $t && length $t;
+	}
+	_validate_feature_descriptions( $tags, $schema->{feature_descriptions} )
+		if defined $schema->{feature_descriptions};
+	croak "prototype schema mungers must be an object of 'tag => munger spec'"
+		if defined $schema->{mungers} && ref $schema->{mungers} ne 'HASH';
+	for my $str (qw(missing impute_with)) {
+		croak "prototype schema $str must be a plain string"
+			if defined $schema->{$str} && ref $schema->{$str};
+	}
+
+	my $params = $proto->{params};
+	croak "prototype params must be an object of tuning knobs"
+		if defined $params && ref $params ne 'HASH';
+	for my $k ( sort keys %{ $params || {} } ) {
+		croak "prototype params has unknown key '$k' for a $which prototype (allowed: "
+			. join( ', ', sort keys %{ $PROTO_PARAM_KEYS{$which} } )
+			. '; machine-local knobs like use_c are deliberately not allowed)'
+			unless $PROTO_PARAM_KEYS{$which}{$k};
+	}
+
+	return $proto;
+} ## end sub validate_prototype
+
+=head2 new_from_prototype($proto, %overrides)
+
+Creates a fresh, unfitted model from a prototype (a hashref or a JSON
+string) and returns it -- an instance of whichever class the prototype's
+C<class> field names, so like C<load()> this is a single entry point for
+both model types.  Croaks on any validation failure; a munger-bearing
+prototype compiles its plan here, so a bogus munger spec dies at
+creation (and needs Algorithm::ToNumberMunger installed).
+
+C<%overrides> merge over the prototype's C<params> block -- per-run
+knobs like C<seed> -- and are held to the same per-class whitelist.
+Overriding the schema itself (feature_names, feature_descriptions,
+mungers, missing, impute_with, schema_version, schema_description)
+croaks: the schema is the prototype's, full stop; edit the prototype.
+
+    my $oif = Algorithm::Classifier::IsolationForest->new_from_prototype(
+        $proto_json,
+        seed => 42,
+    );
+
+=cut
+
+sub new_from_prototype {
+	my ( $class, $proto, %overrides ) = @_;
+
+	$proto = $class->validate_prototype($proto);
+	my $which  = $proto->{class};
+	my $schema = $proto->{schema};
+
+	for my $k ( sort keys %overrides ) {
+		croak "new_from_prototype: '$k' is part of the prototype's schema and may not "
+			. "be overridden; edit the prototype instead"
+			if $k
+			=~ /\A(?:feature_names|feature_descriptions|mungers|missing|impute_with|schema_version|schema_description)\z/;
+		croak "new_from_prototype: unknown override '$k' for a $which prototype (allowed: "
+			. join( ', ', sort keys %{ $PROTO_PARAM_KEYS{$which} } ) . ')'
+			unless $PROTO_PARAM_KEYS{$which}{$k};
+	}
+
+	my %args = (
+		%{ $proto->{params} || {} },
+		%overrides,
+		feature_names      => $schema->{feature_names},
+		schema_version     => $proto->{schema_version},
+		schema_description => $proto->{schema_description},
+	);
+	for my $k (qw(feature_descriptions mungers missing impute_with)) {
+		$args{$k} = $schema->{$k} if defined $schema->{$k};
+	}
+
+	if ( $which eq 'online' ) {
+		require Algorithm::Classifier::IsolationForest::Online;
+		return Algorithm::Classifier::IsolationForest::Online->new(%args);
+	}
+	return Algorithm::Classifier::IsolationForest->new(%args);
+} ## end sub new_from_prototype
+
+=head2 load_prototype($path, %overrides)
+
+L</new_from_prototype($proto, %overrides)> from a file.
+
+    my $iforest = Algorithm::Classifier::IsolationForest->load_prototype(
+        'proto.json', seed => 42 );
+
+=cut
+
+sub load_prototype {
+	my ( $class, $path, %overrides ) = @_;
+	my $raw = read_file($path);
+	return $class->new_from_prototype( $raw, %overrides );
+}
+
+=head2 to_prototype
+
+Returns a prototype JSON string extracted from this model: its variable
+schema (feature_names, feature_descriptions, mungers, missing policy)
+plus its current tuning knobs.  This closes the loop -- extract a
+prototype from a good model and periodically create fresh models with an
+identical schema, the natural retrain workflow -- and means hand-writing
+a prototype is never mandatory.
+
+Croaks when the model has no C<feature_names>: a prototype's variable
+schema needs named variables.  A model with no recorded
+C<schema_version> / C<schema_description> (fitted before prototype
+support, or without the knobs) gets placeholder values, since both are
+required in the file -- edit them in and bump from there.  C<seed> and
+C<max_depth> resolved at fit time are not emitted; pass such per-run
+knobs as overrides when creating from the prototype.
+
+    my $proto_json = $iforest->to_prototype;
+
+=cut
+
+sub to_prototype {
+	my ($self) = @_;
+	croak "to_prototype: this model has no feature_names; a prototype's variable " . "schema needs named features"
+		unless ref $self->{feature_names} eq 'ARRAY' && @{ $self->{feature_names} };
+
+	my $schema = {
+		feature_names => $self->{feature_names},
+		missing       => $self->{missing},
+	};
+	$schema->{feature_descriptions} = $self->{feature_descriptions}
+		if ref $self->{feature_descriptions} eq 'HASH' && %{ $self->{feature_descriptions} };
+	$schema->{mungers} = $self->{mungers}
+		if ref $self->{mungers} eq 'HASH' && %{ $self->{mungers} };
+	$schema->{impute_with} = $self->{impute_with}
+		if defined $self->{missing} && $self->{missing} eq 'impute';
+
+	my $params = {
+		n_trees     => $self->{n_trees},
+		sample_size => $self->{sample_size},
+		mode        => $self->{mode},
+		voting      => $self->{voting},
+	};
+	$params->{max_depth}       = $self->{max_depth} if defined $self->{max_depth};
+	$params->{extension_level} = $self->{extension_level_used} // $self->{extension_level}
+		if defined( $self->{extension_level_used} // $self->{extension_level} );
+	$params->{contamination} = $self->{contamination} if defined $self->{contamination};
+
+	return JSON::PP->new->canonical(1)->encode(
+		{
+			format             => 'Algorithm::Classifier::IsolationForest::Prototype',
+			version            => 1,
+			class              => 'batch',
+			schema_version     => $self->{schema_version} // '0',
+			schema_description => $self->{schema_description}
+				// '(none recorded; describe this schema and bump schema_version)',
+			schema => $schema,
+			params => $params,
+		}
+	);
+} ## end sub to_prototype
 
 =head1 REFERENCES
 
@@ -4343,6 +4905,64 @@ sub _check_fitted {
 	my ($self) = @_;
 	croak "model is not fitted yet; call fit() first"
 		unless ref $self->{trees} eq 'ARRAY' && @{ $self->{trees} };
+}
+
+# ---------------------------------------------------------------------------
+# Optional Algorithm::ToNumberMunger integration -- see the MUNGERS POD
+# section.  Both helpers are plain functions (not methods) so the Online
+# class's delegating methods can hand them their own $self: the plan and
+# spec live in the same hash slots on either class.
+# ---------------------------------------------------------------------------
+
+# Validate a feature_descriptions hash against the feature names: every
+# described feature must exist (a description for one that does not is
+# either a typo or a stale leftover from a schema change) and every
+# description must be a plain string.  Partial coverage is fine.  A plain
+# function, like the munger helpers, so both classes and the prototype
+# validator can call it.
+sub _validate_feature_descriptions {
+	my ( $tags, $fd ) = @_;
+	croak "feature_descriptions must be a hashref of 'feature name => description'"
+		unless ref $fd eq 'HASH';
+	croak "feature_descriptions requires feature_names to validate against"
+		unless ref $tags eq 'ARRAY' && @$tags;
+	my %known = map { $_ => 1 } @$tags;
+	for my $k ( sort keys %$fd ) {
+		croak "feature_descriptions describes '$k', which is not in feature_names"
+			unless $known{$k};
+		croak "feature_descriptions entry for '$k' must be a plain string"
+			if ref $fd->{$k};
+	}
+	return 1;
+} ## end sub _validate_feature_descriptions
+
+# Compile a munger spec against the model's feature names.  Requires
+# Algorithm::ToNumberMunger on demand -- it is an optional dependency --
+# and lets its compile() croak on any spec problem.
+sub _compile_mungers {
+	my ( $tags, $mungers ) = @_;
+	croak "this model has mungers but no feature_names to compile them against"
+		unless ref $tags eq 'ARRAY' && @$tags;
+	local $@;
+	eval { require Algorithm::ToNumberMunger; 1 }
+		or croak "this model has mungers configured but Algorithm::ToNumberMunger "
+		. "could not be loaded; install it to use tagged data with this model: $@";
+	return Algorithm::ToNumberMunger->compile(
+		tags    => $tags,
+		mungers => $mungers,
+	);
+} ## end sub _compile_mungers
+
+# The compiled plan for this model, or undef when no mungers are
+# configured.  Compiled lazily (memoised in _munger_plan) so from_json
+# does not need Algorithm::ToNumberMunger installed unless tagged data
+# is actually used; new() populates the slot eagerly instead, surfacing
+# spec errors at construction.
+sub _plan {
+	my ($self) = @_;
+	return undef unless $self->{mungers};
+	$self->{_munger_plan} //= _compile_mungers( $self->{feature_names}, $self->{mungers} );
+	return $self->{_munger_plan};
 }
 
 # Memoised "does this perl have a real fork()?".  False on Windows

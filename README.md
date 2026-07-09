@@ -120,6 +120,156 @@ iforest stream -i suspect.csv -m om.json --score-only # score without learning
 iforest info -m om.json                               # online-aware model info
 ```
 
+## `iforest streamd` — a scoring daemon
+
+For continuous operation, `iforest streamd` wraps the same prequential
+loop in a daemon: it listens on a Unix domain socket (default
+`/var/run/iforest_streamd/streamd.sock`, pid file alongside it), serves
+many concurrent connections from one shared model, and exchanges one
+JSON document per line (via `JSON::MaybeXS`) — so raw values headed for
+mungers may safely contain commas, newlines, or any unicode, and object
+rows run the *full* munger plan (expanding and combining mungers
+included, which positional CSV cannot express).
+
+```shell
+iforest streamd --prototype proto.json -c 0.05      # /var defaults
+iforest streamd -f --socket /tmp/s.sock --model-dir ./models \
+                --save-interval 60 --keep 48        # foreground, local paths
+
+# Named instances: several daemons side by side, each with its own
+# socket (<rundir>/<set>.sock), pid, model subdirectory, and resume state.
+iforest streamd --set web
+iforest streamd --set dns --prototype dns-proto.json -c 0.02
+```
+
+```
+→ {"row": {"method":"GET","path":"/a,b/☃.html","host":"h"}, "tag": "req-1"}
+← {"score": 0.41, "label": 0, "tag": "req-1"}
+→ {"rows": [[0.2,0.7],[0.3,0.5]], "mode": "learn"}
+← {"ok": {"learned": 2}}
+→ {"cmd": "stats"}
+← {"ok": {"seen": 48210, "window": 2048, "threshold": 0.61, "connections": 3, ...}}
+```
+
+The optional `"tag"` (any JSON value) is echoed back verbatim — on
+errors too, which are always per-message: a bad row gets an
+`{"error": ...}` reply and the connection lives on. Models save to
+`--model-dir` (default `/var/db/iforest_streamd`) as timestamped files
+every `--save-interval` seconds when learning happened (plus on the
+`save` command, SIGUSR1, and shutdown), with the symlink `latest.json`
+atomically repointed at each save and resumed from at the next startup —
+a crash or restart loses at most one interval of learning.
+
+`iforest streamc` is the matching client — no hand-rolled JSON needed:
+
+```shell
+iforest streamc --set web -i warmup.csv --mode learn   # silent warm-up
+iforest streamc --set web -i batch1.csv                # prequential: score,label lines
+tail -F log | to-jsonl | iforest streamc --set web --jsonl -i - --batch 1
+iforest streamc --set web --stats                      # ops: --ping/--save/--relearn-threshold
+iforest streamc --set web --ping && echo healthy       # exit code driven
+```
+
+CSV input matches `stream`'s (positional rows; raw strings pass through
+for munged columns — the daemon owns validation); `--jsonl` takes one
+JSON row per line, unlocking tagged rows and the full munger plan from
+the shell. Errors from either side die naming the input line.
+
+# Munging raw values (Algorithm::ToNumberMunger)
+
+With the optional `Algorithm::ToNumberMunger` module installed, a model can
+carry a declarative munger spec that turns raw tagged values — HTTP methods,
+hostnames, timestamps, status codes — into the numbers the forest needs, so
+callers hand the model the data they actually have. The spec is pure data and
+is **saved with the model**, so a loaded model munges scoring input exactly as
+it did training input. Works identically on the batch and online classes.
+
+```perl
+my $forest = Algorithm::Classifier::IsolationForest->new(
+    feature_names => [ 'method', 'path_len', 'host_entropy', 'bytes' ],
+    mungers       => {
+        method       => { munger => 'http_method_enum', default => -1 },
+        path_len     => { munger => 'length',  from => 'path' },
+        host_entropy => { munger => 'entropy', from => 'host' },
+        # 'bytes' has no munger: raw numeric passthrough
+    },
+);
+$forest->fit_tagged(\@raw_rows);   # hashrefs of raw values
+my $score = $forest->score_sample_tagged({
+    method => 'BREW', path => '/aaaa...aaa.php',
+    host   => 'kq3xv9z2.biz', bytes => 60000,
+});
+```
+
+Expanding mungers (one timestamp into a `sin`/`cos` pair) and combining
+mungers (a ratio of two fields) work through the tagged methods;
+`munge_rows` applies scalar mungers to positional rows. On the command line,
+`fit`/`stream` take `--mungers spec.json` (with `-t` tags) and accept raw
+values in munged CSV columns; `predict` and resumed `stream` runs munge
+automatically because the model carries its spec, and `info` shows a per-tag
+munger summary. Loading a munger-bearing model does not require the module —
+only actually using tagged data does. See the MUNGERS section in the module
+POD for details and caveats.
+
+# Prototypes (schema-first model creation)
+
+A prototype is a small JSON document describing what a model should be
+before any data exists: the variable schema (feature names in column
+order, plus their munger specs, per-feature descriptions, and missing
+policy), a required user-owned `schema_version` string and free-text
+`schema_description`, and optionally the tuning knobs. Creating a model
+from one stamps the schema metadata into the model JSON, so `iforest
+info`, resumed streams, and your own tooling can tell which revision of
+the input schema a model was built against — bump `schema_version` when
+the schema changes.
+
+```json
+{
+  "format": "Algorithm::Classifier::IsolationForest::Prototype",
+  "version": 1,
+  "class": "online",
+  "schema_version": "2026.07.08-1",
+  "schema_description": "HTTP request stream: method enum, path length, host entropy, raw bytes",
+  "schema": {
+    "feature_names": ["method", "path_len", "host_entropy", "bytes"],
+    "feature_descriptions": {
+      "host_entropy": "Shannon entropy of the Host header, catches DGA-ish hostnames"
+    },
+    "mungers": {
+      "method":       { "munger": "http_method_enum", "default": -1 },
+      "path_len":     { "munger": "length",  "from": "path" },
+      "host_entropy": { "munger": "entropy", "from": "host" }
+    }
+  },
+  "params": { "n_trees": 150, "window_size": 4096, "contamination": 0.02 }
+}
+```
+
+```perl
+# One entry point for both classes; dispatches on the prototype's "class".
+# Overrides merge over params (the schema itself may not be overridden).
+my $oif = Algorithm::Classifier::IsolationForest->load_prototype(
+    'proto.json', seed => 42 );
+
+# And back out again -- extract a prototype from a good model to
+# periodically create fresh models with an identical schema:
+my $proto_json = $oif->to_prototype;
+```
+
+```shell
+iforest fit    --prototype proto.json -i train.csv -o model.json  # batch protos
+iforest stream --prototype proto.json -i batch1.csv -m om.json    # online protos
+iforest proto  --from-model model.json -o proto.json              # extract
+iforest proto  --check proto.json                                 # validate + summarise
+```
+
+Explicit tuning switches override the prototype's params; the schema comes
+only from the prototype (combining `--prototype` with `-t`/`--mungers` is
+refused), and unknown or machine-local param keys croak rather than
+silently falling back to defaults. `info` shows `schema_version` /
+`schema_description` and prints each feature's description beside its
+tag. See the PROTOTYPES section in the module POD for the full format.
+
 # Performance options
 
 A handful of constructor / method-level knobs unlock measurable speedups

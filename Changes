@@ -51,6 +51,120 @@ Revision history for Algorithm-Classifier-IsolationForest
           state back.
         - `iforest info` and the parent class's load()/from_json()
           recognise online models via their stored format tag.
+        - Optional Algorithm::ToNumberMunger integration for tagged data,
+          on both the batch and online classes: new(mungers => {...})
+          takes a declarative spec (requires feature_names; compiled and
+          validated at construction) and every tagged row -- the
+          *_tagged methods, the new fit_tagged(), and learn_tagged's new
+          arrayref batch form -- is munged from raw values (strings,
+          timestamps, status codes, ...) into numbers through the
+          compiled plan. Expanding (into) and combining (from lists)
+          mungers are supported via the tagged methods; the new
+          munge_rows() applies scalar mungers to positional rows. The
+          spec is SAVED WITH THE MODEL (plus munger_module_version), so
+          a loaded model munges scoring input exactly as it did training
+          input; loading a munger-bearing model does not require the
+          module -- the plan recompiles lazily on first tagged use and
+          croaks with an install hint if it is absent. CLI: fit and
+          stream grow --mungers (JSON spec file, requires -t; munged CSV
+          columns may hold raw values, re-validated numeric after
+          munging), predict/stream munge raw CSV automatically when the
+          model carries a spec (packed input is never munged), and info
+          shows a per-tag munger summary. Algorithm::ToNumberMunger is
+          a recommends, not a requirement.
+        - Prototype support: a prototype is a small JSON document
+          describing what a model should be before any data exists --
+          the variable schema (feature_names in column order, plus
+          munger specs, per-feature descriptions, and missing policy),
+          a required user-owned schema_version string and free-text
+          schema_description, and optionally the per-class tuning knobs
+          (unknown or machine-local knobs croak). Creating a model from
+          one stamps the schema metadata into the model JSON. New class
+          methods new_from_prototype()/load_prototype() (single entry
+          point, dispatching to batch or online by the prototype's
+          class field; %overrides merge over params, the schema may not
+          be overridden), validate_prototype() (structural, no munger
+          compilation), and to_prototype() on both classes to extract a
+          prototype back out of a model -- the retrain loop. Both
+          new()s also take schema_version / schema_description /
+          feature_descriptions directly (described features must exist
+          in feature_names), with accessors, all persisted. CLI: fit
+          and stream grow --prototype (schema comes only from the
+          prototype -- combining it with -t/--mungers is refused;
+          explicit tuning switches override the prototype's params),
+          info shows schema_version/schema_description and prints each
+          feature's description beside its tag, and the new `iforest
+          proto` subcommand extracts (--from-model) and validates
+          (--check) prototype files. See PROTOTYPES in the module POD
+          for the file format.
+        - `iforest fit` now actually passes -d through as max_depth
+          (previously accepted and silently ignored).
+        - New `iforest streamd` subcommand: a prequential scoring daemon
+          around an online model. Listens on a Unix domain socket
+          (--socket, default /var/run/iforest_streamd/streamd.sock; pid
+          at --pid, default /var/run/iforest_streamd/streamd.pid),
+          handles many concurrent connections in one process (a
+          select loop -- rows apply to the shared model in line-arrival
+          order, which defines the stream order), and speaks one JSON
+          document per line via JSON::MaybeXS (new hard prereq;
+          pure-Perl JSON::PP fallback), so raw values headed for
+          mungers may safely carry commas, newlines, or any unicode.
+          Requests take one of "row" (array = positional, object = a
+          tagged row through the full munger plan, expanding/combining
+          mungers included), "rows" (batch), or "cmd" (ping / stats /
+          mode / save / relearn-threshold), plus an optional "mode"
+          (prequential/learn/score, also settable per connection) and
+          an optional client tag echoed back verbatim in the reply --
+          on errors too, which are per-message and never kill the
+          connection or daemon. Models save to --model-dir (default
+          /var/db/iforest_streamd) as timestamped files every
+          --save-interval seconds (when learning happened), on the
+          save command, SIGUSR1, and shutdown, with the symlink
+          latest.json atomically repointed at each save and resumed
+          from at startup -- a restart loses at most one interval.
+          --keep N prunes old saves; --prototype/-t/--mungers and the
+          stream creation knobs cover new-model creation; SIGHUP
+          reopens the log; missing state directories are created at
+          startup or refused loudly before daemonizing; over-long
+          socket paths (the ~104-byte sun_path limit) are refused
+          instead of silently truncated. New benchmark script
+          benchmarking/bench-streamd.pl measures the daemon end to end
+          (spawns its own): batched rows over the socket run within
+          ~2% of in-process score_learn (~2,700 vs ~2,770 pts/s at 100
+          trees / 5 features on the dev box), throughput is flat
+          across concurrent clients by design, and ping floors at
+          ~29k round trips/s -- the model, not the wire, is the
+          bottleneck. --set NAME runs a named
+          instance: the set name is appended to --model-dir (its own
+          saves, latest.json, resume state, and default log) and the
+          socket/pid become <set>.sock / <set>.pid under the run dir
+          (with --set, --socket and --pid name the base run dir instead
+          of the files), so several sets run side by side with no other
+          flags; set names must match /\A[A-Za-z0-9+\-@_]+\z/, whose
+          class has no '.' or '/', so a name can only ever create one
+          path segment. stats reports the set and the startup log line
+          carries it. New test t/91-streamd.t drives live daemons over
+          the socket, including two sets side by side.
+        - New `iforest streamc` subcommand: the client for streamd.
+          Stream mode (-i, - for stdin) feeds rows through the daemon
+          in --batch sized lockstep messages and prints one result per
+          row in order -- CSV input (positional rows, numeric-looking
+          fields sent as numbers, everything else as raw strings for
+          the daemon's munger plan) emits stream-compatible
+          `$score,$label` lines with -d prepending the input columns;
+          --jsonl input takes one JSON row per line (array positional,
+          object tagged through the full munger plan) and emits the
+          daemon's reply lines verbatim. --mode
+          prequential/learn/score; row validation is entirely the
+          daemon's, and both client- and daemon-side errors die naming
+          the input line (requests are tagged with their starting line
+          number to map batch errors back). Command mode sends --ping,
+          --stats, --save, or --relearn-threshold, rendered as text or
+          raw with --json, exiting 0 on ok and non-zero on error,
+          connect failure, or --timeout -- so `streamc --set web
+          --ping` slots straight into health checks. --set/--socket
+          resolve the socket exactly as streamd does. New test
+          t/92-streamc.t drives the real CLI against a live daemon.
         - New cross-language test t/80-sklearn-comparison-online.t
           (skipped without Python/scikit-learn): streams datasets of 2
           to 20 features through the online model and verifies its
