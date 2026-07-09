@@ -186,7 +186,7 @@ my %WriteMakefileArgs = (
 					# Unlocks the mungers knob: declarative raw-value ->
 					# number munging for tagged data, with the spec saved
 					# in the model.  Everything else works without it.
-					'Algorithm::ToNumberMunger' => '0.01',
+					'Algorithm::ToNumberMunger' => '0.0.1',
 				},
 			},
 		},
