@@ -148,14 +148,6 @@ repacks once.  C<score_learn> never touches the snapshot: it mutates
 the trees after every single point, so its rows are scored by walking
 the live trees in C instead.
 
-One deployment caveat: the online learn accelerators were added to the
-C backend in 0.6.0, and the parent will happily load a prebuilt object
-compiled from an older release.  When that happens this class detects
-the missing functions at load time and quietly keeps learning in pure
-Perl (batch scoring stays accelerated); rebuilding/reinstalling the
-module -- or C<IF_RUNTIME_BUILD=1> -- restores the full set.  See
-C<use_c>/C<use_openmp> under L</new(%args)>.
-
 A model needs to have seen at least C<max_leaf_samples> points before
 tree structure exists at all; until then every point scores 1.0.  Give
 the model a warm-up C<learn()> pass before trusting scores or labels.
@@ -1043,12 +1035,13 @@ sub to_prototype {
 =head1 REFERENCES
 
 Filippo Leveni, Guilherme Weigert Cassales, Bernhard Pfahringer, Albert
-Bifet, Giacomo Boracchi (2024). Online Isolation Forest. Proceedings of
-the 41st International Conference on Machine Learning (ICML), PMLR 235.
+Bifet, Giacomo Boracchi (2024). Online Isolation Forest.
 
-L<https://proceedings.mlr.press/v235/leveni24a.html>
+L<https://arxiv.org/abs/2505.09593>
 
 L<https://github.com/ineveLoppiliF/Online-Isolation-Forest>
+
+L<https://proceedings.mlr.press/v235/leveni24a.html>
 
 =cut
 

@@ -4339,7 +4339,11 @@ Yousra Chabchoub, Maurras Ulbricht Togbe, Aliou Boly, Raja Chiky (2022). An In-D
 
 L<https://ieeexplore.ieee.org/document/9684896>
 
-Filippo Leveni, Guilherme Weigert Cassales, Bernhard Pfahringer, Albert Bifet, Giacomo Boracchi (2024). Online Isolation Forest. Proceedings of the 41st International Conference on Machine Learning (ICML), PMLR 235. (the streaming variant implemented by L<Algorithm::Classifier::IsolationForest::Online>)
+Filippo Leveni, Guilherme Weigert Cassales, Bernhard Pfahringer, Albert Bifet, Giacomo Boracchi (2024). Online Isolation Forest. (the streaming variant implemented by L<Algorithm::Classifier::IsolationForest::Online>)
+
+L<https://arxiv.org/abs/2505.09593>
+
+L<https://github.com/ineveLoppiliF/Online-Isolation-Forest>
 
 L<https://proceedings.mlr.press/v235/leveni24a.html>
 
