@@ -1,5 +1,32 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
+0.7.0   (unreleased)
+        - Add fit_from_csv(), which trains directly from a CSV file without
+          loading it into RAM (for data sets too large to slurp). Streams
+          the file in a census pass, a gather pass that keeps only the rows
+          the trees sampled (Floyd's algorithm, O(n_trees*sample_size)
+          memory), and -- when contamination is set -- a scoring pass whose
+          min-heap yields the exact same threshold the in-RAM learner would.
+          The census and gather passes only parse the cells they need (row
+          count / column width, and the sampled rows), and the contamination
+          scoring pass runs through the C backend when use_c is on, so a
+          learned threshold over a large file is seconds rather than minutes.
+          The first CSV line is skipped automatically when it holds feature
+          names (any non-numeric cell, or a match of stored feature_names);
+          header => 1 still forces it.
+        - fit_from_csv() now defaults to an "index" gather: a fast block-scan
+          census records each row's byte offset so the second pass seeks
+          straight to the sampled rows instead of re-scanning the whole file,
+          cutting a no-contamination fit of a 2M-row file from ~15s to ~3s.
+          The offset table costs 8*n bytes and is dropped (falling back to the
+          streaming reader) once it would exceed index_max (default 256 MiB);
+          pass index => 0 to force streaming. The contamination scoring pass
+          defaults to c_scan => 1, letting the C packer coerce cells instead
+          of validating each in Perl (identical result on valid data; a
+          non-numeric scored cell becomes 0.0 rather than dying). Under
+          missing => 'die', a missing cell is now rejected when it lands in a
+          sampled training row rather than during a full up-front scan.
+
 0.6.0   2026-07-09/08:15
         - Implement Online Isolation Forest (Filippo Leveni, Guilherme
           Weigert Cassales, Bernhard Pfahringer, Albert Bifet, Giacomo

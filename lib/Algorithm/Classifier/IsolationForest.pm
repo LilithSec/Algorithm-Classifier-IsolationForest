@@ -2,12 +2,13 @@ package Algorithm::Classifier::IsolationForest;
 
 use strict;
 use warnings;
-use Carp        qw(croak);
-use Config      ();
-use List::Util  qw(min);
-use POSIX       qw(ceil);
-use JSON::PP    ();
-use File::Slurp qw(read_file write_file);
+use Carp         qw(croak);
+use Config       ();
+use List::Util   qw(min);
+use Scalar::Util qw(looks_like_number);
+use POSIX        qw(ceil);
+use JSON::PP     ();
+use File::Slurp  qw(read_file write_file);
 
 our $VERSION = '0.6.0';
 
@@ -3040,33 +3041,10 @@ sub fit {
 
 	my $n = scalar @$train;
 
-	# The sub-sample cannot be larger than the data set itself.
-	my $psi = min( $self->{sample_size}, $n );
-	$self->{c_psi}    = _c($psi);
-	$self->{psi_used} = $psi;
-
-	# Resolve the extension level against the data's dimensionality.
-	if ( $self->{mode} eq 'extended' ) {
-		my $max_ext = $n_features - 1;
-		my $ext
-			= defined $self->{extension_level}
-			? $self->{extension_level}
-			: $max_ext;
-		$ext                          = 0        if $ext < 0;
-		$ext                          = $max_ext if $ext > $max_ext;
-		$self->{extension_level_used} = $ext;
-	} else {
-		$self->{extension_level_used} = undef;
-	}
-
-	# Height limit: the average tree height ceil(log2(psi)). Past this depth the
-	# remaining points are scored using the c(size) adjustment instead.
-	my $limit
-		= defined $self->{max_depth}
-		? $self->{max_depth}
-		: ceil( log($psi) / log(2) );
-	$limit = 1 if $limit < 1;
-	$self->{max_depth_used} = $limit;
+	# Resolve sub-sample size, extension level and height limit against the
+	# data's shape.  Shared with fit_from_csv(), which learns n from a census
+	# pass before it ever holds the rows in RAM.
+	my ( $psi, $limit ) = $self->_resolve_geometry( $n, $n_features );
 
 	srand( $self->{seed} ) if defined $self->{seed};
 
@@ -3149,6 +3127,213 @@ sub fit_tagged {
 	}
 	return $self->fit( \@rows );
 } ## end sub fit_tagged
+
+=head2 fit_from_csv($path, %opts)
+
+Trains the model directly from a CSV file B<without loading it into RAM>,
+for datasets too large to slurp.  An Isolation Forest never trains on more
+than C<n_trees * sample_size> rows -- each tree uses one independent
+sub-sample of C<sample_size> points -- so the working set is bounded by the
+model's parameters, not the file size.
+
+The file is read in two (or three) passes:
+
+=over 4
+
+=item 1.
+
+B<Census> -- count the rows (this is the true C<n> that fixes C<psi =
+min(sample_size, n)>) and pin the feature width.  By default this is an
+I<index> pass (see C<index> below): a fast block-scan that also records each
+data row's byte offset.
+
+=item 2.
+
+B<Gather> -- retain only the rows the trees actually sampled (chosen in
+bounded memory via Floyd's algorithm), then build each tree from its
+sub-sample exactly as L</fit> would.  With the offset table from pass 1 this
+B<seeks straight to the sampled rows> instead of re-scanning the file.
+
+=item 3.
+
+B<Threshold> (only when C<contamination> is set) -- score every row against
+the built forest and place the cut at the contamination boundary.  The cut
+is B<exact>, not estimated: a single min-heap of the C<k+1> largest scores
+(C<k = round(contamination * n)>) captures everything
+L</decision_threshold> selection needs, with a rare extra pass to resolve a
+tie block straddling the boundary.  Under C<< use_c => 1 >> (the default when
+the C backend is present) this pass runs through the C scorer, so it stays
+fast even over millions of rows.
+
+=back
+
+Neither census variant parses cells into numbers or checks for missing
+values: only the rows that actually train (via gather) or are scored (the
+threshold pass) are validated, so a malformed or missing cell in a
+never-used row is not reported.  In particular, under C<< missing => 'die' >>
+a missing cell is rejected exactly when it appears in a sampled training row.
+
+Because rows are addressed by their position across passes, C<$path> must be
+a stable, re-readable file (not a pipe or C<STDIN>).
+
+The first line is skipped as a header when it holds any non-numeric text (a
+feature-name row) or exactly matches the model's stored C<feature_names> --
+data rows contain only numbers and empty cells.  Pass C<< header => 1 >> to
+force the first line to be skipped even when it is all-numeric.
+
+Options:
+
+=over 4
+
+=item * C<< header => 1 >> -- always skip the first line as a column header
+(otherwise a header is auto-detected as described above).
+
+=item * C<< index => 0 >> -- disable the offset-index pass and use the
+streaming two-pass reader instead.  The index is on by default: it makes
+gather a random-access read of just the sampled rows rather than a second
+full scan, but costs an C<8 * n>-byte offset table.  When that table would
+exceed C<index_max> it is dropped automatically and the fit falls back to
+streaming.  (In index mode a blank line is one that is empty or contains only
+whitespace, judged cheaply; pass C<< index => 0 >> for files where that
+matters.)
+
+=item * C<< index_max => bytes >> -- ceiling on the offset table (default
+256 MiB).  Above it, the index is abandoned mid-scan and gather streams.
+
+=item * C<< c_scan => 0 >> -- validate each scored cell with
+C<looks_like_number> in the threshold pass instead of letting the C packer
+coerce it.  C<c_scan> is on by default and takes effect only on the C
+mean-voting scoring path, where it is a large saving over millions of rows;
+it produces the identical result on valid data, but coerces a non-numeric
+scored cell to C<0.0> (nudging the threshold) rather than dying on it.
+
+=back
+
+Every column is a feature; an empty cell is treated as a missing value and
+handled by the model's C<missing> strategy.  The resulting model is
+identical in shape to one built by L</fit> and is fully deterministic given
+the same file, C<seed>, and parameters (though not bit-identical to
+L</fit>, whose RNG stream interleaves sampling and tree-building
+differently).
+
+Current limitations: C<mungers> and tagged/named columns are not supported
+(load such data through L</fit_tagged>), and the trees are always built
+serially in pure Perl -- C<parallel_fit>/C<use_openmp_fit> are ignored for
+the build, though scoring is still accelerated when C<use_c> is on.
+
+    my $iforest = Algorithm::Classifier::IsolationForest->new(
+        n_trees       => 100,
+        sample_size   => 256,
+        contamination => 0.01,
+        seed          => 42,
+    );
+    $iforest->fit_from_csv('huge.csv', header => 1);
+
+=cut
+
+sub fit_from_csv {
+	my ( $self, $path, %opt ) = @_;
+
+	croak "fit_from_csv() requires a path to a CSV file"
+		unless defined $path && length $path;
+	croak "fit_from_csv(): '$path' is not a readable file"
+		unless -f $path && -r _;
+	croak "fit_from_csv() does not support munger models; " . "load the data through fit_tagged/fit instead"
+		if _plan($self);
+
+	# Decide once whether the first line is a header, so every pass skips the
+	# same line and row indices stay aligned.  header => 1 forces it; otherwise
+	# a first line carrying any non-numeric text (or matching stored
+	# feature_names) is a header -- data rows hold only numbers and blanks.
+	my $skip_first = $self->_detect_header( $path, $opt{header} );
+
+	# ---- Pass 1: census.  Establish the true row count (which fixes psi) and
+	# pin the feature width.  Neither census variant parses cells into numbers
+	# or checks for missing values -- only the rows that actually train
+	# (_numify_row, in gather) or get scored (the threshold pass) are validated,
+	# so a malformed or missing cell in a never-sampled row is not seen.
+	#
+	# By default the census is an "index" pass: a block-scan that also records
+	# each data row's byte offset, letting Pass 2 seek straight to the sampled
+	# rows instead of re-scanning the whole file.  The offset table costs 8*n
+	# bytes; when that would top index_max (or index => 0 was passed) it is not
+	# built and both passes fall back to the streaming reader.
+	my $use_index = exists $opt{index}      ? $opt{index}     : 1;
+	my $index_max = defined $opt{index_max} ? $opt{index_max} : ( 256 * 1024 * 1024 );
+
+	my ( $n, $n_features, $offsets );
+	if ($use_index) {
+		( $n, $n_features, $offsets ) = $self->_index_pass( $path, $skip_first, $index_max );
+	} else {
+		( $n, $n_features ) = $self->_census_stream( $path, $skip_first );
+	}
+	croak "fit_from_csv(): no data rows in '$path'" unless $n;
+
+	# A stored feature_names schema fixes the expected column count.
+	if ( ref $self->{feature_names} eq 'ARRAY' && @{ $self->{feature_names} } ) {
+		my $want = scalar @{ $self->{feature_names} };
+		croak "fit_from_csv(): $want feature_names but CSV has $n_features columns"
+			unless $want == $n_features;
+	}
+
+	$self->{n_features} = $n_features;
+	my ( $psi, $limit ) = $self->_resolve_geometry( $n, $n_features );
+
+	# ---- Choose which row indices each tree trains on: an independent,
+	# uniform psi-subset drawn without replacement.  Floyd's algorithm draws
+	# each subset in O(psi) memory, never materialising the 0..n-1 index
+	# vector _subsample() uses -- for an out-of-core n that vector would not
+	# fit either.  %want maps each needed row index to the (tree, slot) pairs
+	# awaiting it, so a row several trees picked is gathered once and shared.
+	srand( $self->{seed} ) if defined $self->{seed};
+	my @tree_idx;    # tree => [ chosen row indices ]
+	my %want;        # row index => [ [tree, slot], ... ]
+	for my $t ( 0 .. $self->{n_trees} - 1 ) {
+		my @idx = _sample_indices_distinct( $n, $psi );
+		$tree_idx[$t] = \@idx;
+		push @{ $want{ $idx[$_] } }, [ $t, $_ ] for 0 .. $#idx;
+	}
+
+	# ---- Pass 2: gather the sampled rows (validated + coerced by _numify_row).
+	# With an offset table this seeks straight to them; otherwise it re-scans.
+	my $pool
+		= $offsets
+		? $self->_gather_indexed( $path, $offsets, \%want )
+		: $self->_gather_stream( $path, $skip_first, \%want );
+
+	# Apply the missing-value strategy to the retained rows (see fit()'s
+	# _prepare_fit_data; the impute fill is learned from this training
+	# sub-sample, the only value bounded-memory fitting can compute).
+	$self->_apply_missing_to_pool($pool);
+
+	# ---- Build. Each tree trains on its gathered sub-sample -- structurally
+	# identical to fit()'s per-tree _build_tree(_subsample(...)).
+	my @trees;
+	for my $t ( 0 .. $self->{n_trees} - 1 ) {
+		my $sample = [ @{$pool}{ @{ $tree_idx[$t] } } ];
+		push @trees, $self->_build_tree( $sample, 0, $limit );
+	}
+	$self->{trees} = \@trees;
+
+	# Repack the just-built trees for the C scorer up front.  fit() scores its
+	# learned threshold pure-Perl because its training set is small; the
+	# streaming contamination pass here may score millions of rows, so paying
+	# one repack now lets that pass run through the C path instead (bit-
+	# identical result, minutes -> seconds).  The delete first clears any stale
+	# buffers from a prior fit so the repack reflects the new forest.
+	delete @$self{qw(_c_nodes _c_coef_idx _c_coef_val)};
+	$self->_rebuild_c_trees() if $self->{_use_c};
+
+	# c_scan (default on): let the C scorer's packer coerce raw cells via SvNV
+	# in the contamination pass instead of validating each with looks_like_number
+	# in Perl -- a large saving over millions of rows.  It only takes effect on
+	# the C mean-voting path; see _stream_scores.
+	my $c_scan = exists $opt{c_scan} ? $opt{c_scan} : 1;
+	$self->_learn_contamination_threshold_streaming( $path, $skip_first, $n, $c_scan )
+		if defined $self->{contamination};
+
+	return $self;
+} ## end sub fit_from_csv
 
 =head2 pack_data(\@data)
 
@@ -4536,6 +4721,451 @@ sub _randn {
 	my $c = _to_double( cos( _to_double( TWO_PI * $u2 ) ) );
 	return _to_double( $s * $c );
 } ## end sub _randn
+
+#-------------------------------------------------------------------------------
+# Resolve the derived per-fit geometry from the sample count and feature width,
+# storing it on the object and returning ($psi, $limit) for the build loop.
+# Factored out of fit() so fit_from_csv() -- which learns n from a streaming
+# census rather than an in-RAM array -- produces byte-identical psi/extension/
+# depth values.  Pure arithmetic: consumes no randomness.
+#-------------------------------------------------------------------------------
+sub _resolve_geometry {
+	my ( $self, $n, $n_features ) = @_;
+
+	# The sub-sample cannot be larger than the data set itself.
+	my $psi = min( $self->{sample_size}, $n );
+	$self->{c_psi}    = _c($psi);
+	$self->{psi_used} = $psi;
+
+	# Resolve the extension level against the data's dimensionality.
+	if ( $self->{mode} eq 'extended' ) {
+		my $max_ext = $n_features - 1;
+		my $ext
+			= defined $self->{extension_level}
+			? $self->{extension_level}
+			: $max_ext;
+		$ext                          = 0        if $ext < 0;
+		$ext                          = $max_ext if $ext > $max_ext;
+		$self->{extension_level_used} = $ext;
+	} else {
+		$self->{extension_level_used} = undef;
+	}
+
+	# Height limit: the average tree height ceil(log2(psi)). Past this depth the
+	# remaining points are scored using the c(size) adjustment instead.
+	my $limit
+		= defined $self->{max_depth}
+		? $self->{max_depth}
+		: ceil( log($psi) / log(2) );
+	$limit = 1 if $limit < 1;
+	$self->{max_depth_used} = $limit;
+
+	return ( $psi, $limit );
+} ## end sub _resolve_geometry
+
+#-------------------------------------------------------------------------------
+# fit_from_csv() machinery.
+#-------------------------------------------------------------------------------
+
+# Inspect the first non-blank line and report whether it is a header to skip
+# rather than train on.  $forced (the header => option) makes it unconditional;
+# otherwise a line is a header when it carries any non-numeric text -- data rows
+# hold only numbers and empty cells -- or exactly matches stored feature_names.
+sub _detect_header {
+	my ( $self, $path, $forced ) = @_;
+	open my $fh, '<', $path
+		or croak "fit_from_csv(): cannot open '$path': $!";
+	my $first;
+	while ( defined( my $line = <$fh> ) ) {
+		$line =~ s/\r?\n\z//;
+		next if $line =~ /^\s*$/;
+		$first = $line;
+		last;
+	}
+	close $fh;
+	return 0 unless defined $first;    # empty file; the census will report it
+	return 1 if $forced;
+
+	my @f = split /,/, $first, -1;
+	for my $x (@f) {
+		next if !length $x;                       # empty cell: fine in data
+		return 1 unless looks_like_number($x);    # text: it is a header
+	}
+
+	# All-numeric first line: only a header if it reproduces feature_names.
+	my $names = $self->{feature_names};
+	if ( ref $names eq 'ARRAY' && @$names == @f ) {
+		my $match = grep { $f[$_] eq $names->[$_] } 0 .. $#f;
+		return 1 if $match == @f;
+	}
+	return 0;
+} ## end sub _detect_header
+
+# Return a closure that yields ($row, $line_number) per non-blank CSV line and
+# an empty list at EOF.  An empty cell becomes undef (the missing-value marker).
+# With $parse true each non-empty cell is validated and coerced to a number (a
+# non-numeric cell dies); with $parse false the cells are left as raw strings --
+# the cheap mode the census uses, which needs only the column count and empties.
+# When $skip_first is set the first non-blank line (a header) is dropped.  Blank
+# lines are skipped, so a row's index is its position among the non-blank data
+# lines -- stable across passes as long as the file does not change under us.
+sub _csv_reader {
+	my ( $self, $path, $skip_first, $parse ) = @_;
+	open my $fh, '<', $path
+		or croak "fit_from_csv(): cannot open '$path': $!";
+	my $line_no = 0;
+	my $skipped = 0;
+	return sub {
+		while ( defined( my $line = <$fh> ) ) {
+			$line_no++;
+			$line =~ s/\r?\n\z//;
+			next if $line =~ /^\s*$/;
+			if ( $skip_first && !$skipped ) { $skipped = 1; next; }
+			my @fields = split /,/, $line, -1;
+			for my $f (@fields) {
+				if ( !length $f ) { $f = undef; next; }
+				next unless $parse;
+				croak "fit_from_csv(): line $line_no value '$f' is not a number"
+					unless looks_like_number($f);
+				$f += 0;
+			}
+			return ( \@fields, $line_no );
+		} ## end while ( defined( my $line = <$fh> ) )
+		close $fh;
+		return;
+	}; ## end sub
+} ## end sub _csv_reader
+
+# Validate and coerce a raw row (from a parse => 0 reader) into numbers in
+# place: defined cells must look like numbers.  An undef cell (empty CSV marker)
+# passes through for zero/impute/nan, but croaks under the 'die' strategy -- so
+# 'die' rejects a missing value exactly when it lands in a sampled training row.
+# $where names the row for error messages.  Only the rows a fit keeps are run
+# through here, which is why a bad cell elsewhere is never reported.
+sub _numify_row {
+	my ( $self, $row, $where ) = @_;
+	my $die = $self->{missing} eq 'die';
+	for my $f (@$row) {
+		if ( !defined $f ) {
+			croak "fit_from_csv(): missing value in $where; construct with "
+				. "missing => 'zero', 'impute', or 'nan' to train on data "
+				. "with missing values"
+				if $die;
+			next;
+		}
+		croak "fit_from_csv(): $where value '$f' is not a number"
+			unless looks_like_number($f);
+		$f += 0;
+	} ## end for my $f (@$row)
+	return;
+} ## end sub _numify_row
+
+# Streaming census (index => 0 or offset table over budget): count the data
+# rows and pin the feature width via the cheap parse => 0 reader.  No cell
+# validation -- that is deferred to the rows that train or get scored.
+sub _census_stream {
+	my ( $self, $path, $skip_first ) = @_;
+	my $reader = $self->_csv_reader( $path, $skip_first, 0 );
+	my ( $n, $nf ) = ( 0, undef );
+	while ( my ( $row, $line ) = $reader->() ) {
+		$nf //= scalar @$row;
+		croak "fit_from_csv(): line $line of '$path' has " . scalar(@$row) . " columns but expected $nf"
+			unless @$row == $nf;
+		$n++;
+	}
+	return ( $n, $nf );
+} ## end sub _census_stream
+
+# Streaming gather (no offset table): re-scan the file, numifying only the
+# sampled rows.  Companion to _census_stream.
+sub _gather_stream {
+	my ( $self, $path, $skip_first, $want ) = @_;
+	my $reader = $self->_csv_reader( $path, $skip_first, 0 );
+	my %pool;
+	my $i = 0;
+	while ( my ( $row, $line ) = $reader->() ) {
+		if ( exists $want->{$i} ) {
+			$self->_numify_row( $row, "line $line" );
+			$pool{$i} = $row;
+		}
+		$i++;
+	}
+	return \%pool;
+} ## end sub _gather_stream
+
+# Index census: one block-scan that counts the data rows, pins the feature
+# width, AND records each data row's byte offset so gather can seek straight to
+# the sampled rows.  Blank lines are skipped and the header dropped exactly as
+# the reader does, so offset i is the i-th data row.  The offset table costs
+# 8*n bytes; once it would exceed $max_off it is dropped (returning undef) and
+# only the count survives, so the caller falls back to the streaming gather.
+sub _index_pass {
+	my ( $self, $path, $skip_first, $max_off ) = @_;
+	open my $fh, '<', $path
+		or croak "fit_from_csv(): cannot open '$path': $!";
+	binmode $fh;
+
+	my @off;
+	my $store   = $max_off > 0 ? 1 : 0;
+	my $cap     = int( $max_off / 8 );
+	my $n       = 0;
+	my $skipped = 0;
+	my $nf;
+
+	# Consider the line at ($$sref, $off .. $off+$len).  To stay fast we avoid
+	# copying the line: a zero-length line is empty, and any line whose first
+	# byte is a digit/sign/dot (>= '!') is non-blank without further checks --
+	# only a line starting with whitespace (< '!') is materialised to apply the
+	# reader's /^\s*$/ blank test.  $abs is its absolute byte offset.
+	my $feed = sub {
+		my ( $abs, $sref, $off, $len ) = @_;
+		return if $len == 0;
+		if ( substr( $$sref, $off, 1 ) lt '!' ) {    # leading whitespace: maybe blank
+			return if substr( $$sref, $off, $len ) !~ /\S/;
+		}
+		if ( $skip_first && !$skipped ) { $skipped = 1; return; }
+		$nf //= scalar( () = split /,/, substr( $$sref, $off, $len ), -1 );    # width from row 1
+		$n++;
+		return unless $store;
+		push @off, $abs;
+		if ( @off > $cap ) { $store = 0; @off = () }                           # over budget: abandon the table
+	}; ## end $feed = sub
+
+	my ( $carry, $file_pos ) = ( '', 0 );                                      # $file_pos = abs offset of $carry's start
+	my $buf;
+	while ( my $got = read( $fh, $buf, 1 << 20 ) ) {
+		my $s = $carry . $buf;
+		my $p = 0;
+		my $nl;
+		while ( ( $nl = index( $s, "\n", $p ) ) >= 0 ) {
+			my $len = $nl - $p;
+			$len-- if $len && substr( $s, $nl - 1, 1 ) eq "\r";    # exclude a CRLF's CR
+			$feed->( $file_pos + $p, \$s, $p, $len );
+			$p = $nl + 1;
+		}
+		$carry = substr( $s, $p );
+		$file_pos += $p;
+	} ## end while ( my $got = read( $fh, $buf, 1 << 20 ) )
+	close $fh;
+	$feed->( $file_pos, \$carry, 0, length $carry ) if length $carry;    # final unterminated line
+
+	return ( $n, $nf, $store ? \@off : undef );
+} ## end sub _index_pass
+
+# Random-access gather: seek to each sampled row's recorded offset and numify
+# it.  Indices are visited in order for sequential-ish disk access.
+sub _gather_indexed {
+	my ( $self, $path, $offsets, $want ) = @_;
+	open my $fh, '<', $path
+		or croak "fit_from_csv(): cannot open '$path': $!";
+	my $nf = $self->{n_features};
+	my %pool;
+	for my $i ( sort { $a <=> $b } keys %$want ) {
+		seek( $fh, $offsets->[$i], 0 )
+			or croak "fit_from_csv(): seek failed for row $i: $!";
+		my $line = <$fh>;
+		croak "fit_from_csv(): row $i is past the end of '$path'" unless defined $line;
+		$line =~ s/\r?\n\z//;
+		my @f = split /,/, $line, -1;
+		croak "fit_from_csv(): sampled row $i has " . scalar(@f) . " columns but expected $nf"
+			unless @f == $nf;
+		for my $x (@f) { $x = undef if !length $x }
+		$self->_numify_row( \@f, "sampled row $i" );
+		$pool{$i} = \@f;
+	} ## end for my $i ( sort { $a <=> $b } keys %$want )
+	close $fh;
+	return \%pool;
+} ## end sub _gather_indexed
+
+# Draw $k distinct indices uniformly from [0, $n) via Floyd's algorithm --
+# O($k) time and memory, so it never allocates the 0..n-1 vector _subsample()
+# builds (the whole point: n may not fit in RAM).  Returns them sorted, which
+# makes the per-tree sample order deterministic (independent of hash-key
+# randomisation) even though tree structure does not depend on row order.
+sub _sample_indices_distinct {
+	my ( $n, $k ) = @_;
+	return ( 0 .. $n - 1 ) if $k >= $n;
+	my %seen;
+	for my $j ( $n - $k .. $n - 1 ) {
+		my $t = int( rand( $j + 1 ) );    # uniform in [0, $j]
+		$seen{ exists $seen{$t} ? $j : $t } = 1;
+	}
+	my @idx = sort { $a <=> $b } keys %seen;
+	return @idx;
+} ## end sub _sample_indices_distinct
+
+# Apply the missing-value strategy to the gathered pool (hashref index => row),
+# densifying in place so the pure-Perl _build_tree sees defined cells.  Mirrors
+# _prepare_fit_data, except impute learns its fill from the training sub-sample
+# rather than the full file -- the only fill bounded-memory fitting can form.
+sub _apply_missing_to_pool {
+	my ( $self, $pool ) = @_;
+	my $m = $self->{missing};
+	return if $m eq 'die' || $m eq 'nan';    # die: already dense; nan: keep undef
+
+	my $nf = $self->{n_features};
+	my $fill;
+	if ( $m eq 'impute' ) {
+		$fill = $self->_compute_impute_fill( [ values %$pool ] );
+		$self->{missing_fill} = $fill;
+		delete $self->{_fill_packed};
+	} else {                                 # zero
+		$fill = [ (0) x $nf ];
+	}
+	for my $i ( keys %$pool ) {
+		my $r = $pool->{$i};
+		$pool->{$i} = [ map { defined $r->[$_] ? $r->[$_] : $fill->[$_] } 0 .. $nf - 1 ];
+	}
+	return;
+} ## end sub _apply_missing_to_pool
+
+# Streaming counterpart of _learn_contamination_threshold: learn the exact
+# score cutoff for the contamination rate without holding every score.  k+1
+# largest scores are enough for _threshold_from_ranked's boundary logic; a
+# min-heap keeps them in one scoring pass, and (only under a boundary tie) one
+# extra pass resolves the tie block's edges.
+sub _learn_contamination_threshold_streaming {
+	my ( $self, $path, $skip_first, $n, $c_scan ) = @_;
+
+	my $k = int( $self->{contamination} * $n + 0.5 );
+	$k = 1  if $k < 1;
+	$k = $n if $k > $n;
+
+	# Whole set flagged: sit the cut just below the global minimum score.
+	if ( $k >= $n ) {
+		my $min;
+		$self->_stream_scores( $path, $skip_first, sub { $min = $_[0] if !defined $min || $_[0] < $min }, $c_scan );
+		$self->{threshold} = $min - 1e-9;
+		return;
+	}
+
+	# One scoring pass keeps the k+1 largest scores (a min-heap rooted at the
+	# smallest kept).  contamination <= 0.5 bounds k at n/2, so this tail is
+	# always the smaller side of the split.
+	my @heap;
+	my $cap = $k + 1;
+	$self->_stream_scores(
+		$path,
+		$skip_first,
+		sub {
+			my $s = $_[0];
+			if    ( @heap < $cap )  { _heap_push( \@heap, $s ) }
+			elsif ( $s > $heap[0] ) { _heap_replace_root( \@heap, $s ) }
+		},
+		$c_scan
+	);
+
+	my @desc = sort { $b <=> $a } @heap;    # k+1 largest, descending
+	my $v    = $desc[ $k - 1 ];             # k-th largest
+	my $lo   = $desc[$k];                   # (k+1)-th largest
+
+	# Clean gap at the boundary: cut midway, exactly as _threshold_from_ranked.
+	if ( $lo < $v ) {
+		$self->{threshold} = ( $v + $lo ) / 2.0;
+		return;
+	}
+
+	# A tie block of value $v straddles rank k.  Reproduce _threshold_from_ranked's
+	# tie branch: locate the block's edges (i = first index at $v, j = first
+	# index below it) and the neighbouring scores with one more pass.
+	my ( $cnt_gt, $cnt_eq, $above, $below ) = ( 0, 0, undef, undef );
+	$self->_stream_scores(
+		$path,
+		$skip_first,
+		sub {
+			my $s = $_[0];
+			if ( $s > $v ) {
+				$cnt_gt++;
+				$above = $s if !defined $above || $s < $above;    # smallest > $v
+			} elsif ( $s == $v ) {
+				$cnt_eq++;
+			} else {
+				$below = $s if !defined $below || $s > $below;    # largest < $v
+			}
+		},
+		$c_scan
+	);
+
+	my $i = $cnt_gt;              # first rank holding $v
+	my $j = $cnt_gt + $cnt_eq;    # first rank below $v
+	if ( $i > 0 && ( $k - $i ) < ( $j - $k ) ) {
+		$self->{threshold} = ( $above + $v ) / 2.0;    # exclude the block
+	} elsif ( $j < $n ) {
+		$self->{threshold} = ( $v + $below ) / 2.0;    # include the block
+	} else {
+		$self->{threshold} = $v - 1e-9;                # block runs to the end
+	}
+	return;
+} ## end sub _learn_contamination_threshold_streaming
+
+# Stream the CSV, score rows in flat batches (through the same mean/majority
+# path score_samples/predict use), and invoke $cb->($score) for each row.
+# c_scan fast path: when scoring runs through the C packer (mean voting, use_c,
+# trees packed) the packer coerces each cell via SvNV, so the reader can run
+# raw (parse => 0) and skip the Perl looks_like_number validation.  Every other
+# path parses (parse => 1) so its Perl scorer sees real numbers.
+sub _stream_scores {
+	my ( $self, $path, $skip_first, $cb, $c_scan ) = @_;
+	my $majority = $self->{voting} eq 'majority' ? 1 : 0;
+	my $c_coerce = $c_scan && $self->{_use_c} && $self->{_c_nodes} && !$majority;
+	my $reader   = $self->_csv_reader( $path, $skip_first, $c_coerce ? 0 : 1 );
+
+	# The c_coerce path lets the C packer turn any non-numeric cell into 0.0 via
+	# SvNV; silence the per-cell "isn't numeric" warnings that intentional
+	# coercion raises (clean data produces none).  Other warnings pass through.
+	local $SIG{__WARN__};
+	$SIG{__WARN__} = sub { $_[0] =~ /isn't numeric/ or warn $_[0] }
+		if $c_coerce;
+
+	my @batch;
+	my $flush = sub {
+		return unless @batch;
+		my $scores
+			= $majority
+			? $self->_majority_pivot_scores( \@batch )
+			: $self->score_samples( \@batch );
+		$cb->($_) for @$scores;
+		@batch = ();
+	};
+	while ( my ($row) = $reader->() ) {
+		push @batch, $row;
+		$flush->() if @batch >= 8192;
+	}
+	$flush->();
+	return;
+} ## end sub _stream_scores
+
+# Minimal binary min-heap over a plain arrayref (root = smallest).
+sub _heap_push {
+	my ( $h, $x ) = @_;
+	push @$h, $x;
+	my $i = $#$h;
+	while ( $i > 0 ) {
+		my $p = ( $i - 1 ) >> 1;
+		last if $h->[$p] <= $h->[$i];
+		@{$h}[ $p, $i ] = @{$h}[ $i, $p ];
+		$i = $p;
+	}
+	return;
+} ## end sub _heap_push
+
+sub _heap_replace_root {
+	my ( $h, $x ) = @_;
+	$h->[0] = $x;
+	my $n = scalar @$h;
+	my $i = 0;
+	while (1) {
+		my $l = 2 * $i + 1;
+		my $r = 2 * $i + 2;
+		my $s = $i;
+		$s = $l if $l < $n && $h->[$l] < $h->[$s];
+		$s = $r if $r < $n && $h->[$r] < $h->[$s];
+		last if $s == $i;
+		@{$h}[ $s, $i ] = @{$h}[ $i, $s ];
+		$i = $s;
+	} ## end while (1)
+	return;
+} ## end sub _heap_replace_root
 
 #-------------------------------------------------------------------------------
 # Draw $k samples without replacement via a partial Fisher-Yates shuffle of the
