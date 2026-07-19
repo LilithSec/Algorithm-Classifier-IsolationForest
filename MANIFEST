@@ -8,6 +8,7 @@ lib/Algorithm/Classifier/IsolationForest/App/Command.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/gblob.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/fit.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/predict.pm
+lib/Algorithm/Classifier/IsolationForest/App/Command/explain.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/proto.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/csv2plot.pm
 lib/Algorithm/Classifier/IsolationForest/App/Command/accel.pm
@@ -46,6 +47,7 @@ t/38-online-basic.t
 t/39-online-stream.t
 t/41-mungers.t
 t/42-prototype.t
+t/43-explain.t
 t/91-streamd.t
 t/92-streamc.t
 t/01-accel-flags.t

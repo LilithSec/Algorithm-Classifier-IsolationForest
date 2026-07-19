@@ -519,6 +519,74 @@ sub score_sample_tagged {
 	return $result->[0];
 }
 
+=head2 explain_samples(\@data, %opts)
+
+Explains, per sample, which features drove its anomaly score, without
+learning anything -- the streaming counterpart of the parent class's
+method of the same name, returning the identical structure (see
+C<explain_samples> in L<Algorithm::Classifier::IsolationForest> for the
+full description of the output shape and the C<method> option):
+
+    my $explanations = $oif->explain_samples(\@data);
+    my $top          = $explanations->[0]{features}[0];
+
+Differences from the batch class:
+
+The default C<ablation> method substitutes per-feature medians of the
+currently retained window (there is no fit() to store baselines at;
+the window IS the model's view of normal, and it tracks drift for
+free).  It therefore requires C<< window_size > 0 >> with learned
+points and croaks otherwise -- use C<path> on a windowless model.
+
+The C<path> method carries an extra caveat on top of the batch class's
+(see the parent POD): online trees are shallow by construction (the
+depth budget is C<log(n/max_leaf_samples)/log(4)>) and most of a
+sample's anomalousness lives in the per-leaf count adjustment rather
+than in which splits it crossed, so path attributions here are coarse.
+Treat them as a rough second opinion; prefer C<ablation> whenever a
+window exists.
+
+A model that has not yet accumulated tree structure (fewer than
+C<max_leaf_samples> points seen) scores everything 1.0 and has no
+splits to attribute; every weight comes back 0.
+
+=cut
+
+sub explain_samples {
+	my ( $self, $data, %opts ) = @_;
+	$self->_check_learned;
+	croak "explain_samples() expects a non-empty arrayref of samples"
+		unless ref $data eq 'ARRAY' && @$data;
+
+	my $method = delete $opts{method} // 'ablation';
+	croak "explain_samples: method must be 'path' or 'ablation'"
+		unless $method =~ /\A(?:path|ablation)\z/;
+	croak "explain_samples: unknown option(s): " . join( ', ', sort keys %opts )
+		if %opts;
+
+	return $method eq 'ablation'
+		? $self->_explain_ablation($data)
+		: $self->_explain_path($data);
+} ## end sub explain_samples
+
+=head2 explain_sample_tagged(\%row, %opts)
+
+Explains a single sample supplied as a hashref of named feature values,
+without learning it.  Takes the same C<method> option as
+L</explain_samples> and returns the single explanation hashref.
+
+    my $e = $oif->explain_sample_tagged({ cpu => 0.9, mem => 0.4 });
+
+Croaks under the same conditions as L</tagged_row_to_array>.
+
+=cut
+
+sub explain_sample_tagged {
+	my ( $self, $row, %opts ) = @_;
+	my $vec = $self->tagged_row_to_array( $row, 'explain_sample_tagged' );
+	return $self->explain_samples( [$vec], %opts )->[0];
+}
+
 =head2 path_lengths(\@data)
 
 Returns an arrayref of the mean isolation depth per sample across the
@@ -1405,6 +1473,118 @@ sub _score_row {
 	}
 	return exp( -$sum * $self->_score_inv );
 } ## end sub _score_row
+
+#-------------------------------------------------------------------------------
+# Explanation (explain_samples) internals.  The output shaping is shared
+# with the parent class (_credit_to_features / _deltas_to_features) so
+# both classes return the identical structure; only the walks and the
+# baseline source differ.
+#-------------------------------------------------------------------------------
+
+# Path-credit explanation: _depth_of's exact routing recorded as
+# (path length, crossed features) walks, turned into local-DIFFI
+# credit by the parent's _walks_to_credit (see _path_length_explain
+# there for the weighting and its rationale).  Path lengths carry the
+# per-leaf _rpl(count) adjustment, exactly as scoring's do -- with the
+# shallow trees online models build, most of the between-tree contrast
+# lives in that adjustment, not the raw depth.  Online trees are
+# axis-only, so each node credits exactly one feature (share 1).
+sub _explain_path {
+	my ( $self, $data ) = @_;
+	my $scores = $self->score_samples($data);
+	my $nf     = $self->{n_features};
+	my $names  = $self->{feature_names};
+
+	my @out;
+	for my $i ( 0 .. $#$data ) {
+		my $x = $data->[$i];
+		my @walks;
+		for my $tree ( @{ $self->{trees} } ) {
+			my $node = $tree->{root};
+			next unless defined $node;
+			my @pairs;
+			while ( $node->[_N_TYPE] ) {
+				push @pairs, [ $node->[_N_ATTR], 1 ];
+				$node = ( $x->[ $node->[_N_ATTR] ] // 0 ) < $node->[_N_SPLIT] ? $node->[_N_LEFT] : $node->[_N_RIGHT];
+			}
+			push @walks, [ scalar(@pairs) + $self->_rpl( $node->[_N_COUNT] ), \@pairs ];
+		} ## end for my $tree ( @{ $self->{trees} } )
+		my $credit = Algorithm::Classifier::IsolationForest::_walks_to_credit( \@walks, $nf );
+		push @out,
+			{
+				score    => $scores->[$i],
+				method   => 'path',
+				features => Algorithm::Classifier::IsolationForest::_credit_to_features( $names, $credit, $x ),
+			};
+	} ## end for my $i ( 0 .. $#$data )
+	return \@out;
+} ## end sub _explain_path
+
+# Counterfactual explanation: every row followed by its n_features
+# single-feature baseline substitutions, scored as one batch (which
+# rides the packed-snapshot C scorer when available).  Mirrors the
+# parent's _explain_ablation with the window medians as baselines.
+sub _explain_ablation {
+	my ( $self, $data ) = @_;
+	my $nf        = $self->{n_features};
+	my $names     = $self->{feature_names};
+	my $baselines = $self->_window_baselines;
+
+	my @batch;
+	for my $row (@$data) {
+		push @batch, $row;
+		for my $f ( 0 .. $nf - 1 ) {
+			my @variant = @$row;
+			$variant[$f] = $baselines->[$f];
+			push @batch, \@variant;
+		}
+	}
+	my $scores = $self->score_samples( \@batch );
+
+	my @out;
+	for my $i ( 0 .. $#$data ) {
+		my $base   = $i * ( $nf + 1 );
+		my $score  = $scores->[$base];
+		my @deltas = map { $score - $scores->[ $base + 1 + $_ ] } 0 .. $nf - 1;
+		push @out,
+			{
+				score    => $score,
+				method   => 'ablation',
+				features => Algorithm::Classifier::IsolationForest::_deltas_to_features(
+					$names, \@deltas, $data->[$i], $baselines
+				),
+			};
+	} ## end for my $i ( 0 .. $#$data )
+	return \@out;
+} ## end sub _explain_ablation
+
+# Per-feature medians of the retained window -- the streaming
+# equivalent of the batch class's fit-time baselines, and better in one
+# way: they track drift for free because the window does.  Recomputed
+# per explanation call (the window moves with the stream); a sort per
+# feature over at most window_size values, dwarfed by the scoring batch
+# it feeds.  Window rows are always dense (missing => die/zero), so no
+# undef handling is needed.  Without a retained window there is nothing
+# to take a median of.
+sub _window_baselines {
+	my ($self) = @_;
+	my $win = $self->{window};
+	croak "explain_samples: ablation explanations need retained window data "
+		. "(window_size > 0 and learned points); use method => 'path' instead"
+		unless ref $win eq 'ARRAY' && @$win;
+
+	my $nf = $self->{n_features};
+	my @baselines;
+	for my $f ( 0 .. $nf - 1 ) {
+		my @vals = sort { $a <=> $b } map { $_->[$f] } @$win;
+		my $k    = scalar @vals;
+		$baselines[$f]
+			= $k % 2
+			? $vals[ int( $k / 2 ) ]
+			: ( $vals[ $k / 2 - 1 ] + $vals[ $k / 2 ] ) / 2.0;
+	}
+	return \@baselines;
+} ## end sub _window_baselines
 
 #-------------------------------------------------------------------------------
 # C-accelerated scoring.

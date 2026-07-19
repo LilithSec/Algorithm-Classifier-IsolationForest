@@ -1,6 +1,24 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
 0.7.0   (unreleased)
+        - Add explain_samples() / explain_sample_tagged(), reporting which
+          features drove a sample's anomaly score, to both the batch class
+          and ::Online. Two methods: 'ablation' (the default) substitutes
+          each feature in turn with a stored baseline and reports the score
+          drop -- fit() now learns per-feature training-data medians for
+          this and persists them with the model (::Online uses the medians
+          of its retained window instead, tracking drift for free);
+          'path' apportions credit over the splits each tree walk crossed
+          (local DIFFI; Carletti, Terzi & Susto 2023, see REFERENCES),
+          needing nothing beyond the trees, so it also serves models saved
+          before baseline support. Ablation is the default because it
+          answers the counterfactual for any scored sample; path credit is
+          only sharp for samples that were in the training data.
+        - Add the `iforest explain` CLI command exposing explain_samples:
+          one output line per (row, feature) pair, most responsible
+          feature first, with --method path|ablation, -n for top-N
+          features per row, and -t to score first and explain only the
+          rows clearing the cutoff.
         - Add fit_from_csv(), which trains directly from a CSV file without
           loading it into RAM (for data sets too large to slurp). Streams
           the file in a census pass, a gather pass that keeps only the rows

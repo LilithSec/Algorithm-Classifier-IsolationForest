@@ -2808,6 +2808,9 @@ sub new {
 		impute_with          => $impute_with,                  # mean|median (impute mode only)
 		voting               => $voting,                       # mean|majority (scoring-time aggregation)
 		missing_fill         => undef,                         # per-feature fill, learned in fit() if impute
+		feature_baselines    => undef,                         # per-feature medians, learned in fit();
+															   # the "typical row" ablation explanations
+															   # substitute against -- see explain_samples
 		_use_c               => $use_c,
 		_use_openmp          => $use_openmp,
 		_use_openmp_fit      => $use_openmp_fit,
@@ -3038,6 +3041,13 @@ sub fit {
 	# undef preserved for the split logic to route (nan).  Everything below
 	# trains on $train, never the raw $data.
 	my $train = $self->_prepare_fit_data($data);
+
+	# Per-feature medians of the raw training data, stored for ablation
+	# explanations (explain_samples).  From $data, not $train: the pure-
+	# Perl path's densified $train would bake fill values into the
+	# medians while the C path's raw pass-through would not, and the
+	# baselines must not depend on use_c.
+	$self->{feature_baselines} = $self->_compute_feature_baselines($data);
 
 	my $n = scalar @$train;
 
@@ -3300,6 +3310,14 @@ sub fit_from_csv {
 		= $offsets
 		? $self->_gather_indexed( $path, $offsets, \%want )
 		: $self->_gather_stream( $path, $skip_first, \%want );
+
+	# Baselines for ablation explanations, learned from the gathered
+	# sub-sample -- like the impute fill below, the only rows bounded-
+	# memory fitting ever holds.  Before _apply_missing_to_pool, which
+	# densifies the pool in place (the medians must come from present
+	# values only, matching fit()).  Median is an exact order statistic,
+	# so the hash-order values() walk cannot change the result.
+	$self->{feature_baselines} = $self->_compute_feature_baselines( [ values %$pool ] );
 
 	# Apply the missing-value strategy to the retained rows (see fit()'s
 	# _prepare_fit_data; the impute fill is learned from this training
@@ -3759,6 +3777,131 @@ sub score_sample_tagged {
 	return $result->[0];
 }
 
+=head2 explain_samples(\@data, %opts)
+
+Explains, per sample, which features drove its anomaly score -- the
+"why" to go with C<score_samples>' "how much".  Returns an arrayref
+with one hashref per sample:
+
+    my $explanations = $forest->explain_samples(\@data);
+
+    for my $e (@$explanations) {
+        my $top = $e->{features}[0];
+        printf "score %.3f, mostly because of feature %s (weight %.2f)\n",
+            $e->{score}, $top->{name} // $top->{index}, $top->{weight};
+    }
+
+Each hashref is
+
+    {
+        score    => 0.91,          # same value score_samples returns
+        method   => 'ablation',    # which attribution method produced this
+        features => [              # every feature, most responsible first
+            { index => 1, name => 'bytes_log', weight => 0.62, value => 9.3,
+              delta => 0.31, baseline => 4.1 },
+            { index => 0, name => 'method',    weight => 0.21, value => 2.0,
+              delta => 0.10, baseline => 1.0 },
+            ...
+        ],
+    }
+
+C<name> is taken from the model's stored C<feature_names> and is undef
+when none were recorded.  C<weight> is each feature's normalised share
+of the responsibility, in [0, 1] and summing to 1 (all weights are 0
+in the degenerate case where no attribution information exists).
+C<value> is the feature value the model actually scored.
+
+Options:
+
+  - method :: how per-feature responsibility is computed
+        ablation :: (default) counterfactual substitution.  Each
+            feature in turn is replaced by its baseline (the
+            per-feature training-data median learned at fit time) and
+            the sample is re-scored; the drop in anomaly score is that
+            feature's C<delta>, and weights are the positive deltas
+            normalised.  Features whose substitution does not
+            de-anomalise the sample get 0.  Each feature entry
+            additionally carries C<delta> (may be negative:
+            substituting a correlated feature can make the sample MORE
+            anomalous) and C<baseline> (the value swapped in).  Costs
+            n_samples * (n_features + 1) rows through the ordinary
+            scorer -- C-accelerated when available.
+        path :: split attribution (local DIFFI; Carletti, Terzi &
+            Susto -- see REFERENCES).  The sample walks every tree;
+            each split node crossed credits its feature(s) with
+            1/h_t - 1/h_max, where h_t is that tree's path length for
+            the sample and h_max the longest across the forest -- so
+            the trees that isolated the sample quickly speak loudest
+            and trees that treated it as normal say nothing.  An
+            oblique (extended-mode) split spreads its credit across
+            its features in proportion to |coefficient * value|.
+            Needs nothing stored beyond the trees (so it works on
+            models saved before baseline support) and runs pure Perl
+            over the tree walks.
+
+Why ablation is the default: it directly answers "would this sample
+still be an outlier with feature j at a normal value?", and that
+question has an answer for ANY scored sample.  C<path> can only
+apportion the splits the forest actually built, so it attributes well
+for samples that were IN the training data (post-fit forensics of
+flagged training rows) but degrades for unseen samples in the tails --
+an out-of-range sample walks through boundary regions whose splits
+mostly test OTHER features, and the attribution dilutes or even
+misleads.  Prefer C<ablation> whenever the model has baselines;
+C<path> is the fallback for old saved models and a second opinion on
+training-set outliers.  Neither method untangles strongly correlated
+features -- a sample anomalous only in the JOINT distribution of two
+features may show weak attributions on both.
+
+Under C<< voting => 'majority' >> the score (and ablation's deltas) are
+in vote-fraction space, matching C<score_samples>' semantics in that
+mode; the C<path> method is aggregation-independent and unchanged.
+
+C<ablation> requires stored baselines: models fitted before explanation
+support have none and croak (models with C<< missing => 'impute' >>
+fall back to their stored fill vector); refitting stores them.
+
+=cut
+
+sub explain_samples {
+	my ( $self, $data, %opts ) = @_;
+	$self->_check_fitted;
+
+	my $method = delete $opts{method} // 'ablation';
+	croak "explain_samples: method must be 'path' or 'ablation'"
+		unless $method =~ /\A(?:path|ablation)\z/;
+	croak "explain_samples: unknown option(s): " . join( ', ', sort keys %opts )
+		if %opts;
+
+	my $rows = $self->_to_arrayref($data);
+	croak "explain_samples() expects a non-empty arrayref of samples"
+		unless @$rows;
+
+	return $method eq 'ablation'
+		? $self->_explain_ablation($rows)
+		: $self->_explain_path($rows);
+} ## end sub explain_samples
+
+=head2 explain_sample_tagged(\%row, %opts)
+
+Explains a single sample supplied as a hashref of named feature values
+-- the tagged counterpart of L</explain_samples>, taking the same
+C<method> option and returning the single explanation hashref (with
+C<name> filled from the stored feature names).
+
+    my $e = $forest->explain_sample_tagged({ cpu => 0.9, mem => 0.4 });
+    print "worst feature: $e->{features}[0]{name}\n";
+
+Croaks under the same conditions as L</tagged_row_to_array>.
+
+=cut
+
+sub explain_sample_tagged {
+	my ( $self, $row, %opts ) = @_;
+	my $vec = $self->tagged_row_to_array( $row, 'explain_sample_tagged' );
+	return $self->explain_samples( [$vec], %opts )->[0];
+}
+
 =head2 score_predict_samples
 
 Returns an array ref of arrays. First value of each sub array is the score with the second being
@@ -4072,6 +4215,7 @@ sub to_json {
 			missing               => $self->{missing},
 			impute_with           => $self->{impute_with},
 			missing_fill          => $self->{missing_fill},
+			feature_baselines     => $self->{feature_baselines},
 			feature_names         => $self->{feature_names},
 			voting                => $self->{voting},
 			mungers               => $self->{mungers},
@@ -4136,10 +4280,14 @@ sub from_json {
 		max_depth_used       => $p->{max_depth_used},
 		# Models saved before missing-value support lack these keys; default
 		# to 'zero', which reproduces the old undef -> 0 scoring behaviour.
-		missing       => $p->{missing}     // 'zero',
-		impute_with   => $p->{impute_with} // 'mean',
-		missing_fill  => $p->{missing_fill},
-		feature_names => $p->{feature_names},
+		missing      => $p->{missing}     // 'zero',
+		impute_with  => $p->{impute_with} // 'mean',
+		missing_fill => $p->{missing_fill},
+		# Absent in models saved before explanation support; ablation
+		# explanations then fall back to missing_fill or croak with a
+		# refit hint -- see _ablation_baselines.
+		feature_baselines => $p->{feature_baselines},
+		feature_names     => $p->{feature_names},
 		# The munger plan is recompiled lazily on first tagged use, so a
 		# munger-bearing model still loads (and scores positional data)
 		# where Algorithm::ToNumberMunger is not installed.
@@ -4523,6 +4671,12 @@ L<https://ieeexplore.ieee.org/document/8888179>
 Yousra Chabchoub, Maurras Ulbricht Togbe, Aliou Boly, Raja Chiky (2022). An In-Depth Study and Improvement of Isolation Forest. IEEE Access, vol. 10, 10219 - 10237. 10.1109/ACCESS.2022.3144425 (the Majority Voting Isolation Forest implemented by C<< voting => 'majority' >>)
 
 L<https://ieeexplore.ieee.org/document/9684896>
+
+Mattia Carletti, Matteo Terzi, Gian Antonio Susto (2023). Interpretable Anomaly Detection with DIFFI: Depth-based feature importance of Isolation Forest. Engineering Applications of Artificial Intelligence, vol. 119. 10.1016/j.engappai.2022.105730 (the depth-weighted split attribution of C<explain_samples>' C<path> method is inspired by local DIFFI)
+
+L<https://arxiv.org/abs/2007.11117>
+
+L<https://www.sciencedirect.com/science/article/pii/S0952197622007205>
 
 Filippo Leveni, Guilherme Weigert Cassales, Bernhard Pfahringer, Albert Bifet, Giacomo Boracchi (2024). Online Isolation Forest. (the streaming variant implemented by L<Algorithm::Classifier::IsolationForest::Online>)
 
@@ -5410,6 +5564,216 @@ sub _path_length {
 	return $depth + _c( $node->[1] );    # leaf size at slot 1
 } ## end sub _path_length
 
+#-------------------------------------------------------------------------------
+# Explanation (explain_samples) internals.
+#-------------------------------------------------------------------------------
+
+# Instrumented twin of _path_length: routes $x through one tree with
+# EXACTLY _path_length's split logic while recording which feature(s)
+# each crossed node tested.  Returns (path_length, \@pairs) where
+# path_length carries the usual c(leaf size) adjustment and each pair
+# is [feature_index, share] -- an axis node contributes one pair with
+# share 1, an oblique node one pair per participating feature with
+# shares proportional to |coef_k * x_k| (each feature's part of the
+# dot product), falling back to an even split when every term is 0.
+#
+# The caller (_explain_path) turns these walks into local-DIFFI credit
+# (Carletti, Terzi & Susto, see REFERENCES): every node of a tree's
+# walk is credited w_t = 1/h_t - 1/h_max, where h_t is this tree's
+# (adjusted) path length and h_max the longest walk any tree gave the
+# same sample -- so trees that isolated the sample quickly speak
+# loudest, trees that treated it as normal say nothing, and the credit
+# is a cross-TREE statistic.  Within-tree positional weightings were
+# tried and rejected: root-anchored credit (1/(depth+1)) mostly
+# rediscovers the RNG (the root split's feature is drawn uniformly at
+# random regardless of the sample), and leaf-anchored credit
+# (1/(h-depth)) is diluted by the trees that never isolated the sample
+# at all.
+sub _path_length_explain {
+	my ( $x, $node, $nan ) = @_;
+	my $depth = 0;
+	my @pairs;                # [feature, share] for every crossed node
+	while ( $node->[0] ) {    # false only for leaf (type 0)
+		if ( $node->[0] == _NODE_AXIS ) {    # [1, attr, split, left, right]
+			push @pairs, [ $node->[1], 1 ];
+			if ($nan) {
+				my $v = $x->[ $node->[1] ];
+				$node = ( defined($v) && $v < $node->[2] ) ? $node->[3] : $node->[4];
+			} else {
+				$node = ( $x->[ $node->[1] ] // 0 ) < $node->[2] ? $node->[3] : $node->[4];
+			}
+		} else {                             # [2, \@idx, \@coef, b, left, right]
+			my ( $idx, $coef, $b ) = ( $node->[1], $node->[2], $node->[3] );
+
+			my @parts      = map { abs( $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 ) ) } 0 .. $#$idx;
+			my $part_total = 0;
+			$part_total += $_ for @parts;
+			push @pairs, $part_total > 0
+				? ( map { [ $idx->[$_], $parts[$_] / $part_total ] } 0 .. $#$idx )
+				: ( map { [ $idx->[$_], 1 / scalar @$idx ] } 0 .. $#$idx );
+
+			if ($nan) {
+				my $dot     = 0.0;
+				my $missing = 0;
+				for ( 0 .. $#$idx ) {
+					my $v = $x->[ $idx->[$_] ];
+					if ( !defined $v ) { $missing = 1; last }
+					$dot += $coef->[$_] * $v;
+				}
+				$node = ( !$missing && $dot <= $b ) ? $node->[4] : $node->[5];
+			} else {
+				my $dot = 0.0;
+				$dot += $coef->[$_] * ( $x->[ $idx->[$_] ] // 0 ) for 0 .. $#$idx;
+				$node = $dot <= $b ? $node->[4] : $node->[5];
+			}
+		} ## end else [ if ( $node->[0] == _NODE_AXIS ) ]
+		$depth++;
+	} ## end while ( $node->[0] )
+	return ( $depth + _c( $node->[1] ), \@pairs );    # leaf size at slot 1
+} ## end sub _path_length_explain
+
+# Turn one sample's per-tree walks into local-DIFFI feature credit --
+# see _path_length_explain's comment for the weighting and what was
+# tried instead.  A plain function so the Online class can reuse it on
+# its own walks.
+sub _walks_to_credit {
+	my ( $walks, $nf ) = @_;
+	my $hmax = 0;
+	for (@$walks) { $hmax = $_->[0] if $_->[0] > $hmax }
+	my $credit = [ (0) x $nf ];
+	for my $walk (@$walks) {
+		my ( $h, $pairs ) = @$walk;
+		next unless @$pairs && $h > 0 && $hmax > 0;
+		my $w = 1.0 / $h - 1.0 / $hmax;
+		next if $w <= 0;
+		$credit->[ $_->[0] ] += $w * $_->[1] for @$pairs;
+	}
+	return $credit;
+} ## end sub _walks_to_credit
+
+# Turn one sample's accumulated per-feature path credit into the sorted
+# features list explain_samples returns.  Weights are the credit shares
+# (summing to 1); a sample that never crossed a split node (all-leaf
+# trees) carries no information, so every weight stays 0 rather than
+# inventing a uniform split.  A plain function, not a method: the
+# Online class shapes its explanations through this too.
+sub _credit_to_features {
+	my ( $names, $credit, $row ) = @_;
+	my $total = 0;
+	$total += $_ for @$credit;
+	my @features = map {
+		{
+			index  => $_,
+			name   => $names     ? $names->[$_]           : undef,
+			weight => $total > 0 ? $credit->[$_] / $total : 0,
+			value  => $row->[$_],
+		}
+	} 0 .. $#$credit;
+	return [ sort { $b->{weight} <=> $a->{weight} || $a->{index} <=> $b->{index} } @features ];
+} ## end sub _credit_to_features
+
+# Ablation counterpart of _credit_to_features: deltas are score drops
+# (score(original) - score(feature substituted with its baseline));
+# weight is each positive delta's share of the positive total, keeping
+# weights in [0, 1] like the path method's.  A negative delta -- the
+# substitution made the sample MORE anomalous, possible with correlated
+# features -- keeps its sign in delta but contributes weight 0.
+sub _deltas_to_features {
+	my ( $names, $deltas, $row, $baselines ) = @_;
+	my $pos_total = 0;
+	for (@$deltas) { $pos_total += $_ if $_ > 0 }
+	my @features = map {
+		{
+			index    => $_,
+			name     => $names ? $names->[$_] : undef,
+			delta    => $deltas->[$_],
+			weight   => ( $pos_total > 0 && $deltas->[$_] > 0 ) ? $deltas->[$_] / $pos_total : 0,
+			value    => $row->[$_],
+			baseline => $baselines->[$_],
+		}
+	} 0 .. $#$deltas;
+	return [ sort { $b->{weight} <=> $a->{weight} || $a->{index} <=> $b->{index} } @features ];
+} ## end sub _deltas_to_features
+
+# The path-credit explanation: one pure-Perl instrumented walk per tree
+# per sample.  The reported score still comes from score_samples so it
+# is bit-identical to what the user saw when the sample got flagged
+# (and carries the right semantics under voting => 'majority').
+sub _explain_path {
+	my ( $self, $rows ) = @_;
+	my $scores   = $self->score_samples($rows);
+	my $prepared = $self->_prepare_perl_input($rows);
+	my $nan      = $self->{missing} eq 'nan' ? 1 : 0;
+	my $nf       = $self->{n_features};
+	my $names    = $self->{feature_names};
+	my $trees    = $self->{trees};
+
+	my @out;
+	for my $i ( 0 .. $#$prepared ) {
+		my @walks = map { [ _path_length_explain( $prepared->[$i], $_, $nan ) ] } @$trees;
+		push @out,
+			{
+				score    => $scores->[$i],
+				method   => 'path',
+				features => _credit_to_features( $names, _walks_to_credit( \@walks, $nf ), $prepared->[$i] ),
+			};
+	}
+	return \@out;
+} ## end sub _explain_path
+
+# The counterfactual explanation: every row followed by its n_features
+# single-feature baseline substitutions, all scored as ONE batch so the
+# whole thing runs through score_samples once (C-accelerated when
+# available) instead of n_features+1 separate scoring calls.
+sub _explain_ablation {
+	my ( $self, $rows ) = @_;
+	my $nf        = $self->{n_features};
+	my $names     = $self->{feature_names};
+	my $baselines = $self->_ablation_baselines;
+
+	my @batch;
+	for my $row (@$rows) {
+		push @batch, $row;
+		for my $f ( 0 .. $nf - 1 ) {
+			my @variant = @$row;
+			$variant[$f] = $baselines->[$f];
+			push @batch, \@variant;
+		}
+	}
+	my $scores = $self->score_samples( \@batch );
+
+	my @out;
+	for my $i ( 0 .. $#$rows ) {
+		my $base   = $i * ( $nf + 1 );
+		my $score  = $scores->[$base];
+		my @deltas = map { $score - $scores->[ $base + 1 + $_ ] } 0 .. $nf - 1;
+		push @out,
+			{
+				score    => $score,
+				method   => 'ablation',
+				features => _deltas_to_features( $names, \@deltas, $rows->[$i], $baselines ),
+			};
+	} ## end for my $i ( 0 .. $#$rows )
+	return \@out;
+} ## end sub _explain_ablation
+
+# The per-feature substitution values ablation uses: the training-data
+# medians fit() stores, falling back to the impute fill for models
+# saved before baseline support (better than refusing outright -- the
+# fill IS a typical value, just impute_with's statistic rather than
+# always-median).
+sub _ablation_baselines {
+	my ($self) = @_;
+	my $nf = $self->{n_features};
+	for my $candidate ( $self->{feature_baselines}, $self->{missing_fill} ) {
+		return $candidate if ref $candidate eq 'ARRAY' && @$candidate == $nf;
+	}
+	croak "explain_samples: this model has no stored feature baselines "
+		. "(saved by a version before ablation explanation support?); "
+		. "refit to enable method => 'ablation', or explain with "
+		. "method => 'path'";
+} ## end sub _ablation_baselines
+
 # Recursively convert a version-0 hash-based tree node to the version-1
 # array format.  Called by from_json when loading an old saved model.
 sub _hash_node_to_array {
@@ -5981,11 +6345,14 @@ sub _prepare_fit_data {
 } ## end sub _prepare_fit_data
 
 # Per-feature fill value (mean or median of the present values) for impute
-# mode.  Croaks if a feature has no present value to learn from.
+# mode.  Croaks if a feature has no present value to learn from.  The
+# optional $how_override selects the statistic independently of the
+# model's impute_with knob (used by _compute_feature_baselines, which
+# always wants the median).
 sub _compute_impute_fill {
-	my ( $self, $data ) = @_;
+	my ( $self, $data, $how_override ) = @_;
 	my $nf  = $self->{n_features};
-	my $how = $self->{impute_with};
+	my $how = $how_override // $self->{impute_with};
 
 	# C fast path: walks the raw data directly and finds the median via
 	# quickselect (O(n) average) instead of the Perl fallback's full sort
@@ -6031,6 +6398,43 @@ sub _compute_impute_fill {
 	} ## end for my $f ( 0 .. $nf - 1 )
 	return \@fill;
 } ## end sub _compute_impute_fill
+
+# Per-feature median of the present values of the training data -- the
+# "typical row" that ablation explanations (explain_samples with
+# method => 'ablation') substitute against, one feature at a time.
+# Always the median (not impute_with's statistic): a baseline should be
+# a robustly central value, and outliers in the training data drag a
+# mean around far more than a median.
+#
+# Computed from the RAW rows, never a densified copy, so the stored
+# baselines are identical whether use_c is on or off (the pure-Perl fit
+# path densifies $train before the trees are built; the C path does
+# not).  A column with no present value at all -- legal under
+# missing => 'zero'/'nan' -- cannot yield a median, so the fast path's
+# croak falls back to a tolerant pure-Perl pass that gives such columns
+# the fill value scoring maps their undefs to anyway (0).
+sub _compute_feature_baselines {
+	my ( $self, $data ) = @_;
+	my $baselines = eval { $self->_compute_impute_fill( $data, 'median' ) };
+	return $baselines if ref $baselines eq 'ARRAY';
+
+	my $nf = $self->{n_features};
+	my @fallback;
+	for my $f ( 0 .. $nf - 1 ) {
+		my @vals = sort { $a <=> $b } grep { defined } map { $_->[$f] } @$data;
+		my $k    = scalar @vals;
+		if ( $k == 0 ) {
+			$fallback[$f] = 0;
+			next;
+		}
+		$fallback[$f]
+			= $k % 2
+			? $vals[ int( $k / 2 ) ]
+			: ( $vals[ $k / 2 - 1 ] + $vals[ $k / 2 ] ) / 2.0;
+		$fallback[$f] = _to_double( $fallback[$f] ) unless _NV_IS_DOUBLE;
+	} ## end for my $f ( 0 .. $nf - 1 )
+	return \@fallback;
+} ## end sub _compute_feature_baselines
 
 # Return a dense copy of $data with every undef cell replaced by the
 # matching per-feature fill value.  Leaves present cells untouched.
