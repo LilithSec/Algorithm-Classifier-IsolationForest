@@ -218,6 +218,55 @@ void pack_input_xs(SV* data_sv, SV* out_sv, int n_pts, int n_feats,
     }
 }
 
+/* first_missing_xs(data_sv, n_pts, n_feats, out_rv)
+ *
+ * C replacement for _prepare_fit_data's missing => 'die' scan, which is a
+ * pure-Perl double loop over every cell of the training set and, being the
+ * default strategy, the single largest fixed cost of a fit on wide or long
+ * data.  Walks the same arrayref-of-arrayrefs pack_input_xs walks, in the
+ * same row-major order, and stops at the first cell that is undef or
+ * absent, pushing (row, col) into out_rv.  Leaves out_rv empty when every
+ * cell is present.
+ *
+ * A row that is not an arrayref counts as missing at column 0 -- the same
+ * reading pack_input_xs gives it (it fills such a row entirely from the
+ * missing branch), so the two agree on what "present" means. */
+void first_missing_xs(SV* data_sv, int n_pts, int n_feats, SV* out_rv){
+    dTHX;
+    AV *outer, *out;
+    int i, k;
+
+    if (!SvROK(data_sv) || SvTYPE(SvRV(data_sv)) != SVt_PVAV) {
+        croak("first_missing_xs: data must be an arrayref");
+    }
+    if (!SvROK(out_rv) || SvTYPE(SvRV(out_rv)) != SVt_PVAV) {
+        croak("first_missing_xs: out must be an arrayref");
+    }
+    outer = (AV*)SvRV(data_sv);
+    out   = (AV*)SvRV(out_rv);
+    av_clear(out);
+
+    for (i = 0; i < n_pts; i++) {
+        SV** row_pp = av_fetch(outer, i, 0);
+        AV* row;
+        if (!row_pp || !*row_pp || !SvROK(*row_pp) ||
+            SvTYPE(SvRV(*row_pp)) != SVt_PVAV) {
+            av_push(out, newSViv(i));
+            av_push(out, newSViv(0));
+            return;
+        }
+        row = (AV*)SvRV(*row_pp);
+        for (k = 0; k < n_feats; k++) {
+            SV** v = av_fetch(row, k, 0);
+            if (!v || !*v || !SvOK(*v)) {
+                av_push(out, newSViv(i));
+                av_push(out, newSViv(k));
+                return;
+            }
+        }
+    }
+}
+
 /* finalize_scores_xs(sm_sv, n_pts, inv, out_rv)
  *
  * Fills the pre-allocated arrayref out_rv with exp(-sm[i] * inv) for
@@ -1319,6 +1368,175 @@ void build_forest_openmp_xs(SV* x_sv, int n_pts, int n_feats, int n_trees,
         tb_free(&bufs[t]);
     }
     free(bufs);
+}
+
+/* ---------------------------------------------------------------------
+ * pack_tree_xs(root_rv, n_features, nodes_sv, idx_sv, val_sv)
+ *
+ * C image of _pack_tree: flattens one tree into the three packed buffers
+ * the scorer walks.  _rebuild_c_trees runs it once per tree at the end of
+ * every fit() and every from_json(), and in Perl each node costs a
+ * recursive closure call, an arrayref and six SVs, plus a trailing map
+ * that pushes every one of those SVs back onto the stack for pack() --
+ * which made it the largest single phase of an axis-mode fit.  This is
+ * the same walk done in C, appending into the TreeBuf above and handing
+ * the three buffers back as plain strings.
+ *
+ * The layout is unchanged: nodes are numbered DFS pre-order (a node's
+ * record is reserved before its children recurse, so the root is 0 and
+ * every child index sits above its parent's -- unlike the post-order
+ * _build_node_packed above), oblique coefficients dense-pack in feature
+ * order when a node uses every feature, and a leaf's slot 2 carries
+ * c(size).  Output is byte-identical to the Perl path.
+ *
+ * The Perl side only calls this on nvsize == 8 perls: c(size) is computed
+ * here in C doubles, and a wide-NV perl's _c() keeps extra low bits, so
+ * the stored leaf adjustment would otherwise differ in the last ulp
+ * between backends -- the same parity concern _NV_IS_DOUBLE guards
+ * everywhere else.
+ * ------------------------------------------------------------------ */
+
+/* Scratch reused across every node of a tree, so packing a node
+ * allocates nothing.  Grown on demand rather than sized once from
+ * n_features: a model saved before n_features was persisted packs with
+ * n_features == -1, which leaves no up-front bound on an oblique node's
+ * coefficient count. */
+typedef struct {
+    double *dense;    /* coefficients by feature index, for the dense pack */
+    int    *order;    /* 0..cap-1 -- the dense pack's index array */
+    int    *ix;       /* sparse pack scratch */
+    double *cv;
+    int     cap;
+} PackScratch;
+
+static void ps_init(PackScratch *s) {
+    s->dense = NULL; s->order = NULL; s->ix = NULL; s->cv = NULL; s->cap = 0;
+}
+
+static void ps_free(PackScratch *s) {
+    free(s->dense); free(s->order); free(s->ix); free(s->cv);
+}
+
+static void ps_reserve(PackScratch *s, int n) {
+    int k;
+    if (n <= s->cap) return;
+    s->dense = (double*)realloc(s->dense, (size_t)n * sizeof(double));
+    s->order = (int*)   realloc(s->order, (size_t)n * sizeof(int));
+    s->ix    = (int*)   realloc(s->ix,    (size_t)n * sizeof(int));
+    s->cv    = (double*)realloc(s->cv,    (size_t)n * sizeof(double));
+    for (k = s->cap; k < n; k++) s->order[k] = k;
+    s->cap = n;
+}
+
+/* c(n) -- the expression _c() evaluates, operation for operation. */
+static double _pt_c(double n) {
+    double harmonic;
+    if (n <= 1.0) return 0.0;
+    if (n == 2.0) return 1.0;
+    harmonic = log(n - 1.0) + 0.5772156649015329;
+    return 2.0 * harmonic - (2.0 * (n - 1.0) / n);
+}
+
+/* Appends the subtree rooted at node_rv to buf; returns its node index. */
+static int _pack_node_xs(pTHX_ SV* node_rv, int n_features, TreeBuf* b,
+                          PackScratch* s) {
+    AV* node;
+    SV** slots;
+    int type, my_idx;
+    double* rec;
+
+    if (!SvROK(node_rv) || SvTYPE(SvRV(node_rv)) != SVt_PVAV) {
+        croak("pack_tree_xs: tree node is not an arrayref");
+    }
+    node  = (AV*)SvRV(node_rv);
+    slots = AvARRAY(node);
+    type  = (int)SvIV(slots[0]);
+
+    /* Reserved before recursing so children are numbered above us. */
+    my_idx = tb_push_node(b, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+    if (type == 0) {
+        double size = SvNV(slots[1]);
+        rec = b->nodes + (size_t)my_idx * IF_NZ;
+        rec[1] = size;
+        rec[2] = _pt_c(size);    /* the rest of the record stays zero */
+    } else if (type == 1) {
+        double attr  = SvNV(slots[1]);
+        double split = SvNV(slots[2]);
+        int li = _pack_node_xs(aTHX_ slots[3], n_features, b, s);
+        int ri = _pack_node_xs(aTHX_ slots[4], n_features, b, s);
+        /* tb_push_node reallocs, so the record's address is only valid
+         * once the children are back. */
+        rec = b->nodes + (size_t)my_idx * IF_NZ;
+        rec[0] = 1.0; rec[1] = attr; rec[2] = split;
+        rec[3] = (double)li; rec[4] = (double)ri;
+    } else {
+        AV *iav, *cav;
+        double bcoef;
+        int num, coff, li, ri, k, dense_ok;
+
+        if (!SvROK(slots[1]) || SvTYPE(SvRV(slots[1])) != SVt_PVAV ||
+            !SvROK(slots[2]) || SvTYPE(SvRV(slots[2])) != SVt_PVAV) {
+            croak("pack_tree_xs: oblique node needs idx/coef arrayrefs");
+        }
+        iav   = (AV*)SvRV(slots[1]);
+        cav   = (AV*)SvRV(slots[2]);
+        bcoef = SvNV(slots[3]);
+        num   = (int)AvFILLp(iav) + 1;
+        ps_reserve(s, num > n_features ? num : n_features);
+
+        for (k = 0; k < num; k++) {
+            s->ix[k] = (int)SvIV(AvARRAY(iav)[k]);
+            s->cv[k] = SvNV(AvARRAY(cav)[k]);
+        }
+
+        /* Dense pack when the node uses every feature, so val[k] is the
+         * coefficient for feature k and score_all_xs can take its
+         * no-gather inner loop.  For any tree this module builds the
+         * indices are a permutation of 0..n_features-1; the range check
+         * only stops a hand-edited model from walking off the scratch,
+         * and the zero-fill covers a repeated index leaving a hole. */
+        dense_ok = (n_features > 0 && num == n_features);
+        for (k = 0; dense_ok && k < num; k++) {
+            if (s->ix[k] < 0 || s->ix[k] >= n_features) dense_ok = 0;
+        }
+        if (dense_ok) {
+            memset(s->dense, 0, (size_t)n_features * sizeof(double));
+            for (k = 0; k < num; k++) s->dense[s->ix[k]] = s->cv[k];
+            coff = tb_push_coef(b, s->order, s->dense, n_features);
+        } else {
+            coff = tb_push_coef(b, s->ix, s->cv, num);
+        }
+
+        li = _pack_node_xs(aTHX_ slots[4], n_features, b, s);
+        ri = _pack_node_xs(aTHX_ slots[5], n_features, b, s);
+        rec = b->nodes + (size_t)my_idx * IF_NZ;
+        rec[0] = 2.0; rec[1] = (double)coff; rec[2] = (double)num;
+        rec[3] = (double)li; rec[4] = (double)ri; rec[5] = bcoef;
+    }
+    return my_idx;
+}
+
+/* n_features may be -1 ("unknown"), which just disables the dense pack.
+ * The three output SVs are overwritten with the packed bytes. */
+void pack_tree_xs(SV* root_rv, int n_features, SV* nodes_sv, SV* idx_sv,
+                   SV* val_sv) {
+    dTHX;
+    TreeBuf b;
+    PackScratch s;
+
+    tb_init(&b);
+    ps_init(&s);
+    _pack_node_xs(aTHX_ root_rv, n_features, &b, &s);
+    ps_free(&s);
+
+    /* An axis-only tree never calls tb_push_coef, so idx/val stay NULL --
+     * pass "" so the Perl side always receives a defined string, matching
+     * what build_forest_openmp_xs hands back. */
+    sv_setpvn(nodes_sv, (char*)b.nodes, b.n_nodes * IF_NZ * sizeof(double));
+    sv_setpvn(idx_sv, b.n_idx ? (char*)b.idx : "", b.n_idx * sizeof(int));
+    sv_setpvn(val_sv, b.n_val ? (char*)b.val : "", b.n_val * sizeof(double));
+    tb_free(&b);
 }
 
 /* ---------------------------------------------------------------------
@@ -5811,9 +6029,22 @@ sub _hash_node_to_array {
 #
 # Nodes are numbered in DFS pre-order: the root is always index 0 and
 # children always get indices larger than their parent's.
+#
+# The C backend does this walk in pack_tree_xs, which is what actually
+# runs whenever it is available -- the Perl body below is the fallback
+# (no C backend, or a wide-NV perl, where the two would disagree on
+# c(size) in the last ulp; see _NV_IS_DOUBLE).  Both produce byte-
+# identical buffers on an nvsize == 8 perl.
 # ---------------------------------------------------------------------------
 sub _pack_tree {
 	my ( $root, $n_features ) = @_;
+
+	if ( $HAS_C && _NV_IS_DOUBLE ) {
+		my ( $nodes_packed, $idx_packed, $val_packed ) = ( '', '', '' );
+		pack_tree_xs( $root, $n_features // -1, $nodes_packed, $idx_packed, $val_packed );
+		return ( $nodes_packed, $idx_packed, $val_packed );
+	}
+
 	my ( @node_data, @coef_idx, @coef_val );
 
 	my $assign;
@@ -6300,15 +6531,31 @@ sub _prepare_fit_data {
 	my $nf = $self->{n_features};
 
 	if ( $m eq 'die' ) {
-		for my $i ( 0 .. $#$data ) {
-			my $row = $data->[$i];
-			for my $f ( 0 .. $nf - 1 ) {
-				next if defined $row->[$f];
-				croak "fit(): undef feature value at sample $i, column $f; "
-					. "construct with missing => 'zero', 'impute', or 'nan' "
-					. "to train on data with missing values";
+
+		# Locate the first missing cell, then report it.  The scan is over
+		# every cell of the training set, so with the C backend on it goes
+		# through first_missing_xs -- same row-major order, same cell
+		# reported, without the per-cell Perl loop overhead.  Both paths
+		# read a row that is not an arrayref as missing at column 0, which
+		# is how pack_input_xs treats one downstream.
+		my $where = [];
+		if ( $self->{_use_c} ) {
+			first_missing_xs( $data, scalar @$data, $nf, $where );
+		} else {
+			my $i = 0;
+			for my $row (@$data) {
+				if ( ref $row ne 'ARRAY' ) { $where = [ $i, 0 ]; last }
+				my $f = 0;
+				$f++ while $f < $nf && defined $row->[$f];
+				if ( $f < $nf ) { $where = [ $i, $f ]; last }
+				$i++;
 			}
-		}
+		} ## end else [ if ( $self->{_use_c} ) ]
+		croak "fit(): undef feature value at sample $where->[0], column $where->[1]; "
+			. "construct with missing => 'zero', 'impute', or 'nan' "
+			. "to train on data with missing values"
+			if @$where;
+
 		return $data;
 	} ## end if ( $m eq 'die' )
 

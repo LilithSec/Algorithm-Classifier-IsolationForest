@@ -44,6 +44,26 @@ Revision history for Algorithm-Classifier-IsolationForest
           non-numeric scored cell becomes 0.0 rather than dying). Under
           missing => 'die', a missing cell is now rejected when it lands in a
           sampled training row rather than during a full up-front scan.
+        - fit()/from_json(): _pack_tree, which flattens each tree into the
+          packed buffers the C scorer walks, now runs in the C backend
+          (pack_tree_xs) instead of a recursive Perl closure that built an
+          arrayref and six SVs per node and then flattened the lot through
+          a map for pack(). It had grown into the largest single phase of
+          an axis-mode fit: 100 trees repack in 0.6ms rather than 20.5ms
+          (4.2ms rather than 62ms in extended mode), taking a 10k x 8 fit
+          from 44ms to 16ms. Same DFS pre-order numbering, same dense-pack
+          rule, byte-identical buffers. Skipped on wide-NV perls, where
+          c(size) computed in C doubles would differ from _c() in the last
+          ulp -- those keep the pure-Perl packer, as _NV_IS_DOUBLE guards
+          elsewhere.
+        - fit(): under missing => 'die' (the default) the up-front scan for
+          undef cells now runs in the C backend when use_c is on, instead of
+          a per-cell Perl loop over the whole training set -- 183ms -> 17ms
+          on 400k rows x 4 features, where it had been ~68% of fit() time.
+          Same row-major order, so the same offending cell is reported. A
+          row that is not an arrayref now reads as missing at column 0 on
+          both the C and pure-Perl paths (previously a Perl deref error),
+          matching how pack_input_xs already treats one.
 
 0.6.0   2026-07-09/08:15
         - Implement Online Isolation Forest (Filippo Leveni, Guilherme
