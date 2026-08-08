@@ -58,6 +58,79 @@ my $labels = $mv->predict(\@data, 0.6);   # threshold is the per-tree cutoff her
 $iforest->set_voting('majority', \@data);  # ->set_voting('mean') if no contamination
 ```
 
+# Explaining a score
+
+`score_samples` says how anomalous a sample is; `explain_samples` says which
+features made it so. It returns one hashref per sample — the score, the
+method used, and every feature ordered most responsible first.
+
+```perl
+my $explanations = $iforest->explain_samples(\@data);
+
+for my $e (@$explanations) {
+    my $top = $e->{features}[0];
+    printf "score %.3f, mostly because of %s (weight %.2f)\n",
+        $e->{score}, $top->{name} // $top->{index}, $top->{weight};
+}
+```
+
+Two methods, differing in what they can answer:
+
+- `ablation` :: the default. Each feature in turn is replaced by its
+  baseline — the per-feature training-data median `fit` learns and saves —
+  and the sample is re-scored; the drop is that feature's `delta`. It
+  answers "would this still be an outlier with feature j at a normal
+  value?", which has an answer for any scored sample.
+- `path` :: apportions credit over the splits each tree walk actually
+  crossed (local DIFFI). Needs nothing beyond the trees, so it also serves
+  models saved before baseline support, but it only attributes well for
+  samples that were in the training data.
+
+`explain_sample_tagged` is the hashref-in, hashref-out counterpart.
+`::Online` implements both, using the medians of its retained window as
+baselines so they track drift for free.
+
+On the command line, `iforest explain` prints one line per (row, feature)
+pair, most responsible feature first:
+
+```shell
+iforest explain -i data.csv -m model.json                # ablation, all rows
+iforest explain -i data.csv -m model.json --method path
+iforest explain -i data.csv -m model.json -t 0.6 -n 3    # top 3, flagged rows only
+```
+
+Ablation scores `n_features + 1` variants of every explained row, so on a
+large input pass `-t` to spend that only on the rows that cleared the cutoff.
+
+# Training from a CSV too large to fit in RAM
+
+`fit_from_csv` trains straight from a file. An Isolation Forest never looks
+at more than `n_trees * sample_size` rows, so the working set is bounded by
+the model's parameters rather than the file size.
+
+```perl
+my $iforest = Algorithm::Classifier::IsolationForest->new(
+    n_trees       => 100,
+    sample_size   => 256,
+    contamination => 0.01,
+    seed          => 42,
+);
+$iforest->fit_from_csv('huge.csv', header => 1);
+```
+
+The file is read in two passes — a census that counts the rows and pins the
+feature width, then a gather that keeps only the rows the trees sampled
+(chosen in bounded memory via Floyd's algorithm) — plus a third scoring pass
+when `contamination` is set, whose min-heap yields the exact threshold the
+in-RAM learner would have. By default the census also records each row's byte
+offset, so gather seeks to the sampled rows instead of rescanning; that table
+is dropped automatically when it would exceed `index_max`.
+
+Only the cells that actually train or get scored are parsed, so `$path` must
+be a stable, re-readable file rather than a pipe. Headers are auto-detected.
+Mungers and tagged columns are not supported on this path — load that data
+through `fit_tagged`.
+
 # Online (streaming) Isolation Forest
 
 For data that arrives as a stream and may drift over time, the companion

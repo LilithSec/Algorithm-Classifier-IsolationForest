@@ -237,4 +237,73 @@ sub execute {
 	write_file( $opt->{'o'}, { 'atomic' => 1 }, $results_string );
 } ## end sub execute
 
+=head1 NAME
+
+Algorithm::Classifier::IsolationForest::App::Command::explain - Explains which features drove each sample's anomaly score using the specified model
+
+=head1 DESCRIPTION
+
+Runs C<explain_samples> over the input and prints one line per (row,
+feature) pair, most responsible feature first.  Input may be a CSV or a
+C<.iforest-packed> binary from C<iforest pack>, detected by its magic
+bytes.
+
+Under the default ablation method the line format is
+
+  $row,$score,$rank,$feature,$weight,$value,$delta,$baseline
+
+and under C<--method path>
+
+  $row,$score,$rank,$feature,$weight,$value
+
+C<$row> is the 1-based input row number, so output filtered by C<-t>
+still points back at the input.  Ablation scores C<n_features + 1>
+variants of every explained row, which is why C<-t> is worth reaching for
+on a large input: it spends that only on the rows that cleared the cutoff.
+
+Run it as C<iforest explain>; C<iforest help explain> lists every option.
+
+=head1 METHODS
+
+L<App::Cmd> calls these while dispatching the subcommand.  Nothing else
+should.
+
+=head2 opt_spec
+
+Returns this command's option specifications, as the list of arrayrefs
+L<Getopt::Long::Descriptive> expects.
+
+=head2 abstract
+
+Returns the one-line summary C<iforest commands> prints beside the
+command name.
+
+=head2 description
+
+Returns the long help text C<iforest help explain> prints under the option
+list.
+
+=head2 validate
+
+Checks the parsed options before anything is read or written, so a
+mistake costs nothing.
+
+Checks that C<-i> and C<-m> name readable files, that C<-o> may be
+written, that C<--method> is C<ablation> or C<path>, that C<-n> is not
+negative, and that C<-t> lies in (0, 1).
+
+Takes the parsed options hashref and the arrayref of remaining
+arguments.  Calls C<usage_error>, which prints the usage and exits, on
+the first problem it finds, and returns 1 when everything checks out.
+
+=head2 execute
+
+Loads the model, reads the input, optionally filters by C<-t>, and prints
+the per-feature lines to STDOUT or to C<-o>.
+
+Takes the parsed options hashref and the arrayref of remaining
+arguments, and returns 1.
+
+=cut
+
 return 1;
