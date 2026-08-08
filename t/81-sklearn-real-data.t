@@ -17,15 +17,22 @@
 # a newer sklearn is caught rather than silently trusted.
 #
 # The two implementations cannot produce identical scores -- they draw from
-# different RNGs -- so agreement is measured on the ORDERING:
+# different RNGs -- so agreement is measured on the ORDERING, by Spearman
+# rank correlation and by overlap of the top 5% most anomalous points (the
+# part of the ranking anyone actually acts on).
 #
-#   1. Spearman rank correlation against sklearn, per dataset.  The floors
-#      below sit a few points under the worst value observed over a 60-seed
-#      sweep, so a real regression trips them but seed luck does not.
-#   2. Overlap of the top 5% most anomalous points, which is the part of
-#      the ranking anyone actually acts on.
-#   3. The C and pure-Perl backends must agree with each other exactly --
-#      the module's own guarantee, checked here on real data.
+# Both are checked twice.  An absolute floor catches an outright collapse.
+# The check that does the real work is relative: agreement with sklearn is
+# required to be no worse than our agreement with OURSELVES across seeds.
+# An Isolation Forest is a random estimator, so that seed-to-seed spread is
+# the ceiling -- if we track sklearn as closely as we track a different
+# seed of ourselves, there is no cross-implementation divergence to find.
+# Stating it that way also stops the thresholds from encoding how hard a
+# particular dataset happens to be to rank.  See the constants below.
+#
+# Separately, the C and pure-Perl backends must agree with each other
+# exactly -- the module's own guarantee, checked here on real data with 30+
+# correlated columns rather than on a Gaussian blob.
 #
 # See t/data/README for provenance, citations and licensing of the data.
 
@@ -40,19 +47,47 @@ use Algorithm::Classifier::IsolationForest;
 
 my $DATA = File::Spec->catdir( $FindBin::Bin, 'data' );
 
-# name => [ spearman floor, top-5% overlap floor ]
-#
-# Observed minimums over seeds 1..60 (rho / overlap):
-#   glass      0.977 / 0.82      ionosphere 0.983 / 0.72
-#   seeds      0.921 / 0.73      wdbc       0.950 / 0.79
-my %FLOOR = (
-	glass      => [ 0.94, 0.60 ],
-	ionosphere => [ 0.95, 0.60 ],
-	seeds      => [ 0.88, 0.60 ],
-	wdbc       => [ 0.91, 0.60 ],
-);
+my @SETS = qw(glass ionosphere seeds wdbc);
 
 my @SEEDS = ( 1, 7, 42 );
+
+# An Isolation Forest is a random estimator, so two fits of the SAME
+# implementation with different seeds already disagree.  That seed-to-seed
+# spread is the ceiling on any cross-implementation comparison, and it is
+# what these checks are stated against.
+#
+# Absolute floors are deliberately not tuned per dataset.  How closely two
+# runs agree is mostly a property of the data -- a set whose points are
+# near-tied in isolatedness has an unstable ranking no matter who ranks it
+# -- so a per-dataset floor ends up measuring the dataset rather than the
+# code, and needs retuning whenever data is added.  These two only have to
+# catch a collapse; the relative checks below do the real work.
+#
+# Measured over 20 disjoint 3-seed groups (the statistic below is a mean
+# over one such group), worst case across the four datasets:
+#
+#   mean spearman vs sklearn    0.9419 (seeds)
+#   mean top-5% overlap         0.788  (seeds)
+use constant MIN_AGREEMENT   => 0.90;
+use constant MIN_TOP_OVERLAP => 0.70;
+
+# The real invariant: agreement with sklearn must not sit meaningfully
+# below our agreement with OURSELVES across seeds.  If we track sklearn as
+# closely as we track a different seed of ourselves then there is no
+# cross-implementation divergence, whatever the absolute number happens to
+# be for a given dataset.  This is what would catch a change that biased
+# our splits relative to sklearn's while leaving our own seed-to-seed
+# stability intact -- which an absolute floor cannot see.
+#
+# Worst (self - cross) over those same 20 groups:
+#
+#   spearman   +0.0104 (wdbc)      -> 0.05 allows ~5x that
+#   overlap    +0.074  (ionosphere) -> 0.15 allows ~2x that
+#
+# Both are usually negative, i.e. we match sklearn slightly more closely
+# than we match our own other seeds.
+use constant AGREEMENT_MARGIN => 0.05;
+use constant OVERLAP_MARGIN   => 0.15;
 
 # Compare against the pure-Perl backend always, and the C backend when it
 # compiled.  Both must agree with sklearn, and with each other.
@@ -63,6 +98,8 @@ push @BACKENDS, [ 'C' => 1 ]
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
+
+sub mean { @_ ? sum(@_) / scalar @_ : 0 }
 
 # 1-based ranks, smallest value getting rank 1.  Ties break by index, which
 # is fine here: the correlation floors have enough slack to absorb it.
@@ -189,9 +226,7 @@ PY
 # -----------------------------------------------------------------------
 # The datasets
 # -----------------------------------------------------------------------
-for my $name ( sort keys %FLOOR ) {
-	my ( $rho_floor, $overlap_floor ) = @{ $FLOOR{$name} };
-
+for my $name (@SETS) {
 	my $csv = File::Spec->catfile( $DATA, "$name.csv" );
 	my $ref = File::Spec->catfile( $DATA, "$name.sklearn" );
 	my $lab = File::Spec->catfile( $DATA, "$name.labels" );
@@ -217,6 +252,9 @@ for my $name ( sort keys %FLOOR ) {
 	for my $backend (@BACKENDS) {
 		my ( $label, $use_c ) = @$backend;
 
+		# One fit per seed, reused by both the cross- and self-comparisons
+		# below.
+		my @runs;
 		for my $seed (@SEEDS) {
 			my $model = Algorithm::Classifier::IsolationForest->new(
 				n_trees     => 100,
@@ -225,29 +263,55 @@ for my $name ( sort keys %FLOOR ) {
 				use_c       => $use_c,
 			);
 			$model->fit($rows);
-			my $scores = $model->score_samples($rows);
-
-			push @{ $by_backend{$label} }, $scores if $seed == $SEEDS[0];
-
-			my $rho = spearman( $scores, \@sk_anom );
-			cmp_ok(
-				$rho, '>=',
-				$rho_floor,
-				sprintf(
-					'%s/%s seed %d: spearman vs sklearn %.3f >= %.2f', $name, $label, $seed, $rho, $rho_floor
-				)
-			);
-
-			my $overlap = top_overlap( $scores, \@sk_anom, 0.05 );
-			cmp_ok(
-				$overlap, '>=',
-				$overlap_floor,
-				sprintf(
-					'%s/%s seed %d: top 5%% overlap %.2f >= %.2f',
-					$name, $label, $seed, $overlap, $overlap_floor
-				)
-			);
+			push @runs, $model->score_samples($rows);
 		} ## end for my $seed (@SEEDS)
+		$by_backend{$label} = \@runs;
+
+		# Agreement with sklearn, averaged over the seeds.
+		my $cross_rho = mean( map { spearman( $_, \@sk_anom ) } @runs );
+		my $cross_ovl = mean( map { top_overlap( $_, \@sk_anom, 0.05 ) } @runs );
+
+		# Agreement with ourselves, over every pair of those same seeds.
+		my ( @self_rho, @self_ovl );
+		for my $i ( 0 .. $#runs ) {
+			for my $j ( $i + 1 .. $#runs ) {
+				push @self_rho, spearman( $runs[$i], $runs[$j] );
+				push @self_ovl, top_overlap( $runs[$i], $runs[$j], 0.05 );
+			}
+		}
+		my $self_rho = mean(@self_rho);
+		my $self_ovl = mean(@self_ovl);
+
+		cmp_ok( $cross_rho, '>=', MIN_AGREEMENT,
+			sprintf( '%s/%s: spearman vs sklearn %.4f >= %.2f', $name, $label, $cross_rho, MIN_AGREEMENT ) );
+		cmp_ok(
+			$cross_rho,
+			'>=',
+			$self_rho - AGREEMENT_MARGIN,
+			sprintf(
+				'%s/%s: spearman vs sklearn %.4f tracks our own seed spread %.4f (within %.2f)',
+				$name, $label, $cross_rho, $self_rho, AGREEMENT_MARGIN
+			)
+		);
+
+		cmp_ok(
+			$cross_ovl,
+			'>=',
+			MIN_TOP_OVERLAP,
+			sprintf(
+				'%s/%s: top 5%% overlap with sklearn %.3f >= %.2f',
+				$name, $label, $cross_ovl, MIN_TOP_OVERLAP
+			)
+		);
+		cmp_ok(
+			$cross_ovl,
+			'>=',
+			$self_ovl - OVERLAP_MARGIN,
+			sprintf(
+				'%s/%s: top 5%% overlap %.3f tracks our own seed spread %.3f (within %.2f)',
+				$name, $label, $cross_ovl, $self_ovl, OVERLAP_MARGIN
+			)
+		);
 	} ## end for my $backend (@BACKENDS)
 
 	# The module promises the C backend only changes speed, never results.
@@ -281,8 +345,8 @@ for my $name ( sort keys %FLOOR ) {
 		);
 
 		my $rho = spearman( $streamed->score_samples($rows), \@sk_anom );
-		cmp_ok( $rho, '>=', $rho_floor,
-			sprintf( '%s: fit_from_csv spearman vs sklearn %.3f >= %.2f', $name, $rho, $rho_floor ) );
+		cmp_ok( $rho, '>=', MIN_AGREEMENT,
+			sprintf( '%s: fit_from_csv spearman vs sklearn %.4f >= %.2f', $name, $rho, MIN_AGREEMENT ) );
 	}
 
 	# Drift check: does the installed sklearn still produce the checked-in
@@ -296,7 +360,7 @@ SKIP: {
 		cmp_ok( $rho, '>=', 0.98,
 			sprintf( '%s: checked-in reference still matches live sklearn (rho %.4f)', $name, $rho ) );
 	}
-} ## end for my $name ( sort keys %FLOOR )
+} ## end for my $name (@SETS)
 
 # Glass is the one set here with a genuinely rare class -- 9 of its 214
 # samples are tableware (4.2%) -- so it can check the thing the module is

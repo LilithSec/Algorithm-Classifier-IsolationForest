@@ -1,6 +1,6 @@
 Revision history for Algorithm-Classifier-IsolationForest
 
-0.7.0   2026-07-08/13:30
+0.7.0   2026-07-08/14:30
         - Add explain_samples() / explain_sample_tagged(), reporting which
           features drove a sample's anomaly score, to both the batch class
           and ::Online. Two methods: 'ablation' (the default) substitutes
@@ -72,11 +72,13 @@ Revision history for Algorithm-Classifier-IsolationForest
           sklearn's scores are now checked in beside each dataset, so the
           comparison runs everywhere; where Python is present an extra arm
           re-runs sklearn live and catches drift against the checked-in
-          reference. Spearman agreement with sklearn on real data is
-          0.92-0.99 depending on the set; the floors are set under the
-          worst of a 60-seed sweep. Also checks that C and pure-Perl score
-          identically on 30+ correlated columns, and that fit_from_csv
-          detects a real header.
+          reference. Agreement is required to be no worse than our own
+          seed-to-seed agreement, rather than against a per-dataset floor:
+          an Isolation Forest is a random estimator, so that spread is the
+          ceiling, and measuring against it keeps the thresholds from
+          encoding how hard a given dataset is to rank. Also checks that C
+          and pure-Perl score identically on 30+ correlated columns, and
+          that fit_from_csv detects a real header.
 
 0.6.0   2026-07-09/08:15
         - Implement Online Isolation Forest (Filippo Leveni, Guilherme
